@@ -6,6 +6,8 @@ import tempfile
 import base64
 import asyncio
 import logging
+from pathlib import Path
+import json
 
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.websockets import WebSocketState
@@ -15,499 +17,432 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 import torch
-import torchaudio
+import torchaudio  # faster audio I/O for long files
 import nemo.collections.asr as nemo_asr
+from nemo.collections.asr.models.asr_model import ASRModel as NeMoASRModelType
+from omegaconf import OmegaConf # Keep for config manipulation
 
-# Load environment variables from .env file if it exists
 from dotenv import load_dotenv
+
+from utils import (
+    generate_srt_content,
+    generate_csv_content,
+    apply_model_settings_for_request,
+    revert_model_settings_after_request,
+    global_original_model_device_str,
+    global_original_model_dtype_torch,
+)
+
 load_dotenv()
 
-# Configure logging
+# --- Logging Configuration ---
 log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
 log_level = getattr(logging, log_level_str, logging.INFO)
 logging.basicConfig(
     level=log_level,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger("parakeet-asr")
+logger = logging.getLogger("parakeet-asr.main")
 logger.info(f"Logging configured with level: {log_level_str}")
 
-# model configuration
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", 1)) 
-NUM_WORKERS = int(os.getenv("NUM_WORKERS", 0)) 
-CHUNK_LENGTH = float(os.getenv("TRANSCRIBE_CHUNK_LEN", 30)) 
-OVERLAP = float(os.getenv("TRANSCRIBE_OVERLAP", 5))   
-MODEL_SAMPLE_RATE = int(os.getenv("SAMPLE_RATE", 16000))
-PORT = int(os.getenv("PORT", 8777))  # Add PORT from .env
-logger.info(f"Model config: BATCH_SIZE: {BATCH_SIZE}, NUM_WORKERS: {NUM_WORKERS}, CHUNK_LENGTH: {CHUNK_LENGTH}, OVERLAP: {OVERLAP}, MODEL_SAMPLE_RATE: {MODEL_SAMPLE_RATE}")
+# --- App Configuration ---
+REST_BATCH_SIZE = 1
+NUM_WORKERS = int(os.getenv("NUM_WORKERS", 0))
+MODEL_SAMPLE_RATE = 16000
+PORT = int(os.getenv("PORT", 8777))
+ASR_MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v2"
+LONG_AUDIO_THRESHOLD_S = float(os.getenv("LONG_AUDIO_THRESHOLD", 480.0))
 
-# FAST API app with CORS
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# --- Chunking Configuration ---
+TRANSCRIBE_CHUNK_LEN = float(os.getenv("TRANSCRIBE_CHUNK_LEN", 30.0))
+TRANSCRIBE_OVERLAP = float(os.getenv("TRANSCRIBE_OVERLAP", 5.0))
+CHUNKING_BATCH_SIZE = int(os.getenv("BATCH_SIZE", 1))
+
+# Log configuration
+logger.info(
+    f"Configuration loaded:\n"
+    f"  Chunking: length={TRANSCRIBE_CHUNK_LEN}s, overlap={TRANSCRIBE_OVERLAP}s, batch={CHUNKING_BATCH_SIZE}\n"
+    f"  App: rest_batch={REST_BATCH_SIZE}, workers={NUM_WORKERS}, "
+    f"sample_rate={MODEL_SAMPLE_RATE}, port={PORT}\n"
+    f"  Model: {ASR_MODEL_NAME}, long_audio_threshold={LONG_AUDIO_THRESHOLD_S}s"
 )
 
-# Mount static files directory
-static_dir = os.path.join(os.path.dirname(__file__), "static")
-if not os.path.exists(static_dir):
-    # If running directly (not in Docker), the static dir might be in a different location
-    static_dir = os.path.join(os.path.dirname(__file__), "..", "static")
-    if not os.path.exists(static_dir):
-        os.makedirs(static_dir, exist_ok=True)
-        logger.warning(f"Created static directory at {static_dir}")
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+)
 
+# --- Static Files ---
+current_dir = os.path.dirname(os.path.abspath(__file__))
+static_dir = os.path.join(current_dir, "static")
+
+# Ensure directory exists – Dockerfile creates it but be defensive for local runs
+os.makedirs(static_dir, exist_ok=True)
+logger.info(f"Static files directory set to: {static_dir}")
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-# Root endpoint to serve index.html
 @app.get("/", response_class=HTMLResponse)
-async def get_index():
+async def get_index_page():
     index_path = os.path.join(static_dir, "index.html")
-    if os.path.exists(index_path):
-        return FileResponse(index_path)
-    else:
-        logger.error(f"Index file not found at {index_path}")
-        return HTMLResponse(content="<html><body><h1>Parakeet ASR Server</h1><p>UI not available. index.html not found.</p></body></html>")
+    return FileResponse(index_path) if os.path.exists(index_path) else \
+           HTMLResponse(f"UI not found at {index_path}.", status_code=404)
 
-# load model
-asr_model = None 
+# --- ASR Model Loading & Global State ---
+asr_model: NeMoASRModelType = None
+original_model_attention_config_dict: dict = None # Store as plain dict
+original_model_subsampling_config_dict: dict = None # Store as plain dict
+global_original_model_device_str: str = "cpu" # Default to CPU if model fails to load
+global_original_model_dtype_torch: torch.dtype = torch.float32 # Default
+
 try:
-    logger.info("Loading ASR model...")
-    asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name="nvidia/parakeet-tdt-0.6b-v2")
-    asr_model.preprocessor.featurizer.dither = 0.0  
-    logger.info("ASR model loaded successfully.")
-except Exception as e:
-    logger.critical(f"FATAL: Could not load ASR model. Error: {e}")
-    asr_model = None 
-
-
-# This function processes a 1D audio tensor chunk.
-# It is called by the endpoints after the full audio file has been decoded
-# and chunked according to server-side chunk_len/overlap logic.
-def run_asr_on_tensor_chunk(
-    audio_chunk_tensor: torch.Tensor,  # Expected to be 1D, mono, at MODEL_SAMPLE_RATE
-    chunk_time_offset: float           # Absolute start time of this chunk in the original audio
-) -> tuple[list[dict], list[str]]:
-    """
-    Transcribes a 1D audio tensor chunk and adjusts timestamps.
-
-    Args:
-        audio_chunk_tensor: A 1D PyTorch tensor of the audio chunk.
-                            The caller must ensure it's correctly formatted (mono, MODEL_SAMPLE_RATE).
-        chunk_time_offset: The absolute start time (in seconds) of this audio_chunk_tensor
-                           relative to the beginning of the original full audio stream.
-
-    Returns:
-        A tuple containing:
-        - processed_segments (list[dict]): A list of segment dictionaries with absolute timestamps.
-        - chunk_full_text_parts (list[str]): A list containing the transcribed text of the chunk (usually one item).
-    """
-    if not asr_model:
-        # This check is still critical as the model might fail to load globally.
-        logger.error("run_asr_on_tensor_chunk: ASR model is not loaded.")
-        return [], []
-
-    # --- Pre-condition Check (Development/Debug Aid) ---
-    # The caller is responsible for providing a 1D tensor. This assertion helps catch caller errors during development.
-    # In a highly optimized production environment, this could be removed if the contract is strictly followed.
-    assert audio_chunk_tensor.ndim == 1, \
-        f"ERROR: run_asr_on_tensor_chunk received tensor with ndim={audio_chunk_tensor.ndim}. Expected 1D."
-    assert audio_chunk_tensor.numel() > 0, \
-        "ERROR: run_asr_on_tensor_chunk received an empty audio tensor."
-
-    try:
-        # Perform ASR transcription on the provided 1D tensor chunk.
-        # `num_workers=0` is appropriate as this function is typically run in `asyncio.to_thread`.
-        output_hypotheses: list = asr_model.transcribe(
-            audio=[audio_chunk_tensor],  # NeMo expects a list of 1D tensors.
-            batch_size=BATCH_SIZE,       # We process one chunk at a time here.
-            return_hypotheses=True,      # Request Hypothesis objects for rich output.
-            timestamps=True,             # Request timestamp information.
-            verbose=False,               # Suppress NeMo's internal transcription logging for this call.
-            num_workers=NUM_WORKERS
-        )
-        
-        processed_segments = []
-        chunk_text_list = [] # Renamed from chunk_full_text_parts for clarity
-
-        # `asr_model.transcribe` with batch_size=1 and return_hypotheses=True
-        # is expected to return a list containing exactly one Hypothesis object.
-        if not (output_hypotheses and isinstance(output_hypotheses, list) and len(output_hypotheses) == 1):
-            logger.warning(f"run_asr_on_tensor_chunk: Unexpected output format from ASR model: {type(output_hypotheses)}")
-            # If the model for some reason didn't transcribe or returned an unexpected format,
-            # we return empty results to prevent further errors.
-            return [], []
-
-        hypothesis = output_hypotheses[0]
-
-        # Extract the full text for this chunk if available.
-        # The text might be None or an empty string for silent/unintelligible audio.
-        if hasattr(hypothesis, 'text') and hypothesis.text: # Check for existence and non-emptiness
-            # .strip() to remove leading/trailing whitespace from model's raw output.
-            transcribed_text = hypothesis.text.strip()
-            if transcribed_text: # Only add if there's actual content after stripping
-                chunk_text_list.append(transcribed_text)
-
-        # Extract segment-level timestamps if available.
-        # The `hypothesis.timestamp` attribute (a dict) is expected if `timestamps=True`.
-        # The "segment" key within this dict contains a list of segment metadata.
-        if hasattr(hypothesis, 'timestamp') and hypothesis.timestamp:
-            segment_metadata_list = hypothesis.timestamp.get("segment", []) # Default to empty list
-            
-            for seg_meta in segment_metadata_list:
-                seg_text = seg_meta.get("segment", "").strip()
-                # Skip segments that are empty after stripping whitespace.
-                if not seg_text:
-                    continue
-
-                # Timestamps from the model (`seg_meta["start"]`, `seg_meta["end"]`) are relative
-                # to the beginning of the `audio_chunk_tensor` that was transcribed.
-                # Add `chunk_time_offset` to make them absolute to the original full audio.
-                abs_start_time = round(seg_meta["start"] + chunk_time_offset, 3)
-                abs_end_time = round(seg_meta["end"] + chunk_time_offset, 3)
-
-                # Construct the segment dictionary.
-                # Other fields are placeholders matching OpenAI's format, can be omitted if not used.
-                processed_segments.append({
-                    "start": abs_start_time,
-                    "end": abs_end_time,
-                    "text": seg_text,
-                    # Placeholder fields:
-                    "id": 0, # ID will be assigned by the caller
-                    "seek": 0, 
-                    "tokens": [], 
-                    "temperature": 0.0,
-                    "avg_logprob": None, 
-                    "compression_ratio": None, 
-                    "no_speech_prob": None
-                })
-        
-        return processed_segments, chunk_text_list
+    logger.info(f"Loading ASR model: {ASR_MODEL_NAME}...")
+    asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=ASR_MODEL_NAME)
+    asr_model.preprocessor.featurizer.dither = 0.0
+    asr_model.eval()
     
-    except Exception as e:
-        # Log the error and return empty lists to allow the calling process to continue if appropriate.
-        logger.error(f"run_asr_on_tensor_chunk: Exception during ASR processing: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return [], []
+    # Store original configurations precisely
+    if hasattr(asr_model, 'cfg') and hasattr(asr_model.cfg, 'encoder'):
+        if hasattr(asr_model.cfg.encoder, 'attention'):
+            # Convert OmegaConf to plain dict for storage to avoid issues with live OmegaConf objects
+            original_model_attention_config_dict = OmegaConf.to_container(asr_model.cfg.encoder.attention, resolve=True)
+        if hasattr(asr_model.cfg.encoder, 'conv_subsampling'):
+            original_model_subsampling_config_dict = OmegaConf.to_container(asr_model.cfg.encoder.conv_subsampling, resolve=True)
+
+    global_original_model_device_str = str(next(asr_model.parameters()).device)
+    global_original_model_dtype_torch = next(asr_model.parameters()).dtype
+    logger.info(f"ASR model '{ASR_MODEL_NAME}' loaded. Original device: {global_original_model_device_str}, dtype: {global_original_model_dtype_torch}. Configs stored if found.")
+except Exception as e:
+    logger.critical(f"FATAL: Could not load ASR model '{ASR_MODEL_NAME}'. Error: {e}", exc_info=True)
+    asr_model = None
+
+model_access_lock = asyncio.Lock()
 
 
+def create_audio_chunks(waveform: torch.Tensor, sample_rate: int = MODEL_SAMPLE_RATE, chunk_len_s: float = TRANSCRIBE_CHUNK_LEN, overlap_s: float = TRANSCRIBE_OVERLAP):
+    """Split 1-D mono waveform into overlapping chunks and return (chunks, offsets_s)."""
+    assert waveform.ndim == 1, "waveform must be 1-D mono"
+    total_dur = waveform.shape[0] / sample_rate
+    stride = chunk_len_s - overlap_s
+    if stride <= 0:
+        raise ValueError("OVERLAP must be smaller than CHUNK_LENGTH")
+
+    chunks, offsets = [], []
+    cur = 0.0
+    while cur < total_dur:
+        start_s = max(0.0, cur - overlap_s)
+        end_s = min(total_dur, cur + chunk_len_s)
+        s_idx = int(start_s * sample_rate)
+        e_idx = int(end_s * sample_rate)
+        if s_idx >= e_idx:
+            break
+        chunk = waveform[s_idx:e_idx].clone()
+        if chunk.numel():
+            chunks.append(chunk)
+            offsets.append(start_s)
+        cur += stride
+    return chunks, offsets
+
+# --- REST Endpoint ---
 @app.post("/v1/audio/transcriptions")
-async def transcribe_rest(file: UploadFile = File(...)):
-    """
-    Handles audio transcription via REST API.
-    The uploaded audio file is saved temporarily, then processed in chunks
-    with overlap using NeMo ASR. Each chunk is saved as a temporary WAV file
-    and passed to the ASR model.
-    """
-    if not asr_model: # Use the global asr_model
-        logger.error("transcribe_rest: ASR model not available.")
+async def transcribe_endpoint_rest(file: UploadFile = File(...)):
+    if not asr_model:
         return JSONResponse(status_code=503, content={"error": "ASR model not available."})
 
-    # Path for the initially uploaded (full) temporary file
-    uploaded_full_temp_file_path = "" 
+    request_id = base64.urlsafe_b64encode(os.urandom(6)).decode()
+    logger.info(f"REST ({request_id}): Received request for '{file.filename}'.")
+
+    temp_uploaded_file_path: str = ""
+    long_audio_settings_were_applied = False # For this request
+    device_dtype_was_changed_from_global = False # For this request
+    
+    processing_device_for_this_req = "cuda" if torch.cuda.is_available() else "cpu"
+    request_processing_start_time = time.time() 
+
     try:
-        # 1. Save the uploaded file to a temporary location
-        # Using delete=False because we need the path for torchaudio.load
-        # and will manually delete it in the finally block.
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp_full_audio: # Suffix can be generic
-            shutil.copyfileobj(file.file, tmp_full_audio)
-            uploaded_full_temp_file_path = tmp_full_audio.name
-        
-        # 2. Load and preprocess the full waveform
-        try:
-            waveform_full, sr_orig = torchaudio.load(uploaded_full_temp_file_path)
-        except Exception as load_err:
-            logger.error(f"transcribe_rest: Failed to load audio from {uploaded_full_temp_file_path}: {load_err}")
-            raise # Re-raise to be caught by the outer try-except
-
-        if sr_orig != MODEL_SAMPLE_RATE:
-            waveform_full = torchaudio.functional.resample(waveform_full, orig_freq=sr_orig, new_freq=MODEL_SAMPLE_RATE)
-        
-        # Ensure waveform is mono and has a batch-like dimension [1, Time] for consistent slicing.
-        # Most ASR models operate on mono.
-        if waveform_full.ndim > 1 and waveform_full.shape[0] > 1: # Multichannel
-            waveform_full = waveform_full.mean(dim=0, keepdim=True) # Convert to mono [1, Time]
-        elif waveform_full.ndim == 1: # Mono but 1D
-             waveform_full = waveform_full.unsqueeze(0) # Add channel/batch dim: [1, Time]
-        # Now waveform_full is expected to be [1, Time]
-
-        if waveform_full.shape[1] == 0: # Check for empty audio after processing
-            logger.info("transcribe_rest: Audio content is empty after loading and preprocessing.")
-            return JSONResponse(content={"text": "", "segments": [], "language": "en", "transcription_time": 0.0})
-
-        total_duration_seconds = waveform_full.shape[1] / MODEL_SAMPLE_RATE
-        
-        # 3. Process audio in chunks using a sliding window
-        start_time_processing = time.time()
-        current_processing_time_seconds = 0.0 # Tracks the start of the main (non-overlapped) part of the current window
-        all_segments = []
-        
-        # The loop continues as long as there's a new main window to process.
-        while current_processing_time_seconds < total_duration_seconds:
-            # Define the actual audio slice considering overlap.
-            # `actual_chunk_start_seconds` can go before `current_processing_time_seconds` due to overlap.
-            actual_chunk_start_seconds = max(0, current_processing_time_seconds - OVERLAP)
-            # `actual_chunk_end_seconds` is the end of the full window (main part + right overlap part).
-            actual_chunk_end_seconds = min(total_duration_seconds, current_processing_time_seconds + CHUNK_LENGTH)
-
-            # Convert times to sample indices
-            start_sample = int(actual_chunk_start_seconds * MODEL_SAMPLE_RATE)
-            end_sample = int(actual_chunk_end_seconds * MODEL_SAMPLE_RATE)
-
-            # If the calculated chunk is empty or invalid, stop.
-            if start_sample >= end_sample:
-                break 
+        async with model_access_lock: 
+            logger.debug(f"REST ({request_id}): Acquired model_access_lock.")
             
-            # Slice the waveform_full (which is [1, Time]) to get a [1, chunk_Time] tensor
-            chunk_slice_2d = waveform_full[:, start_sample:end_sample]
-            
-            # Squeeze to make it 1D [chunk_Time] for run_asr_on_tensor_chunk
-            audio_chunk_for_asr = chunk_slice_2d.squeeze(0) 
-            
-            if audio_chunk_for_asr.numel() == 0:
-                current_processing_time_seconds += (CHUNK_LENGTH - OVERLAP)
-                continue
+            # 1. Save & Preprocess audio (torchaudio)
+            file_suffix = Path(file.filename).suffix if file.filename else ".tmp"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix, prefix=f"rest_up_{request_id}_") as tmp_upload:
+                await asyncio.to_thread(shutil.copyfileobj, file.file, tmp_upload)
+                temp_uploaded_file_path = tmp_upload.name
 
-            segments_from_chunk, _ = await asyncio.to_thread( 
-                run_asr_on_tensor_chunk,
-                audio_chunk_for_asr,
-                actual_chunk_start_seconds
+            try:
+                waveform, sr_orig = await asyncio.to_thread(torchaudio.load, temp_uploaded_file_path)
+                if sr_orig != MODEL_SAMPLE_RATE: # resample if needed: model expects 16kHz sample rate
+                    waveform = await asyncio.to_thread(torchaudio.functional.resample, waveform, sr_orig, MODEL_SAMPLE_RATE)
+
+                # Convert to mono 1-D tensor: model expects mono audio
+                if waveform.ndim > 1 and waveform.shape[0] > 1:
+                    waveform = waveform.mean(dim=0)
+                elif waveform.ndim == 2 and waveform.shape[0] == 1:
+                    waveform = waveform.squeeze(0)
+
+                audio_duration_s = waveform.shape[-1] / MODEL_SAMPLE_RATE # duration in seconds = samples / sample rate
+                logger.info(f"REST ({request_id}): torchaudio loaded '{file.filename}'. Duration: {audio_duration_s:.2f}s.")
+            
+            except Exception as ta_err:
+                logger.error(f"REST ({request_id}): torchaudio failed to decode audio: {ta_err}", exc_info=True)
+                return JSONResponse(status_code=400, content={"error": "Unsupported or corrupt audio file.", "detail": str(ta_err)})
+
+            # 2. Apply model settings (device, dtype, long audio)
+            long_audio_settings_were_applied, device_dtype_was_changed_from_global = await apply_model_settings_for_request(
+                asr_model, audio_duration_s, processing_device_for_this_req, LONG_AUDIO_THRESHOLD_S, request_id
             )
 
-            # Process the transcription output for this chunk
-            for seg_meta in segments_from_chunk: # segments_from_chunk already contains dicts with absolute times
-                # Filtering logic (same as before)
-                if seg_meta["start"] >= current_processing_time_seconds or not all_segments:
-                    all_segments.append({
-                        "id": len(all_segments), 
-                        "start": seg_meta["start"], 
-                        "end": seg_meta["end"], 
-                        "text": seg_meta["text"],
-                        # Placeholder fields:
-                        "seek": 0, 
-                        "tokens": [], 
-                        "temperature": 0.0,
-                        "avg_logprob": None, 
-                        "compression_ratio": None, 
-                        "no_speech_prob": None
-                    })
-            
-            current_processing_time_seconds += (CHUNK_LENGTH - OVERLAP)
-        
-        transcription_duration_seconds = round(time.time() - start_time_processing, 3)
-        final_text = " ".join(s['text'] for s in all_segments).strip()
-        result = {
-            "text": final_text, "segments": all_segments, "language": "en", 
-            "transcription_time": transcription_duration_seconds
-        }
-        return JSONResponse(content=result)
+            # 3. Transcribe using NeMo's high-level API
+            logger.info(f"REST ({request_id}): Starting NeMo transcription for '{temp_uploaded_file_path}'.")
+            transcribe_call_start_time = time.time()
+            hypotheses = await asyncio.to_thread(
+                asr_model.transcribe,
+                audio=[waveform],
+                batch_size=REST_BATCH_SIZE,
+                num_workers=NUM_WORKERS,
+                return_hypotheses=True,
+                timestamps=True
+            )
+            transcribe_call_duration = round(time.time() - transcribe_call_start_time, 3)
+            logger.info(f"REST ({request_id}): NeMo transcription finished in {transcribe_call_duration}s.")
 
-    except Exception as e:
-        logger.error(f"transcribe_rest: Unhandled exception: {str(e)}")
-        import traceback; traceback.print_exc()
-        return JSONResponse(status_code=500, content={"error": "Failed to process audio.", "detail": str(e)})
+            # 4. Process results
+            text_result, segments_result = "", []
+            if hypotheses and isinstance(hypotheses, list) and len(hypotheses) > 0:
+                hypothesis = hypotheses[0]
+                text_result = hypothesis.text.strip() if hasattr(hypothesis, 'text') else ""
+                if hasattr(hypothesis, 'timestamp') and hypothesis.timestamp and 'segment' in hypothesis.timestamp:
+                    for i, seg_meta in enumerate(hypothesis.timestamp['segment']):
+                        segments_result.append({
+                            "id": i, "start": round(seg_meta["start"], 3), "end": round(seg_meta["end"], 3),
+                            "text": seg_meta.get("segment", "").strip(),
+                            "seek": 0, "tokens": [], "temperature": 0.0, 
+                            "avg_logprob": None, "compression_ratio": None, "no_speech_prob": None
+                        })
+            if not text_result and segments_result:
+                text_result = " ".join(s['text'] for s in segments_result).strip()
+
+            csv_content = generate_csv_content(segments_result)
+            srt_content = generate_srt_content(segments_result)
+            
+            total_request_duration = round(time.time() - request_processing_start_time, 3)
+            response = {
+                "text": text_result, "segments": segments_result, "language": "en",
+                "transcription_time": transcribe_call_duration, # More accurate: actual ASR time
+                "total_request_time_server": total_request_duration, # Includes overhead
+                "csv_content": csv_content, "srt_content": srt_content
+            }
+            return JSONResponse(content=response)
+
+    except RuntimeError as e_rt: 
+        if "CUDA out of memory" in str(e_rt): # Specific OOM
+            logger.error(f"REST ({request_id}): CUDA OOM: {e_rt}", exc_info=True)
+            return JSONResponse(status_code=500, content={"error": "CUDA out of memory.", "detail": str(e_rt)})
+        logger.error(f"REST ({request_id}): Runtime error: {e_rt}", exc_info=True) # Other runtime errors
+        return JSONResponse(status_code=500, content={"error": "Server runtime error during transcription.", "detail": str(e_rt)})
+    
+    except Exception as e_main:
+        logger.error(f"REST ({request_id}): General error for '{file.filename}': {e_main}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": "Unexpected server error.", "detail": str(e_main)})
+    
     finally:
-        if uploaded_full_temp_file_path and os.path.exists(uploaded_full_temp_file_path):
-            os.remove(uploaded_full_temp_file_path) # Delete the initially uploaded full temp file
+        # Revert model settings and clean up resources
+        await revert_model_settings_after_request(
+            asr_model, long_audio_settings_were_applied, device_dtype_was_changed_from_global, 
+            processing_device_for_this_req, request_id
+        )
+        for p in [temp_uploaded_file_path]:
+            if p and os.path.exists(p):
+                try: await asyncio.to_thread(os.remove, p)
+                except Exception as e_del: logger.error(f"REST ({request_id}): Error deleting temp file {p}: {e_del}")
+        logger.debug(f"REST ({request_id}): Releasing model_access_lock and cleanup complete.")
 
 
+# --- WebSocket Endpoint ---
 @app.websocket("/v1/audio/transcriptions/ws")
-async def websocket_transcribe(websocket: WebSocket):
-    """
-    Handles audio transcription via WebSocket.
-    The client streams the entire audio file. The server accumulates all data,
-    decodes the full audio, then processes it in chunks with overlap
-    (similar to the REST endpoint's logic) by calling `run_asr_on_tensor_chunk`.
-    """
+async def websocket_transcribe_endpoint(websocket: WebSocket):
+    session_id = base64.urlsafe_b64encode(os.urandom(6)).decode()
+    logger.info(f"WS ({session_id}): Connection from {websocket.client.host}:{websocket.client.port}")
     await websocket.accept()
-    if not asr_model: # Global asr_model
-        logger.error("websocket_transcribe: ASR model not available.")
-        await websocket.send_json({"error": "ASR model not available."})
-        await websocket.close(code=1011)
-        return
 
-    main_audio_buffer = bytearray()  # Buffer for raw file bytes from client
-    client_config = {}               # For storing client-sent metadata (e.g., original format)
+    if not asr_model:
+        await websocket.send_json({"type": "error", "error": "ASR model not available."})
+        await websocket.close(code=1011); return
 
-    is_connected = True # Flag to control the receiving loop
+    accumulated_raw_bytes = bytearray()
+    temp_uploaded_file_path: str = ""
+    long_audio_settings_were_applied_ws = False
+    device_dtype_was_changed_from_global_ws = False
+    processing_device_for_this_req_ws = "cuda" if torch.cuda.is_available() else "cpu"
+
     try:
-        # 1. Receive client configuration (optional, primarily for logging)
-        try:
-            config_message = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
-            client_config.update(config_message)
-            logger.info(f"WebSocket (/ws) client reported config: {client_config}")
-        except asyncio.TimeoutError:
-            logger.info("WebSocket (/ws): Client configuration timeout. Proceeding.")
-        except Exception as e:
-            logger.info(f"WebSocket (/ws): Error receiving client configuration: {e}. Proceeding.")
-        
-        # 2. Accumulate all audio file bytes from the client stream
-        logger.info("WebSocket (/ws): Waiting for audio data stream from client...")
-        while is_connected:
+        raw_config_msg = await asyncio.wait_for(websocket.receive_text(), timeout=20.0)
+        client_config = json.loads(raw_config_msg)
+        client_sr = client_config.get("sample_rate", MODEL_SAMPLE_RATE)
+        client_ch = client_config.get("channels", 1)
+        client_bps = client_config.get("bytes_per_sample", 2)
+        client_audio_fmt = client_config.get("format", "binary").lower()
+        logger.info(f"WS ({session_id}): Config: SR={client_sr}, Ch={client_ch}, BPS={client_bps}, Format={client_audio_fmt}")
+
+        # 1. Accumulate audio data from client
+        while True: 
+            if websocket.application_state != WebSocketState.CONNECTED: break
             try:
-                if websocket.application_state != WebSocketState.CONNECTED:
-                    is_connected = False
-                    break
-                
-                message = await asyncio.wait_for(websocket.receive(), timeout=60.0) # Timeout for individual messages
-                
-                if "bytes" in message:
-                    main_audio_buffer.extend(message["bytes"])
-                elif "text" in message:
-                    if client_config.get("format") == "base64": # Handle base64 if client specifies
-                        try:
-                            main_audio_buffer.extend(base64.b64decode(message["text"]))
-                        except Exception as b64e:
-                            logger.warning(f"WebSocket (/ws): Base64 decode error: {b64e}")
-                            # Decide if this is a fatal error or if we should continue
-                    elif message["text"].upper() == "END":
-                        logger.info(f"WebSocket (/ws): END signal received. Total bytes: {len(main_audio_buffer)}")
-                        is_connected = False # Signal to stop receiving
-                        break 
-            except asyncio.TimeoutError:
-                logger.warning("WebSocket (/ws): Timeout waiting for message. Assuming stream ended or client stalled.")
-                is_connected = False # Stop receiving
-                break
-            except WebSocketDisconnect:
-                logger.info("WebSocket (/ws): Client disconnected during data accumulation.")
-                is_connected = False # Stop receiving
-                break
-            except Exception as e:
-                logger.error(f"WebSocket (/ws): Exception in receive loop: {str(e)}")
-                import traceback; traceback.print_exc()
-                is_connected = False # Stop receiving
-                break
+                message = await asyncio.wait_for(websocket.receive(), timeout=60.0)
+                if 'bytes' in message and message['bytes']:
+                    accumulated_raw_bytes.extend(message['bytes'])
+                elif 'text' in message and message['text']:
+                    if message['text'].upper() == "END":
+                        logger.info(f"WS ({session_id}): END signal. Total bytes: {len(accumulated_raw_bytes)}.")
+                        break
+                    elif client_audio_fmt == "base64": accumulated_raw_bytes.extend(base64.b64decode(message['text']))
+            except asyncio.TimeoutError: logger.warning(f"WS ({session_id}): Receive timeout, assuming end of stream."); break
+            except WebSocketDisconnect: logger.info(f"WS ({session_id}): Client disconnected during accumulation."); break
         
-        if not main_audio_buffer:
-            logger.info("WebSocket (/ws): No audio data received.")
-            if websocket.application_state == WebSocketState.CONNECTED: # Check before sending
-                await websocket.send_json({"error": "No audio data received", "type": "error"})
-            return
+        if not accumulated_raw_bytes:
+            await websocket.send_json({"type": "error", "error": "No audio data received by server."}); return
 
-        # --- Start of full audio processing logic (after all bytes received) ---
-        logger.info("WebSocket (/ws): Starting full audio processing.")
-        processing_start_time = time.time()
-        all_segments_sent_to_client = [] # Tracks segments sent for final summary
-        
-        try:
-            # 3. Decode the entire accumulated audio stream
-            audio_io_buffer = io.BytesIO(main_audio_buffer)
-            full_waveform, sr_original = torchaudio.load(audio_io_buffer)
-            main_audio_buffer.clear() # Release memory as soon as possible
-            logger.info(f"WebSocket (/ws): Audio decoded. Original SR={sr_original}, Shape={full_waveform.shape}")
+        # 2. Process accumulated audio under lock
+        async with model_access_lock:
+            logger.debug(f"WS ({session_id}): Acquired model_access_lock for processing.")
 
-            # 4. Preprocess: Resample to model's sample rate and convert to mono
-            if sr_original != MODEL_SAMPLE_RATE:
-                full_waveform = torchaudio.functional.resample(full_waveform, orig_freq=sr_original, new_freq=MODEL_SAMPLE_RATE)
+            # torchaudio decode & chunking pipeline
+            waveform_ws, sr_orig_ws = await asyncio.to_thread(torchaudio.load, io.BytesIO(bytes(accumulated_raw_bytes)))
+            accumulated_raw_bytes.clear()
+
+            if sr_orig_ws != MODEL_SAMPLE_RATE:
+                waveform_ws = await asyncio.to_thread(torchaudio.functional.resample, waveform_ws, sr_orig_ws, MODEL_SAMPLE_RATE)
             
-            if full_waveform.ndim > 1 and full_waveform.shape[0] > 1: # Multichannel
-                full_waveform = full_waveform.mean(dim=0) # Convert to mono [Time]
-            elif full_waveform.ndim == 2 and full_waveform.shape[0] == 1: # Already mono [1, Time]
-                full_waveform = full_waveform.squeeze(0) # Make it 1D [Time]
-            # Now, full_waveform is expected to be a 1D tensor [Time]
+            # convert to mono 1-D tensor
+            if waveform_ws.ndim > 1 and waveform_ws.shape[0] > 1:
+                waveform_ws = waveform_ws.mean(dim=0)
+            elif waveform_ws.ndim == 2 and waveform_ws.shape[0] == 1:
+                waveform_ws = waveform_ws.squeeze(0)
 
-            if full_waveform.numel() == 0:
-                logger.info("WebSocket (/ws): Audio content is empty after decoding/preprocessing.")
-                if websocket.application_state == WebSocketState.CONNECTED:
-                    await websocket.send_json({
-                        "text": "", "segments": [], "language": "en",
-                        "transcription_time": 0.0, "total_segments": 0,
-                        "final_duration_processed_seconds": 0.0, "type": "final_transcription"
-                    })
-                return
+            audio_duration_s_ws = waveform_ws.shape[-1] / MODEL_SAMPLE_RATE
+            logger.info(f"WS ({session_id}): Loaded stream via torchaudio. Duration: {audio_duration_s_ws:.2f}s.")
 
-            total_audio_duration_seconds = full_waveform.shape[0] / MODEL_SAMPLE_RATE
-            current_processing_window_start_seconds = 0.0 # Start of the main (non-overlapped) part of the window
-            
-            logger.info(f"WebSocket (/ws): Server-side chunking. Total Duration: {total_audio_duration_seconds:.2f}s. ChunkLen: {CHUNK_LENGTH}s, Overlap: {OVERLAP}s")
+            # Create overlapping chunks
+            chunks_ws, offsets_ws = create_audio_chunks(waveform_ws)
+            logger.info(f"WS ({session_id}): Created {len(chunks_ws)} chunks (len={TRANSCRIBE_CHUNK_LEN}s, overlap={TRANSCRIBE_OVERLAP}s)")
 
-            # 5. Process audio in chunks using a sliding window
-            while current_processing_window_start_seconds < total_audio_duration_seconds:
-                if websocket.application_state != WebSocketState.CONNECTED:
-                    logger.info("WebSocket (/ws): Client disconnected during chunk processing.")
-                    break
-                
-                # Calculate the actual slice for ASR, including overlap
-                # CHUNK_LENGTH and OVERLAP are from your global environment variables
-                actual_asr_chunk_start_seconds = max(0, current_processing_window_start_seconds - OVERLAP)
-                actual_asr_chunk_end_seconds = min(total_audio_duration_seconds, current_processing_window_start_seconds + CHUNK_LENGTH)
-                
-                start_sample_idx = int(actual_asr_chunk_start_seconds * MODEL_SAMPLE_RATE)
-                end_sample_idx = int(actual_asr_chunk_end_seconds * MODEL_SAMPLE_RATE)
+            # Apply model settings (device/dtype/long-audio)
+            long_audio_settings_were_applied_ws, device_dtype_was_changed_from_global_ws = await apply_model_settings_for_request(
+                asr_model, audio_duration_s_ws, processing_device_for_this_req_ws, LONG_AUDIO_THRESHOLD_S, session_id
+            )
 
-                if start_sample_idx >= end_sample_idx: # Should only happen if window is past audio end
-                    break 
-                
-                # Extract 1D tensor chunk for ASR
-                audio_chunk_for_asr = full_waveform[start_sample_idx:end_sample_idx] 
-                
-                if audio_chunk_for_asr.numel() == 0: # Skip if somehow the chunk is empty
-                    current_processing_window_start_seconds += (CHUNK_LENGTH - OVERLAP)
-                    continue # Advance window and re-evaluate loop condition
+            sent_segments = []
+            prev_segment = None
+            asr_start_ws = time.time()  # Start timing pure ASR processing
 
-                # Call the ASR function for this chunk
-                # `run_asr_on_tensor_chunk` expects a 1D tensor and its absolute start time
-                segments_from_chunk, _ = await asyncio.to_thread( 
-                    run_asr_on_tensor_chunk, 
-                    audio_chunk_for_asr,      
-                    actual_asr_chunk_start_seconds 
+            for batch_start in range(0, len(chunks_ws), CHUNKING_BATCH_SIZE):
+                batch_end = min(batch_start + CHUNKING_BATCH_SIZE, len(chunks_ws))
+                batch_chunks = chunks_ws[batch_start:batch_end]
+                batch_offsets = offsets_ws[batch_start:batch_end]
+
+                hyps_batch = await asyncio.to_thread(
+                    asr_model.transcribe,
+                    audio=batch_chunks,
+                    batch_size=len(batch_chunks),
+                    return_hypotheses=True,
+                    timestamps=True,
+                    verbose=False,
+                    num_workers=NUM_WORKERS,
                 )
 
-                # Send processed segments to client, applying filtering logic
-                if websocket.application_state == WebSocketState.CONNECTED:
-                    for segment_data in segments_from_chunk:
-                        # Filter: Send segment if its start time is within or after the current main window,
-                        # or if it's the first segment overall (to capture audio at the very beginning).
-                        if segment_data["start"] >= current_processing_window_start_seconds or not all_segments_sent_to_client:
-                            segment_data["id"] = len(all_segments_sent_to_client) # Assign sequential ID
-                            await websocket.send_json(segment_data)
-                            all_segments_sent_to_client.append(segment_data)
-                else:
-                    logger.info("WebSocket (/ws): Client disconnected while sending segments.")
-                    break 
-                
-                # Advance the main processing window
-                current_processing_window_start_seconds += (CHUNK_LENGTH - OVERLAP)
+                for idx, hyp in enumerate(hyps_batch):
+                    offset = batch_offsets[idx]
+                    if hasattr(hyp, "timestamp") and hyp.timestamp and "segment" in hyp.timestamp:
+                        for seg_meta in hyp.timestamp["segment"]:
+                            seg_text = seg_meta.get("segment", "").strip()
+                            if not seg_text:
+                                continue
+                            seg = {
+                                "start": round(seg_meta["start"] + offset, 3),
+                                "end": round(seg_meta["end"] + offset, 3),
+                                "text": seg_text,
+                                "seek": 0,
+                                "tokens": [],
+                                "temperature": 0.0,
+                                "avg_logprob": None,
+                                "compression_ratio": None,
+                                "no_speech_prob": None,
+                            }
+
+                            if prev_segment is None or seg["start"] >= prev_segment["end"] - 0.3:
+                                seg["id"] = len(sent_segments)
+                                if websocket.application_state == WebSocketState.CONNECTED:
+                                    await websocket.send_json({"type": "segment", **seg})
+                                sent_segments.append(seg)
+                                prev_segment = seg
+                            else:
+                                curr_dur = seg["end"] - seg["start"]
+                                prev_dur = prev_segment["end"] - prev_segment["start"]
+                                if curr_dur > prev_dur:
+                                    seg["id"] = prev_segment["id"]
+                                    if websocket.application_state == WebSocketState.CONNECTED:
+                                        await websocket.send_json({"type": "segment", **seg})
+                                    sent_segments[-1] = seg
+                                    prev_segment = seg
+
+            # Calculate timing metrics
+            asr_end_ws = time.time()
+            transcribe_call_duration_ws = round(asr_end_ws - asr_start_ws, 3)  # Pure ASR time
             
-            # 6. Send final transcription summary if still connected
-            if websocket.application_state == WebSocketState.CONNECTED:
-                final_transcription_text = " ".join(s['text'] for s in all_segments_sent_to_client).strip()
-                transcription_duration = round(time.time() - processing_start_time, 3)
-                await websocket.send_json({
-                    "text": final_transcription_text, 
-                    "language": "en", # Placeholder
-                    "transcription_time": transcription_duration,
-                    "total_segments": len(all_segments_sent_to_client),
-                    "final_duration_processed_seconds": round(total_audio_duration_seconds, 3),
-                    "type": "final_transcription"
-                })
-            logger.info("WebSocket (/ws): All processing complete.")
+            # Prepare final transcription text
+            text_ws = " ".join(s["text"] for s in sent_segments).strip()
 
-        except Exception as audio_processing_error:
-            logger.error(f"WebSocket (/ws): Error during audio processing phase: {audio_processing_error}")
-            import traceback; traceback.print_exc()
             if websocket.application_state == WebSocketState.CONNECTED:
-                await websocket.send_json({"error": f"Audio processing error: {audio_processing_error}", "type": "error"})
+                csv_ws = generate_csv_content(sent_segments)
+                srt_ws = generate_srt_content(sent_segments)
+                
+                final_response = {
+                    "type": "final_transcription",
+                    "text": text_ws,
+                    "language": "en",
+                    "transcription_time": transcribe_call_duration_ws,  # Pure ASR time only
+                    "total_segments": len(sent_segments),
+                    "final_duration_processed_seconds": round(audio_duration_s_ws, 3),
+                    "csv_content": csv_ws,
+                    "srt_content": srt_ws,
+                }
+                    
+                await websocket.send_json(final_response)
+                
+            logger.info(f"WS ({session_id}): Streaming processing complete. Segments: {len(sent_segments)}. "
+                       f"ASR time: {transcribe_call_duration_ws}s")
 
-    except Exception as outer_exception: # Catch any other unforeseen errors
-        logger.error(f"WebSocket (/ws): Unhandled exception in handler: {str(outer_exception)}")
-        import traceback; traceback.print_exc()
-    finally:
-        # Ensure WebSocket is closed from server-side if still open
+    except RuntimeError as e_rt_ws: # Specific for runtime errors like CUDA OOM
+        if "CUDA out of memory" in str(e_rt_ws):
+            logger.error(f"WS ({session_id}): CUDA OOM: {e_rt_ws}", exc_info=True)
+            if websocket.application_state == WebSocketState.CONNECTED: await websocket.send_json({"type":"error", "error":f"CUDA out of memory: {e_rt_ws}"})
+        else:
+            logger.error(f"WS ({session_id}): Runtime error: {e_rt_ws}", exc_info=True)
+            if websocket.application_state == WebSocketState.CONNECTED: await websocket.send_json({"type":"error", "error":f"Server runtime error: {e_rt_ws}"})
+            
+    except Exception as e_ws_outer:
+        logger.error(f"WS ({session_id}): Outer error: {e_ws_outer}", exc_info=True)
         if websocket.application_state == WebSocketState.CONNECTED:
-            await websocket.close()
-        logger.info("WebSocket (/ws) handler finished.")
-
+            await websocket.send_json({"type": "error", "error": "Unhandled server exception."})
+            
+    finally:
+        # Revert model settings and clean up resources
+        await revert_model_settings_after_request(
+            asr_model, long_audio_settings_were_applied_ws, device_dtype_was_changed_from_global_ws,
+            processing_device_for_this_req_ws, session_id
+        )
+        if temp_uploaded_file_path and os.path.exists(temp_uploaded_file_path):
+            try: await asyncio.to_thread(os.remove, temp_uploaded_file_path)
+            except Exception as e_del_ws: logger.error(f"WS ({session_id}): Error deleting temp WAV: {e_del_ws}")
+        
+        if websocket.application_state == WebSocketState.CONNECTED:
+            await websocket.close(code=1000)
+        logger.info(f"WS ({session_id}): Connection closed and handler finished.")
 
 if __name__ == "__main__":
     import uvicorn
     if not asr_model:
-        logger.critical("Cannot start server: ASR Model failed to load.")
+        logger.critical(f"ASR Model ('{ASR_MODEL_NAME}') failed to load. Server cannot start.")
     else:
-        logger.info(f"Starting server on port {PORT}. Model Rate: {MODEL_SAMPLE_RATE}")
-        uvicorn.run(app, host="0.0.0.0", port=PORT)
+        logger.info(f"Starting Uvicorn server on host 0.0.0.0, port {PORT}. ASR Model: {ASR_MODEL_NAME}")
+        uvicorn.run("main:app", host="0.0.0.0", port=PORT, workers=1)

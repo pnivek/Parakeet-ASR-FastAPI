@@ -2,65 +2,143 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Audio Transcription</title>
+  <title>Audio Transcription Service</title>
   <style>
-    /* Basic page styling */
-    body { font-family: system-ui, sans-serif; margin: 0; padding: 20px; line-height: 1.5; }
-    .container { max-width: 800px; margin: 0 auto; }
-    h1 { margin-top: 0; }
-    
-    /* Output display areas */
-    #segments { padding: 1em; background: #f4f4f4; border: 1px solid #ccc; max-height: 400px; overflow-y: auto; margin-top:10px; }
-    .segment { margin-bottom: 0.5em; padding: 4px; border-bottom: 1px dotted #eee; }
-    .segment:last-child { border-bottom: none; }
-    #result { background:#f8f8f8; padding:1em; border:1px solid #ccc; max-height:300px; overflow:auto; white-space:pre-wrap; border-radius: 4px; margin-top:10px;}
-    
-    /* Status indicators */
-    #progress { width: 100%; height: 20px; margin-top: 10px; display: none; }
-    .status { padding: 8px; margin: 8px 0; background: #e9f5ff; border-radius: 4px; }
-    #debug { background: #ffe; padding: 10px; border: 1px solid #ccc; max-height: 200px; overflow: auto; white-space: pre-wrap; font-family: monospace; font-size: 12px; margin-top: 20px; display: none; }
-    
-    /* Status message types */
-    .warning { background: #ffeeee; color: #990000; }
-    .success { background: #effff0; color: #006600; }
-    .info { background: #e9f5ff; color: #00529B; }
-    
-    /* Controls and inputs */
-    .controls { margin: 16px 0; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;}
-    button { padding: 8px 16px; background: #2563eb; color: white; border: none; border-radius: 4px; cursor: pointer; }
-    button:hover { background: #1d4ed8; }
-    button:disabled { background: #9ca3af; cursor: not-allowed; }
-    select, input[type="file"] { padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 20px; line-height: 1.6; background-color: #f4f7f6; color: #333; }
+    .container { max-width: 900px; margin: 20px auto; background: #fff; padding: 25px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+    h1, h2, h3 { color: #2c3e50; }
+    h1 { text-align: center; margin-bottom: 20px; }
+    h2 { margin-top: 30px; border-bottom: 1px solid #eee; padding-bottom: 10px;}
+    h3 { margin-top: 20px; }
+
+    /* Tabs */
+    .tab-container { display: flex; border-bottom: 1px solid #ccc; margin-bottom: 20px; }
+    .tab-button { 
+      padding: 10px 20px; 
+      cursor: pointer; 
+      background: #e8e8e8; 
+      color: #333; 
+      border: none; 
+      border-bottom: 1px solid #ccc; 
+      margin-right: 5px; 
+      border-radius: 4px 4px 0 0; 
+      font-weight: 500;
+      transition: all 0.2s ease;
+    }
+    .tab-button:hover { 
+      background: #d0d0d0; 
+      color: #222; 
+    }
+    .tab-button.active { 
+      background: #fff; 
+      color: #2c3e50; 
+      border: 1px solid #ccc; 
+      border-bottom: 1px solid #fff; 
+      position: relative; 
+      top: 1px; 
+      font-weight: 600;
+    }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    .controls { margin: 16px 0; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 15px; background-color: #f9f9f9; border-radius: 6px;}
+    button, input[type="file"], select { padding: 10px 15px; border: 1px solid #ccc; border-radius: 4px; font-size: 1em; }
+    button { background: #3498db; color: white; border: none; cursor: pointer; transition: background-color 0.3s; }
+    button:hover { background: #2980b9; }
+    button:disabled { background: #bdc3c7; cursor: not-allowed; }
+    #transcribeButton { background-color: #2ecc71; }
+    #transcribeButton:hover { background-color: #27ae60; }
+    #downloadCsvButton, #downloadSrtButton { background-color: #9b59b6; margin-top: 10px; display:none; /* Initially hidden */}
+    #downloadCsvButton:hover, #downloadSrtButton:hover { background-color: #8e44ad; }
+
+    #progress { width: 100%; height: 24px; margin-top: 15px; display: none; border-radius: 4px; }
+    .status { padding: 12px; margin: 15px 0; border-radius: 4px; font-size: 0.95em; }
+    #debug { background: #222; color: #0f0; padding: 15px; border: 1px solid #444; max-height: 250px; overflow: auto; white-space: pre-wrap; font-family: 'Courier New', Courier, monospace; font-size: 13px; margin-top: 20px; display: none; border-radius: 4px; }
+    .warning { background: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
+    .success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+    .info { background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
+
+    #result { background:#ecf0f1; padding:15px; border:1px solid #bdc3c7; max-height:200px; overflow:auto; white-space:pre-wrap; border-radius: 4px; margin-top:10px;}
+    #segmentsTableContainer { margin-top:10px; max-height: 300px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px;}
+    #segmentsTable { width: 100%; border-collapse: collapse; }
+    #segmentsTable th, #segmentsTable td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+    #segmentsTable th { background-color: #f0f0f0; position: sticky; top: 0; z-index: 1;}
+    .segment-row { cursor: pointer; } /* Make rows look clickable */
+    .segment-row:hover { background-color: #f0f8ff; } /* Light blue hover */
+    .segment-row.playing { background-color: #e6f7ff; font-weight: bold; } /* Highlight currently playing segment */
+    .segment-row td:nth-child(1), .segment-row td:nth-child(2) { width: 80px; text-align: right;}
+
+
+    #segmentPlayerContainer { margin-top: 20px; }
+    #segmentPlayer { width: 100%; }
+    .timing-info { display: flex; justify-content: space-between; margin: 10px 0; padding: 10px; background-color: #e9ecef; border-radius: 4px;}
+    .timing-info span { font-weight: bold; }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>NeMo parakeet Audio Transcription</h1>
-    
-    <div class="controls">
-      <input type="file" id="audioFile" accept="audio/*" />
-      <select id="mode">
-        <option value="rest">REST API (File Upload)</option>
-        <option value="ws">WebSocket (Full File Decode)</option>
-      </select>
-      <button id="transcribeButton" onclick="transcribe()">Transcribe</button>
-      <div>
-        <input type="checkbox" id="enableDebug" onchange="toggleDebug()" /> <label for="enableDebug">Debug mode</label>
+    <h1>NeMo Parakeet ASR Service</h1>
+
+    <div class="tab-container">
+      <button class="tab-button active" onclick="openTab(event, 'audioFileTab')">Audio File</button>
+      <button class="tab-button" onclick="openTab(event, 'microphoneTab')">Microphone</button>
+    </div>
+
+    <div id="audioFileTab" class="tab-content active">
+      <h2>Transcribe from Audio File</h2>
+      <div class="controls">
+        <input type="file" id="audioFile" accept="audio/*" />
+        <select id="mode">
+          <option value="rest">REST API (File Upload)</option>
+          <option value="ws">WebSocket (Chunked Processing)</option>
+        </select>
+        <button id="transcribeButton" onclick="transcribe()">Transcribe</button>
       </div>
+    </div>
+
+    <div id="microphoneTab" class="tab-content">
+      <h2>Transcribe from Microphone</h2>
+      <button id="startMicButton" disabled>Start Recording (Placeholder)</button>
     </div>
     
     <progress id="progress" value="0" max="100"></progress>
-    <div id="statusBox" class="status" style="display: none;"></div>
+    <div id="statusBox" class.status" style="display: none;"></div>
 
-    <h3>Transcription Time: <span id="time">N/A</span></h3>
-    <h3>Time to First Segment: <span id="timeToFirstSegment">N/A</span></h3>
-
-    <h3>Final Transcription Text:</h3>
+    <div class="timing-info">
+      <div>Time to First Segment: <span id="timeToFirstSegment">N/A</span></div>
+      <div>Transcription Time: <span id="time">N/A</span></div>
+      <div>Total Request Time: <span id="totalRequestTime">N/A</span></div>
+    </div>
+    
+    <h2>Full Transcription Text:</h2>
     <div id="result">No transcription yet.</div>
 
-    <h3>Streaming Segments:</h3>
-    <div id="segments">No segments received yet.</div>
+    <h2>Transcription Segments:</h2>
+    <div id="segmentPlayerContainer" style="display:none;">
+        <audio id="segmentPlayer" controls></audio>
+    </div>
+    <div id="segmentsTableContainer">
+        <table id="segmentsTable">
+            <thead>
+                <tr>
+                    <th>Start (s)</th>
+                    <th>End (s)</th>
+                    <th>Text</th>
+                </tr>
+            </thead>
+            <tbody>
+                <!-- Segments will be populated here -->
+            </tbody>
+        </table>
+    </div>
+    <div id="downloadButtons" style="margin-top: 15px; display:none;">
+        <button id="downloadCsvButton">Download CSV</button>
+        <button id="downloadSrtButton">Download SRT</button>
+    </div>
     
+    <div style="margin-top: 20px;">
+      <input type="checkbox" id="enableDebug" onchange="toggleDebug()" /> <label for="enableDebug">Show Debug Log</label>
+    </div>
     <div id="debug"></div>
   </div>
 
@@ -68,47 +146,46 @@
     // Constants
     const CLIENT_UPLOAD_CHUNK_SIZE = 1024 * 256; // 256KB chunk size for file uploads
 
-    // DOM Elements - Reference to all important UI elements for easy access
+    // DOM Elements
     const debugBox = document.getElementById("debug");
     const resultBox = document.getElementById("result");
     const timeBox = document.getElementById("time");
     const timeToFirstSegmentBox = document.getElementById("timeToFirstSegment");
-    const segmentsBox = document.getElementById("segments");
+    const totalRequestTimeBox = document.getElementById("totalRequestTime");
+    const segmentsTableBody = document.querySelector("#segmentsTable tbody");
+    const segmentPlayer = document.getElementById("segmentPlayer");
+    const segmentPlayerContainer = document.getElementById("segmentPlayerContainer");
+    const downloadCsvButton = document.getElementById("downloadCsvButton");
+    const downloadSrtButton = document.getElementById("downloadSrtButton");
+    const downloadButtonsContainer = document.getElementById("downloadButtons");
     const progressBar = document.getElementById("progress");
     const statusBox = document.getElementById("statusBox");
     const transcribeButton = document.getElementById("transcribeButton");
+    const audioFileInput = document.getElementById("audioFile");
+    const modeSelect = document.getElementById("mode");
     
-    // State variables - Track application state across function calls
-    let currentWebSocket = null;       // Current active WebSocket connection
-    let watchdogInterval = null;       // Interval for monitoring WebSocket health
-    let transcriptionStartTime = 0;    // Timestamp when transcription started
-    let firstSegmentReceived = false;  // Whether we've received at least one segment
+    // State variables
+    let currentWebSocket = null;
+    let watchdogInterval = null;
+    let transcriptionStartTime = 0;
+    let firstSegmentReceived = false;
+    let fullAudioBlobUrl = null; 
+    let currentlyPlayingRow = null; // To track the row being played
+    let accumulatedTranscriptionTime = 0; // For accumulating transcription time in WebSocket mode
 
     // Helper functions
-    /**
-     * Returns the base URL for making API requests, handling both development and production environments
-     */
     const getBaseUrl = () => {
-      return window.location.href.split('/').slice(0, 3).join('/');
+      return window.location.origin;
     };
 
-    /**
-     * Toggles debug information display based on checkbox state
-     * Enables/disables verbose logging for diagnostics
-     */
     function toggleDebug() {
       const debugEnabled = document.getElementById("enableDebug").checked;
       debugBox.style.display = debugEnabled ? "block" : "none";
       if (debugEnabled) logDebug("Debug mode enabled.");
     }
     
-    /**
-     * Logs debug information to the debug console if enabled
-     * @param {string} message - The message to log
-     * @param {any} obj - Optional object to serialize and display
-     */
     function logDebug(message, obj) {
-      if (debugBox.style.display === "block") {
+      if (debugBox.style.display === "block" || document.getElementById("enableDebug").checked) {
         const timestamp = new Date().toLocaleTimeString();
         let logMsg = `[${timestamp}] ${message}`;
         if (obj !== undefined) {
@@ -118,65 +195,150 @@
         const logElement = document.createElement("div");
         logElement.textContent = logMsg;
         debugBox.appendChild(logElement);
-        debugBox.scrollTop = debugBox.scrollHeight;
+        debugBox.scrollTop = debugBox.scrollHeight; 
       }
     }
     
-    /**
-     * Updates the status message display with appropriate styling
-     * @param {string} message - The status message to display
-     * @param {string} type - Message type ('info', 'warning', or 'success')
-     */
     function updateStatus(message, type = "info") {
       statusBox.style.display = "block";
       statusBox.textContent = message;
       statusBox.className = 'status'; 
       if (type) statusBox.classList.add(type);
-      logDebug(`Status Update (${type}): ${message}`);
+      logDebug(`Status (${type}): ${message}`);
     }
 
-    /**
-     * Resets the UI to its initial state before starting a new transcription
-     * Clears all display areas and resets state variables
-     */
+    function openTab(event, tabName) {
+      let i, tabcontent, tabbuttons;
+      tabcontent = document.getElementsByClassName("tab-content");
+      for (i = 0; i < tabcontent.length; i++) {
+        tabcontent[i].style.display = "none";
+      }
+      tabbuttons = document.getElementsByClassName("tab-button");
+      for (i = 0; i < tabbuttons.length; i++) {
+        tabbuttons[i].className = tabbuttons[i].className.replace(" active", "");
+      }
+      document.getElementById(tabName).style.display = "block";
+      event.currentTarget.className += " active";
+    }
+
+    function triggerDownload(content, fileName, mimeType) {
+        const blob = new Blob([content], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        logDebug(`Triggered download for ${fileName}`);
+    }
+
+    function playSegment(startTime, endTime, rowElement) {
+        logDebug(`Attempting to play segment from ${startTime}s to ${endTime}s`);
+        if (!fullAudioBlobUrl) {
+            logDebug("Error: fullAudioBlobUrl is not set. Cannot play segment.", "error");
+            updateStatus("Error: Audio source not loaded for segment playback.", "warning");
+            return;
+        }
+
+        segmentPlayerContainer.style.display = "block"; // Ensure player is visible
+        // Use a new src assignment to force media fragment loading
+        segmentPlayer.src = `${fullAudioBlobUrl}#t=${startTime},${endTime}`;
+        segmentPlayer.load(); // Important to re-load the source with the new fragment
+        segmentPlayer.play().catch(e => {
+            logDebug("Error playing audio segment:", e);
+            updateStatus(`Error playing segment: ${e.message}`, "warning");
+        });
+
+        if (currentlyPlayingRow) {
+            currentlyPlayingRow.classList.remove("playing");
+        }
+        if (rowElement) {
+            rowElement.classList.add("playing");
+            currentlyPlayingRow = rowElement;
+        }
+    }
+
+    // Add event listener to remove playing class when audio ends or is paused
+    segmentPlayer.onended = () => {
+        if (currentlyPlayingRow) {
+            currentlyPlayingRow.classList.remove("playing");
+            currentlyPlayingRow = null;
+        }
+    };
+    segmentPlayer.onpause = () => { // Also remove on manual pause
+        if (currentlyPlayingRow && segmentPlayer.currentTime >= parseFloat(currentlyPlayingRow.dataset.endTime) - 0.1) {
+             // if pause happens near end, treat as ended for styling
+            currentlyPlayingRow.classList.remove("playing");
+            currentlyPlayingRow = null;
+        }
+    };
+
+
     function resetUI() {
         resultBox.textContent = "No transcription yet.";
         timeBox.textContent = "N/A";
         timeToFirstSegmentBox.textContent = "N/A";
-        segmentsBox.innerHTML = "No segments received yet.";
+        totalRequestTimeBox.textContent = "N/A";
+        segmentsTableBody.innerHTML = ""; 
+        
+        if (fullAudioBlobUrl) {
+            URL.revokeObjectURL(fullAudioBlobUrl);
+            fullAudioBlobUrl = null;
+        }
+        segmentPlayer.pause(); // Stop any playback
+        segmentPlayer.src = ""; // Clear src
+        segmentPlayer.removeAttribute('src'); // Fully remove src attribute
+        segmentPlayerContainer.style.display = "none";
+        if (currentlyPlayingRow) {
+            currentlyPlayingRow.classList.remove("playing");
+            currentlyPlayingRow = null;
+        }
+
+
+        downloadButtonsContainer.style.display = "none";
+        downloadCsvButton.style.display = "none"; 
+        downloadSrtButton.style.display = "none";
+        downloadCsvButton.onclick = null; 
+        downloadSrtButton.onclick = null;
+
         if (!document.getElementById("enableDebug").checked) {
           debugBox.innerHTML = "";
         }
         progressBar.style.display = "none";
         progressBar.value = 0;
         statusBox.style.display = "none";
+        
         transcribeButton.disabled = false;
+        audioFileInput.disabled = false;
+        modeSelect.disabled = false;
         firstSegmentReceived = false;
+        accumulatedTranscriptionTime = 0;
     }
     
-    /**
-     * Main transcription function triggered by the Transcribe button
-     * Handles file selection and routes to appropriate processing method based on selected mode
-     */
     async function transcribe() {
-      resetUI();
-      const fileInput = document.getElementById("audioFile");
-      const mode = document.getElementById("mode").value;
+      resetUI(); // Ensures fullAudioBlobUrl is cleared before new assignment
+      const file = audioFileInput.files[0];
+      const mode = modeSelect.value;
 
-      // Validate file selection
-      if (!fileInput.files.length) {
+      if (!file) {
         updateStatus("Please select an audio file.", "warning");
         return;
       }
 
-      const file = fileInput.files[0];
       logDebug(`File selected: ${file.name}, size: ${(file.size / (1024 * 1024)).toFixed(2)}MB, type: ${file.type}`);
       transcribeButton.disabled = true;
+      audioFileInput.disabled = true;
+      modeSelect.disabled = true;
       
-      // Record start time for performance measurement
       transcriptionStartTime = performance.now();
 
-      // Route to appropriate processing method based on mode
+      fullAudioBlobUrl = URL.createObjectURL(file); // Create and store for segment playback
+      // Do not set segmentPlayer.src here for the full audio initially, 
+      // only when a segment is clicked or if a full playback button is added.
+      // segmentPlayerContainer.style.display = "block"; // Keep hidden until a segment is played
+
       if (mode === "rest") {
         await processWithREST(file);
       } else if (mode === "ws") {
@@ -184,29 +346,26 @@
       }
     }
     
-    /**
-     * Process audio file using REST API (synchronous processing)
-     * Uploads the entire file and waits for complete transcription
-     * @param {File} file - The audio file to transcribe
-     */
     async function processWithREST(file) {
       const formData = new FormData();
       formData.append("file", file);
       
-      // Set up progress display
       progressBar.style.display = "block";
       progressBar.value = 0; 
       updateStatus("Uploading and processing file (REST)...", "info");
       
-      // Simulate progress since we don't have real progress events from fetch
+      // Show placeholders for timing fields during processing
+      timeBox.textContent = "Calculating...";
+      timeToFirstSegmentBox.textContent = "Calculating...";
+      totalRequestTimeBox.textContent = "Calculating...";
+      
       let progressVal = 0;
       const pseudoProgress = setInterval(() => {
-        progressVal = Math.min(95, progressVal + 5);
+        progressVal = Math.min(95, progressVal + 5); 
         progressBar.value = progressVal;
       }, 200);
 
       try {
-        // Send file to server
         const res = await fetch(`${getBaseUrl()}/v1/audio/transcriptions`, {
           method: "POST", 
           body: formData
@@ -215,36 +374,58 @@
         clearInterval(pseudoProgress);
         progressBar.value = 100;
         
-        // Calculate total processing time
         const processingEndTime = performance.now();
         const totalDurationSeconds = ((processingEndTime - transcriptionStartTime) / 1000).toFixed(2);
         
-        // Handle server errors
         if (!res.ok) {
             const errorData = await res.json().catch(() => ({ detail: "Unknown server error" }));
             throw new Error(`Server error: ${res.status} - ${errorData.detail || res.statusText}`);
         }
         
-        // Process and display results
         const json = await res.json();
-        timeBox.textContent = `${json.transcription_time || totalDurationSeconds} seconds`; 
-        timeToFirstSegmentBox.textContent = `${json.transcription_time || totalDurationSeconds} seconds`; 
+        logDebug("REST response received", json);
+
+        // Calculate total request time client-side
+        totalRequestTimeBox.textContent = `${totalDurationSeconds} seconds`;
 
         resultBox.textContent = json.text || "No transcription text returned.";
-        segmentsBox.innerHTML = ""; 
+        timeBox.textContent = `${json.transcription_time || totalDurationSeconds} seconds`; 
         
-        // Display individual segments if available
+        segmentsTableBody.innerHTML = ""; 
         if (json.segments && json.segments.length) {
           json.segments.forEach(seg => {
-            const el = document.createElement("div");
-            el.className = "segment";
-            el.textContent = `[${seg.start.toFixed(2)}s - ${seg.end.toFixed(2)}s] ${seg.text}`;
-            segmentsBox.appendChild(el);
+            const row = segmentsTableBody.insertRow();
+            row.className = "segment-row"; // Add class for styling/selection
+            row.dataset.startTime = seg.start; // Store times as data attributes
+            row.dataset.endTime = seg.end;
+            row.insertCell().textContent = seg.start.toFixed(3);
+            row.insertCell().textContent = seg.end.toFixed(3);
+            row.insertCell().textContent = seg.text;
+            row.onclick = () => playSegment(parseFloat(row.dataset.startTime), parseFloat(row.dataset.endTime), row); 
           });
+          // For REST, time to first segment = total request time (all segments arrive at once)
+          timeToFirstSegmentBox.textContent = `${totalDurationSeconds} seconds`;
           updateStatus(`REST: Transcription complete with ${json.segments.length} segments!`, "success");
         } else {
+          timeToFirstSegmentBox.textContent = "N/A";
           updateStatus("REST: Transcription complete, but no segments were returned.", "info");
         }
+
+        let downloadsAvailable = false;
+        if (json.csv_content) {
+            downloadCsvButton.style.display = "inline-block";
+            downloadCsvButton.onclick = () => triggerDownload(json.csv_content, "transcription.csv", "text/csv");
+            downloadsAvailable = true;
+        }
+        if (json.srt_content) {
+            downloadSrtButton.style.display = "inline-block";
+            downloadSrtButton.onclick = () => triggerDownload(json.srt_content, "transcription.srt", "application/x-subrip");
+            downloadsAvailable = true;
+        }
+        if (downloadsAvailable) {
+            downloadButtonsContainer.style.display = "block";
+        }
+
       } catch (err) {
         console.error("REST Error:", err);
         resultBox.textContent = "Error: " + err.message;
@@ -253,14 +434,11 @@
       } finally {
         progressBar.style.display = "none";
         transcribeButton.disabled = false;
+        audioFileInput.disabled = false;
+        modeSelect.disabled = false;
       }
     }
     
-    /**
-     * Process audio file using WebSocket (streaming processing)
-     * Uploads file in chunks and receives real-time transcription results
-     * @param {File} file - The audio file to transcribe
-     */
     async function processWithWebSocket(file) {
       progressBar.style.display = "block";
       progressBar.value = 0;
@@ -269,11 +447,18 @@
       let receivedSegmentsCount = 0;
       let lastMessageTime = Date.now();
       let uploadStreamCompleted = false;
-      segmentsBox.innerHTML = ""; 
-      let audioSampleRate = 16000;  // Default sample rate if detection fails
-      let audioChannels = 1;        // Default to mono if detection fails
+      segmentsTableBody.innerHTML = ""; 
+      resultBox.textContent = "Connecting to WebSocket..."; 
+      let accumulatedTextForWs = ""; 
       
-      // Try to detect audio properties for optimal transcription
+      // Show placeholders for timing fields
+      timeBox.textContent = "Calculating...";
+      timeToFirstSegmentBox.textContent = "Calculating...";
+      totalRequestTimeBox.textContent = "Calculating...";
+
+      let audioSampleRate = 16000; 
+      let audioChannels = 1;
+      
       try {
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         const arrayBuffer = await file.arrayBuffer(); 
@@ -284,201 +469,196 @@
         await audioCtx.close(); 
       } catch (e) {
         logDebug(`Could not decode audio for properties: ${e.message}. Using defaults. File type: ${file.type}`, "warning");
-        if (file.type === "audio/wav" || file.name.toLowerCase().endsWith(".wav")) {
-            logDebug("File is WAV. Server will handle resampling if needed based on its default (16kHz).");
-        }
       }
 
       try {
-        // Close any existing WebSocket connection
         if (currentWebSocket && currentWebSocket.readyState === WebSocket.OPEN) {
           currentWebSocket.close();
         }
         
-        // Use secure WebSocket when on HTTPS, regular otherwise
         const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
         const wsUrl = `${wsProtocol}${window.location.host}/v1/audio/transcriptions/ws`;
         currentWebSocket = new WebSocket(wsUrl);
         
         const socket = currentWebSocket; 
         
-        // Set up watchdog to detect stalled connections
         if (watchdogInterval) clearInterval(watchdogInterval);
         watchdogInterval = setInterval(() => {
           if (uploadStreamCompleted && (Date.now() - lastMessageTime > 20000)) { 
-            updateStatus("No response from server for 20s. Processing might be slow or stalled.", "warning");
-            logDebug("Watchdog: Potential stall detected.");
+            updateStatus("No response from server for 20s (WS). Processing might be slow or stalled.", "warning");
+            logDebug("Watchdog (WS): Potential stall detected.");
             lastMessageTime = Date.now(); 
           }
         }, 10000); 
 
-        // WebSocket event handlers
         socket.onopen = async () => {
-          updateStatus("WebSocket connected (Full Decode). Sending configuration...", "info");
-          logDebug("WebSocket (Full Decode) opened.");
+          updateStatus("WebSocket connected. Sending configuration...", "info");
+          logDebug("WebSocket (Chunked) opened.");
           
-          // Send audio configuration
           socket.send(JSON.stringify({ 
             sample_rate: audioSampleRate, 
             channels: audioChannels, 
             format: "binary" 
           }));
-          logDebug(`Sent config (Full Decode): SR=${audioSampleRate}, CH=${audioChannels}`);
+          logDebug(`Sent config (Chunked WS): SR=${audioSampleRate}, CH=${audioChannels}`);
           
           try {
-            // Upload file in chunks
             await uploadFileInChunks(file, socket); 
-            logDebug("uploadFileInChunks (Full Decode) finished.");
+            logDebug("uploadFileInChunks (Chunked WS) finished.");
             
-            // Send END signal to indicate completion of upload
             if (socket.readyState === WebSocket.OPEN) {
-              updateStatus("File upload complete (Full Decode). Sending END signal...", "info");
+              updateStatus("File upload complete (Chunked WS). Waiting for final transcription...", "info");
               socket.send("END");
               uploadStreamCompleted = true;
               lastMessageTime = Date.now(); 
-              logDebug("END signal sent (Full Decode).");
+              logDebug("END signal sent (Chunked WS).");
             }
           } catch (uploadError) {
-            logDebug(`Upload failed (Full Decode): ${uploadError.message}`, uploadError);
-            updateStatus(`Upload error (Full Decode): ${uploadError.message}`, "warning");
+            logDebug(`Upload failed (Chunked WS): ${uploadError.message}`, uploadError);
+            updateStatus(`Upload error (Chunked WS): ${uploadError.message}`, "warning");
             if (socket.readyState === WebSocket.OPEN) socket.close();
           }
         };
         
-        // Handle incoming messages from server
         socket.onmessage = (event) => {
           lastMessageTime = Date.now(); 
           let msg;
           try {
             msg = JSON.parse(event.data); 
-            logDebug("WebSocket message received (Full Decode)", msg);
+            logDebug("WebSocket message received (Chunked WS)", msg);
 
-            // Handle server error messages
             if (msg.type === "error") {
-              updateStatus(`Server error (Full Decode): ${msg.error}`, "warning");
-              logDebug("Server-side error reported (Full Decode)", msg.error);
+              updateStatus(`Server error (Chunked WS): ${msg.error}`, "warning");
+              logDebug("Server-side error reported (Chunked WS)", msg.error);
               socket.close();
               return;
             }
             
-            // Handle final transcription result
             if (msg.type === "final_transcription") {
-              // Total transcription time is from the server message
+              // Use server-provided transcription time (pure ASR)
               timeBox.textContent = `${msg.transcription_time || 'N/A'} seconds`;
+              resultBox.textContent = msg.text || accumulatedTextForWs || "No final transcription text."; 
               
-              // Set time to first segment if not already set
-              if (!firstSegmentReceived && msg.total_segments > 0) { 
-                const fallbackTimeToFirst = ((performance.now() - transcriptionStartTime) / 1000).toFixed(2);
-                timeToFirstSegmentBox.textContent = `${fallbackTimeToFirst} seconds (final only)`;
-              } else if (!firstSegmentReceived && msg.total_segments === 0) {
+              // Calculate total request time client-side
+              const finalTime = performance.now();
+              const totalRequestSeconds = ((finalTime - transcriptionStartTime) / 1000).toFixed(2);
+              totalRequestTimeBox.textContent = `${totalRequestSeconds} seconds`;
+              
+              // If no segments were received, update time to first segment
+              if (!firstSegmentReceived && msg.total_segments === 0) {
                 timeToFirstSegmentBox.textContent = "N/A (no segments)";
               }
 
-              resultBox.textContent = msg.text || "No final transcription text.";
               progressBar.style.display = "none";
               const expectedSegments = msg.total_segments || 0;
               
-              // Check if we received all expected segments
               if (expectedSegments > receivedSegmentsCount) {
-                updateStatus(`Transcription complete (Full Decode)! Received ${receivedSegmentsCount}/${expectedSegments} segments. Final duration: ${msg.final_duration_processed_seconds}s.`, "warning");
+                updateStatus(`Transcription complete (Chunked WS)! Received ${receivedSegmentsCount}/${expectedSegments} segments. Final duration: ${msg.final_duration_processed_seconds}s.`, "warning");
               } else {
-                updateStatus(`Transcription complete (Full Decode)! ${receivedSegmentsCount} segments processed. Final duration: ${msg.final_duration_processed_seconds}s.`, "success");
+                updateStatus(`Transcription complete (Chunked WS)! ${receivedSegmentsCount} segments processed. Final duration: ${msg.final_duration_processed_seconds}s.`, "success");
               }
               
-              // Clean up resources
+              let downloadsAvailable = false;
+              if (msg.csv_content) {
+                  downloadCsvButton.style.display = "inline-block";
+                  downloadCsvButton.onclick = () => triggerDownload(msg.csv_content, "transcription.csv", "text/csv");
+                  downloadsAvailable = true;
+              }
+              if (msg.srt_content) {
+                  downloadSrtButton.style.display = "inline-block";
+                  downloadSrtButton.onclick = () => triggerDownload(msg.srt_content, "transcription.srt", "application/x-subrip");
+                  downloadsAvailable = true;
+              }
+              if (downloadsAvailable) {
+                  downloadButtonsContainer.style.display = "block";
+              }
+
               if (watchdogInterval) clearInterval(watchdogInterval); 
               socket.close(); 
-            } else if (msg.text !== undefined && msg.start !== undefined) { 
-              // This is a segment message with transcription text
-              
-              // Record time to first segment for UX measurement
+
+            } else if (msg.type === "segment" && msg.text !== undefined && msg.start !== undefined) { 
               if (!firstSegmentReceived) {
                 const firstSegmentTime = performance.now();
                 const durationToFirstSegment = ((firstSegmentTime - transcriptionStartTime) / 1000).toFixed(2);
                 timeToFirstSegmentBox.textContent = `${durationToFirstSegment} seconds`;
                 firstSegmentReceived = true;
+                segmentsTableBody.innerHTML = ""; 
+                resultBox.textContent = ""; 
               }
               
               receivedSegmentsCount++;
-              updateStatus(`Processing (Full Decode): Received segment ${receivedSegmentsCount}`, "info");
+              updateStatus(`Processing (Chunked WS): Received segment ${receivedSegmentsCount}`, "info");
               
-              // Clear placeholder if this is first segment
-              if (segmentsBox.innerHTML === "No segments received yet.") {
-                segmentsBox.innerHTML = ""; 
-                resultBox.textContent = "Transcribing... (receiving segments)";
+              const row = segmentsTableBody.insertRow();
+              row.className = "segment-row";
+              row.dataset.startTime = msg.start;
+              row.dataset.endTime = msg.end;
+              row.insertCell().textContent = msg.start.toFixed(3);
+              row.insertCell().textContent = msg.end.toFixed(3);
+              row.insertCell().textContent = msg.text;
+              row.onclick = () => playSegment(parseFloat(row.dataset.startTime), parseFloat(row.dataset.endTime), row);
+
+              accumulatedTextForWs += msg.text + " ";
+              resultBox.textContent = accumulatedTextForWs.trim() + "... (transcribing)"; 
+              
+              // Show that transcription is in progress without showing misleading time
+              if (receivedSegmentsCount === 1) {
+                timeBox.textContent = "Processing...";
               }
-              
-              // Create and display segment element
-              const el = document.createElement("div");
-              el.className = "segment";
-              el.textContent = `[${msg.start.toFixed(2)}s - ${msg.end.toFixed(2)}s] ${msg.text}`;
-              segmentsBox.appendChild(el);
-              segmentsBox.scrollTop = segmentsBox.scrollHeight; 
+
             } else {
-              logDebug("Received unhandled message structure (Full Decode)", msg);
+              logDebug("Received unhandled message structure (Chunked WS)", msg);
             }
           } catch (err) {
-            updateStatus(`Error parsing server JSON response (Full Decode): ${err.message}`, "warning");
-            logDebug("JSON Parse error (Full Decode)", {error: err.message, data: event.data});
+            updateStatus(`Error parsing server JSON response (Chunked WS): ${err.message}`, "warning");
+            logDebug("JSON Parse error (Chunked WS)", {error: err.message, data: event.data});
           }
         };
 
-        // Handle WebSocket error events
         socket.onerror = (error) => {
-          logDebug("WebSocket error (Full Decode)", error);
-          updateStatus("WebSocket error (Full Decode). Check console and server logs.", "warning");
+          logDebug("WebSocket error (Chunked WS)", error);
+          updateStatus("WebSocket error (Chunked WS). Check console and server logs.", "warning");
           progressBar.style.display = "none";
           if (watchdogInterval) clearInterval(watchdogInterval);
           transcribeButton.disabled = false;
+          audioFileInput.disabled = false;
+          modeSelect.disabled = false;
         };
         
-        // Handle WebSocket close events
         socket.onclose = (event) => {
-          logDebug("WebSocket closed (Full Decode)", {
-            code: event.code, 
-            reason: event.reason, 
-            wasClean: event.wasClean
-          });
-          
-          // Detect and report potential incomplete transcription
+          logDebug("WebSocket closed (Chunked WS)", { code: event.code, reason: event.reason, wasClean: event.wasClean });
           if (uploadStreamCompleted && !resultBox.textContent.includes("Transcription complete")) {
-             updateStatus(`Connection closed (Full Decode) (Code: ${event.code}). Transcription might be incomplete.`, 
-                          event.wasClean ? "info" : "warning");
-          } else if (!uploadStreamCompleted && event.code !== 1000 ) {
-             updateStatus(`Connection closed prematurely (Full Decode) (Code: ${event.code}).`, "warning");
+             updateStatus(`Connection closed (Chunked WS) (Code: ${event.code}). Transcription might contain duplicates.`, event.wasClean ? "info" : "warning");
+          } else if (!uploadStreamCompleted && event.code !== 1000 ) { 
+             updateStatus(`Connection closed prematurely (Chunked WS) (Code: ${event.code}).`, "warning");
           }
           
-          // Clean up resources
           progressBar.style.display = "none";
           if (watchdogInterval) clearInterval(watchdogInterval);
           transcribeButton.disabled = false;
+          audioFileInput.disabled = false;
+          modeSelect.disabled = false;
           currentWebSocket = null;
         };
         
       } catch (err) {
-        // Handle any errors in WebSocket setup
-        updateStatus(`Client-side WebSocket setup error (Full Decode): ${err.message}`, "warning");
-        logDebug("Outer WebSocket Error (Full Decode)", err);
+        updateStatus(`Client-side WebSocket setup error (Chunked WS): ${err.message}`, "warning");
+        logDebug("Outer WebSocket Error (Chunked WS)", err);
         progressBar.style.display = "none";
         if (watchdogInterval) clearInterval(watchdogInterval);
         transcribeButton.disabled = false;
+        audioFileInput.disabled = false;
+        modeSelect.disabled = false;
       }
     }
     
-    /**
-     * Uploads a file in chunks to a WebSocket connection
-     * Streams the file data and updates progress bar
-     * @param {File} file - The file to upload
-     * @param {WebSocket} socket - The WebSocket connection to send data through
-     */
     async function uploadFileInChunks(file, socket) {
         const fileSize = file.size;
         let offset = 0;
         
-        updateStatus(`Starting upload (Full File Mode): ${(fileSize / (1024 * 1024)).toFixed(2)}MB total`, "info");
-        logDebug(`uploadFileInChunks (Full File Mode): Starting for ${file.name}, size ${fileSize}`);
+        updateStatus(`Starting upload (Chunked WS Mode): ${(fileSize / (1024 * 1024)).toFixed(2)}MB total`, "info");
+        logDebug(`uploadFileInChunks (Chunked WS Mode): Starting for ${file.name}, size ${fileSize}`);
         
-        // Check browser support for streaming API
         if (!file.stream) {
             const errorMsg = "File streaming (file.stream()) is not supported. Cannot upload.";
             logDebug(errorMsg, "error");
@@ -490,74 +670,64 @@
         let lastProgressUpdate = 0;
         
         try {
-            // Read and send file in chunks
             while (offset < fileSize) {
-                // Check if WebSocket is still open
                 if (socket.readyState !== WebSocket.OPEN) {
-                    logDebug("WS closed during upload (Full File Mode).", "warning");
-                    throw new Error("WS connection closed during upload (Full File Mode).");
+                    logDebug("WS closed during upload (Chunked WS Mode).", "warning");
+                    throw new Error("WS connection closed during upload (Chunked WS Mode).");
                 }
                 
                 const { done, value } = await reader.read();
                 
                 if (done) {
-                    logDebug("File stream read complete (Full File Mode).");
+                    logDebug("File stream read complete (Chunked WS Mode).");
                     break;
                 }
                 
                 if (value) {
-                    // Send binary chunk directly through WebSocket
-                    socket.send(value);
+                    socket.send(value); 
                     offset += value.byteLength;
                     
-                    // Update progress bar
                     const progress = Math.min(100, Math.round((offset / fileSize) * 100));
                     progressBar.value = progress;
                     
-                    // Only update status on significant progress to avoid UI spam
                     if (progress > lastProgressUpdate || progress === 100) {
-                        updateStatus(`Uploading (Full File Mode): ${progress}%`, "info");
+                        updateStatus(`Uploading (Chunked WS Mode): ${progress}%`, "info");
                         lastProgressUpdate = progress;
                     }
-                    
-                    // Small delay to allow UI updates and prevent browser from freezing
-                    await new Promise(resolve => setTimeout(resolve, 1));
+                    await new Promise(resolve => setTimeout(resolve, 1)); 
                 } else if (!done) {
-                    logDebug("Reader no value but not done (Full File Mode).", "warning");
+                    logDebug("Reader no value but not done (Chunked WS Mode).", "warning");
                 }
             }
-            
-            // Verify complete upload
             if (offset < fileSize) {
-                logDebug(`Upload ended prematurely (Full File Mode): ${offset}/${fileSize} bytes.`, "warning");
+                logDebug(`Upload ended prematurely (Chunked WS Mode): ${offset}/${fileSize} bytes.`, "warning");
             } else {
-                logDebug("Full file content streamed for upload (Full File Mode).", "success");
+                logDebug("Full file content streamed for upload (Chunked WS Mode).", "success");
             }
         } catch (error) {
-            logDebug(`Error during chunk upload (Full File Mode): ${error.message}`, error);
-            updateStatus(`Upload stream error (Full File Mode): ${error.message}`, "warning");
-            
-            // Clean up reader if error occurs
-            if (reader) {
-                await reader.releaseLock().catch(e => logDebug("Error releasing reader lock (Full File Mode)", e));
-            }
-            
+            logDebug(`Error during chunk upload (Chunked WS Mode): ${error.message}`, error);
+            updateStatus(`Upload stream error (Chunked WS Mode): ${error.message}`, "warning");
+            if (reader) await reader.releaseLock().catch(e => logDebug("Error releasing reader lock (Chunked WS Mode)", e));
             throw error; 
         } finally {
-            // Always release reader lock to prevent memory leaks
             if (reader && typeof reader.releaseLock === 'function') { 
-                try {
-                    await reader.releaseLock();
-                    logDebug("File stream reader lock released (Full File Mode).");
-                } catch (e) {
-                    logDebug("Could not release reader lock (Full File Mode).", e);
-                }
+                try { await reader.releaseLock(); logDebug("File stream reader lock released (Chunked WS Mode)."); } 
+                catch (e) { logDebug("Could not release reader lock (Chunked WS Mode).", e); }
             }
         }
     }
     
-    // Initialize debug mode on page load
-    toggleDebug(); 
+    document.addEventListener('DOMContentLoaded', () => {
+        const activeTabButton = document.querySelector(".tab-button.active") || document.querySelector(".tab-button");
+        if (activeTabButton) {
+            // Simplified tab name extraction assuming it's the second argument to openTab
+            const onclickAttr = activeTabButton.getAttribute('onclick');
+            const tabNameMatch = onclickAttr ? onclickAttr.match(/'([^']*)'(?:,\s*'([^']*)')?/) : null;
+            const tabName = tabNameMatch ? (tabNameMatch[2] || tabNameMatch[1]) : 'audioFileTab'; // Fallback to audioFileTab
+            openTab({currentTarget: activeTabButton }, tabName);
+        }
+        toggleDebug(); 
+    });
   </script>
 </body>
 </html>

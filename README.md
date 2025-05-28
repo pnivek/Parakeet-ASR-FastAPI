@@ -29,7 +29,7 @@ The easiest way to run Parakeet ASR is using Docker:
 ```bash
 # Clone the repository
 git clone https://github.com/pnivek/Parakeet-ASR-FastAPI.git
-cd Parakeet-ASR-FastAPI # Updated directory name if it changed
+cd Parakeet-ASR-FastAPI
 
 # Build the Docker image
 docker build -t parakeet-asr .
@@ -46,7 +46,7 @@ If you prefer to run without Docker:
 ```bash
 # Clone the repository
 git clone https://github.com/pnivek/Parakeet-ASR-FastAPI.git
-cd Parakeet-ASR-FastAPI # Updated directory name if it changed
+cd Parakeet-ASR-FastAPI
 
 # Install dependencies (ensure you have build tools for packages that need compilation)
 # It's recommended to use a virtual environment
@@ -191,7 +191,7 @@ To set up a development environment:
 ```bash
 # Clone the repository
 git clone https://github.com/pnivek/Parakeet-ASR-FastAPI.git
-cd Parakeet-ASR-FastAPI # Updated directory name
+cd Parakeet-ASR-FastAPI
 
 # Create and activate a virtual environment (recommended)
 python -m venv venv

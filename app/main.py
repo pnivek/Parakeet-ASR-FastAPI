@@ -775,99 +775,106 @@ async def handle_streaming_pcm(
 
     async def pcm_consumer():
         """Consumer coroutine that processes audio chunks and generates transcriptions."""
-        nonlocal prev_segment_pcm, accumulated_asr_processing_time_s, sent_segments_pcm
+        # `prev_segment_pcm` is no longer needed here for on-the-fly stitching
+        # `sent_segments_pcm` will still accumulate all segments for the final CSV/SRT.
+        nonlocal accumulated_asr_processing_time_s, sent_segments_pcm 
         
-        consumer_batch_size = client_config["batch_size"]
+        consumer_batch_size_cap = client_config["batch_size"] # Max ASR input tensors per ASR call
         
         while True:
-            batch_chunks, batch_offsets, first_item_is_sentinel = [], [], False
+            batch_audio_tensors, batch_offsets, first_item_is_sentinel = [], [], False
             
-            # Collect batch of chunks
-            for _ in range(consumer_batch_size):
-                timeout = 0.02 if batch_chunks else None
+            # Collect a batch of ASR input audio tensors from the queue,
+            # up to consumer_batch_size_cap.
+            # This loop processes what's available, even if less than the cap.
+            for _ in range(consumer_batch_size_cap):
+                timeout = 0.02 if batch_audio_tensors else None # Wait indefinitely for the first item, short timeout for subsequent
                 item = None
                 
                 try:
-                    if producer_done_event.is_set() and chunk_queue.empty() and not batch_chunks:
-                        try:
-                            item = chunk_queue.get_nowait()
-                        except asyncio.QueueEmpty: 
-                            break
+                    if producer_done_event.is_set() and chunk_queue.empty() and not batch_audio_tensors:
+                        try: item = chunk_queue.get_nowait()
+                        except asyncio.QueueEmpty: break
                     else: 
                         item = await asyncio.wait_for(chunk_queue.get(), timeout=timeout)
                 except (asyncio.TimeoutError, asyncio.QueueEmpty): 
+                    # Timeout occurred or queue empty after getting at least one item, or queue initially empty for non-first.
                     break 
                 
-                if item is None: 
-                    if not batch_chunks: 
+                if item is None: # Sentinel value from producer
+                    if not batch_audio_tensors: # This was the first item fetched, and it's the sentinel
                         first_item_is_sentinel = True
                     chunk_queue.task_done()
-                    break
+                    break # Stop trying to collect for this batch
                 
                 tensor, offset = item
-                batch_chunks.append(tensor)
+                batch_audio_tensors.append(tensor)
                 batch_offsets.append(offset)
                 chunk_queue.task_done()
                 
+                # If producer is done and queue is now empty, process what we have
                 if producer_done_event.is_set() and chunk_queue.empty(): 
                     break
             
-            # Exit if no chunks to process
-            if not batch_chunks:
+            # If no audio tensors were collected (e.g., first item was sentinel or initial timeout),
+            # check if we should exit or continue waiting.
+            if not batch_audio_tensors:
                 if first_item_is_sentinel or (producer_done_event.is_set() and chunk_queue.empty()): 
-                    break
+                    logger.debug(f"({session_id}) PCM Consumer: No more audio tensors to process. Exiting consumer.")
+                    break # Exit the main while loop
                 else: 
-                    continue
+                    # This case should be rare if timeout for first item is None,
+                    # unless producer_done_event is set and queue becomes empty.
+                    logger.debug(f"({session_id}) PCM Consumer: No audio tensors in current attempt, but producer not done or queue not confirmed empty. Continuing.")
+                    continue # Go back to waiting for items from the queue
             
-            # Perform ASR transcription
-            hyps_list, batch_duration = await _perform_asr_transcription(
+            # Perform ASR transcription on the collected batch of audio tensors
+            logger.info(f"({session_id}) PCM Consumer: Processing batch of {len(batch_audio_tensors)} ASR input tensor(s).")
+            hyps_list, asr_call_duration = await _perform_asr_transcription(
                 asr_model_instance=asr_model, 
-                audio_input_list=batch_chunks,
-                batch_size_for_transcribe_call=len(batch_chunks), 
+                audio_input_list=batch_audio_tensors,
+                batch_size_for_transcribe_call=len(batch_audio_tensors), # Pass all collected tensors to NeMo
                 num_asr_workers=NUM_WORKERS,
-                request_id=f"WS-PCM-{session_id}-b"
+                request_id=f"WS-PCM-{session_id}-b" # Log a batch ID if useful
             )
-            accumulated_asr_processing_time_s += batch_duration
+            accumulated_asr_processing_time_s += asr_call_duration
 
-            # Clean up CUDA memory if used
             if processing_device == "cuda" and torch.cuda.is_available(): 
                 await asyncio.to_thread(torch.cuda.empty_cache)
             
-            # Process segments from this batch
-            segments_from_batch = []
+            segments_generated_this_asr_call = []
             if hyps_list:
-                segments_from_batch = _process_hypotheses_to_segments(
-                    hyps_list, batch_offsets, session_id
+                segments_generated_this_asr_call = _process_hypotheses_to_segments(
+                    hyps_list, batch_offsets, session_id # batch_offsets correspond to batch_audio_tensors
                 )
+                logger.info(f"({session_id}) PCM Consumer: ASR call yielded {len(segments_generated_this_asr_call)} segments.")
 
-            # Send segments, handling overlaps
-            for seg in segments_from_batch:
-                if (prev_segment_pcm is None or 
-                    seg["start"] >= prev_segment_pcm["end"] - 0.3):
-                    # New non-overlapping segment
-                    seg["id"] = len(sent_segments_pcm)
-                    if websocket.application_state == WebSocketState.CONNECTED: 
-                        await websocket.send_json({"type": "segment", **seg})
-                    sent_segments_pcm.append(seg)
-                    prev_segment_pcm = seg
-                else:
-                    # Overlapping segment - check if current is better
-                    curr_dur = seg["end"] - seg["start"]
-                    prev_dur = prev_segment_pcm["end"] - prev_segment_pcm["start"]
-                    
-                    if curr_dur > prev_dur:
-                        seg["id"] = prev_segment_pcm["id"]
-                        if websocket.application_state == WebSocketState.CONNECTED: 
-                            await websocket.send_json({"type": "segment", **seg})
-                        sent_segments_pcm[-1] = seg
-                        prev_segment_pcm = seg
+
+            # --- MODIFIED SEGMENT SENDING LOGIC ---
+            if segments_generated_this_asr_call:
+                if websocket.application_state == WebSocketState.CONNECTED:
+                    # Segments are already chronologically ordered by _process_hypotheses_to_segments
+                    # if hypotheses and offsets are ordered.
+                    # No temporary IDs needed here unless client specifically expects them per intermediate batch.
+                    await websocket.send_json({
+                        "type": "segments_batch", # Mirroring full file upload message type
+                        "segments": segments_generated_this_asr_call
+                    })
+                    logger.debug(f"({session_id}) PCM Consumer: Sent segments_batch with {len(segments_generated_this_asr_call)} segments.")
+                
+                # Accumulate all segments for the final SRT/CSV in the final_transcription message
+                sent_segments_pcm.extend(segments_generated_this_asr_call)
+            # --- END OF MODIFIED SEGMENT SENDING LOGIC ---
             
-            # Check for completion
+            # Check for completion (this condition is met if 'item is None' was processed,
+            # and this was the last batch to clear out the queue after producer was done).
             if (producer_done_event.is_set() and 
                 chunk_queue.empty() and 
-                first_item_is_sentinel and 
-                not batch_chunks): 
+                first_item_is_sentinel and # Ensures we recognized the sentinel
+                not batch_audio_tensors): # And no actual data was in this final processing loop
+                logger.debug(f"({session_id}) PCM Consumer: Post-processing sentinel check, exiting consumer.")
                 break
+
 
     try:
         # Run producer and consumer concurrently

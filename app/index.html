@@ -316,8 +316,8 @@
       <input type="file" id="audioFile" accept="audio/*" />
       <select id="modeSelect">
         <option value="rest">REST API</option>
-        <option value="ws_full_upload">WebSocket (Full File Upload)</option>
-        <option value="ws_live_stream">WebSocket (Live Stream)</option>
+        <option value="ws_upload">WebSocket (Full File Upload)</option>
+        <option value="ws_stream">WebSocket (Live Stream)</option>
       </select>
       <button id="transcribeButton" onclick="transcribe()">Transcribe</button>
     </div>
@@ -335,7 +335,7 @@
           <div class="setting-group">
             <label for="longAudioThreshold">Long Audio Threshold (s):</label>
             <input type="number" id="longAudioThreshold" value="480.0" step="30" min="60" max="1800" />
-            <span class="description">For all modes. Model uses different settings for audio longer than this.</span>
+            <span class="description">For all modes. Model uses different settings for audio longer than this (or for chunks longer than this in WS modes).</span>
           </div>
         </div>
         <!-- WebSocket Server-Side ASR Engine Configuration -->
@@ -708,7 +708,7 @@
       const bps = streamingStats.totalBytesUploaded / elapsed;
       const kbps = (bps * 8) / 1024;
       const audioBpsTheoretical = streamingStats.audioSampleRate * streamingStats.audioChannels * streamingStats.audioBytesPerSampleVal;
-      const audioSecsUploaded = streamingStats.totalBytesUploaded / audioBpsTheoretical;
+      const audioSecsUploaded = audioBpsTheoretical > 0 ? streamingStats.totalBytesUploaded / audioBpsTheoretical : 0;
       const uploadRtFactor = audioSecsUploaded > 0 && elapsed > 0 ? audioSecsUploaded / elapsed : 0;
       dom.uploadRealtimeFactorSpan.textContent = `${uploadRtFactor.toFixed(2)}x`;
       dom.uploadThroughputSpan.textContent = `${kbps.toFixed(1)} kbps`;
@@ -716,13 +716,13 @@
       dom.chunksSentSpan.textContent = `${streamingStats.totalChunksSent} (avg ${streamingStats.totalChunksSent > 0 ? (streamingStats.totalBytesUploaded / streamingStats.totalChunksSent).toFixed(0) : 0} B)`;
       if (streamingStats.segmentsReceived > 0) {
         const transDur = streamingStats.lastSegmentAudioTime;
-        const procTimeWall = (performance.now() - streamingStats.firstSegmentTime) / 1000;
-        const transRtFactor = transDur > 0 && elapsed > 0 ? transDur / elapsed : 0;
+        const procTimeWall = (performance.now() - streamingStats.firstSegmentTime) / 1000; // Time from first segment received
+        const transRtFactor = transDur > 0 && elapsed > 0 ? transDur / elapsed : 0; // RTF based on total elapsed time
         const avgLatencyMs = streamingStats.totalSegmentLatencyMs / streamingStats.segmentsReceived;
         dom.transcriptionRealtimeFactorSpan.textContent = `${transRtFactor.toFixed(2)}x`;
         dom.segmentsReceivedSpan.textContent = `${streamingStats.segmentsReceived}`;
         dom.avgSegmentLatencySpan.textContent = `${avgLatencyMs.toFixed(0)}ms`;
-        const pipelineEff = audioSecsUploaded > 0 ? (transDur / audioSecsUploaded) * 100 : 0;
+        const pipelineEff = audioSecsUploaded > 0 && transDur > 0 ? (transDur / audioSecsUploaded) * 100 : 0;
         dom.pipelineEfficiencySpan.textContent = `${pipelineEff.toFixed(1)}%`;
       }
     }
@@ -735,7 +735,7 @@
     async function sniffFileHeader(file) {
       const header = new Uint8Array(await file.slice(0, 64).arrayBuffer());
       const ascii = (a, s, e) => String.fromCharCode(...a.slice(s, e));
-      let fmt = "raw", sr = 16000, ch = 1, bps = 2;
+      let fmt = "raw", sr = 16000, ch = 1, bps = 2; // Defaults
       const riff = ascii(header, 0, 4);
       if (riff === 'RIFF' && ascii(header, 8, 12) === 'WAVE') {
         fmt = 'wav';
@@ -743,16 +743,17 @@
         try {
           ch = dv.getUint16(22, true);
           sr = dv.getUint32(24, true);
-          bps = dv.getUint16(34, true) / 8;
-          if (![1, 2, 4].includes(bps)) bps = 0;
+          bps = dv.getUint16(34, true) / 8; // bits per sample / 8
+          if (![1, 2, 4].includes(bps)) bps = 0; // 0 for unknown/unsupported PCM bit depth
         } catch (e) {
-          bps = 0;
+          logDebug("Error parsing WAV header details, using defaults for sr/ch/bps.", e);
+          bps = 0; // Mark as other if parsing failed
         }
       } else if (ascii(header, 0, 4) === 'fLaC') {
         fmt = 'flac';
       } else if (ascii(header, 0, 4) === 'OggS') {
         fmt = 'ogg';
-      } else if (riff === 'ID3' || (header[0] === 0xFF && (header[1] & 0xE0) === 0xE0)) {
+      } else if (riff === 'ID3' || (header[0] === 0xFF && (header[1] & 0xE0) === 0xE0)) { // MP3 check
         fmt = 'mp3';
       }
       return { fmt, sampleRate: sr, channels: ch, bps };
@@ -797,27 +798,38 @@
       }
       const headerInfo = await sniffFileHeader(file);
       updateDetectedAudioPropertiesUI(headerInfo);
-      updateSettingsVisibility(mode);
-      if (mode === "ws_live_stream" && !(headerInfo.fmt === 'wav' && headerInfo.sampleRate === 16000 && headerInfo.channels === 1 && headerInfo.bps === 2)) {
-        dom.audioFormatWarningBox.textContent = `File is ${headerInfo.fmt} (${headerInfo.sampleRate}Hz, ${headerInfo.channels}ch, ${headerInfo.bps * 8}-bit). Live Stream expects 16kHz/mono/16-bit PCM. Server may try conversion.`;
-        dom.audioFormatWarningBox.style.display = "block";
+      updateSettingsVisibility(mode); 
+      
+      // Updated Warning Message for Live Stream
+      if (mode === "ws_live_stream") {
+        if (!(headerInfo.fmt === 'wav' && headerInfo.sampleRate === 16000 && headerInfo.channels === 1 && headerInfo.bps === 2)) {
+            dom.audioFormatWarningBox.textContent = `File is ${headerInfo.fmt} (${headerInfo.sampleRate}Hz, ${headerInfo.channels}ch, ${headerInfo.bps * 8}-bit). Live Stream will send the original file bytes. The server will attempt to convert non-16kHz/mono audio. This may affect performance or quality for very unusual formats.`;
+            dom.audioFormatWarningBox.style.display = "block";
+        } else {
+            dom.audioFormatWarningBox.textContent = `File is ideal 16kHz/mono/16-bit WAV. Server will process efficiently.`;
+            dom.audioFormatWarningBox.className = 'status info'; // Change to info for ideal case
+            dom.audioFormatWarningBox.style.display = "block";
+        }
       } else {
         if (dom.audioFormatWarningBox) dom.audioFormatWarningBox.style.display = "none";
       }
-      logDebug(`File: ${file.name}, Size: ${(file.size / (1024 * 1024)).toFixed(2)}MB, Mode: ${mode}`);
+
+      logDebug(`File: ${file.name}, Size: ${(file.size / (1024 * 1024)).toFixed(2)}MB, Mode: ${mode}, Header:`, headerInfo);
       setControlsDisabled(true);
       transcriptionStartTime = performance.now();
       if (fullAudioBlobUrl) URL.revokeObjectURL(fullAudioBlobUrl);
-      fullAudioBlobUrl = URL.createObjectURL(file);
+      fullAudioBlobUrl = URL.createObjectURL(file); // For segment player
+
       if (mode === 'ws_live_stream') {
         streamingStats.audioSampleRate = headerInfo.sampleRate;
         streamingStats.audioChannels = headerInfo.channels;
-        streamingStats.audioBytesPerSampleVal = headerInfo.bps;
+        streamingStats.audioBytesPerSampleVal = headerInfo.bps > 0 ? headerInfo.bps : (headerInfo.fmt === 'wav' ? 2 : 0); // Guess 2 for WAV if bps is 0
         if (dom.streamingStatsContainer) dom.streamingStatsContainer.style.display = 'flex';
       }
+
       if (mode === "rest") await processWithREST(file);
-      else if (mode === "ws_full_upload") await processWithWebSocketFullUpload(file, headerInfo);
-      else if (mode === "ws_live_stream") await processWithLiveStream(file, headerInfo);
+      else if (mode === "ws_upload") await processWithWebSocketFullUpload(file, headerInfo);
+      else if (mode === "ws_stream") await processWithLiveStream(file, headerInfo);
     }
 
     /**
@@ -844,7 +856,7 @@
      */
     function renderSegmentsToTable(segments) {
       if (!dom.segmentsTableBody) return;
-      dom.segmentsTableBody.innerHTML = "";
+      dom.segmentsTableBody.innerHTML = ""; // Clear previous segments
       let accumulatedTextForDisplay = "";
       if (segments && segments.length) {
         segments.forEach(seg => {
@@ -874,40 +886,30 @@ function displayFinalTranscriptionResult(data, modeName) {
     dom.totalRequestTime.textContent = "N/A";
   }
 
-  // Only re-render the table if the final message explicitly contains a segments array.
-  // Otherwise, assume segments were accumulated client-side and should be preserved.
   if (data.segments && data.segments.length > 0) {
-    renderSegmentsToTable(data.segments); // This will clear and repopulate
+    renderSegmentsToTable(data.segments); 
     if (!firstSegmentReceived && dom.timeToFirstSegment && dom.totalRequestTime.textContent !== "N/A") {
-      dom.timeToFirstSegment.textContent = dom.totalRequestTime.textContent; // Or calculate from first segment time if available
+      dom.timeToFirstSegment.textContent = dom.totalRequestTime.textContent;
       firstSegmentReceived = true;
     }
   } else if (data.text && (!data.segments || data.segments.length === 0)) {
-    // If there's final text but no segments in this message, update the main result div
-    // but leave the client-accumulated segments table as is.
-    if (dom.result) dom.result.textContent = data.text.trim() || "Transcription complete, no text provided in final message.";
-    // If segments were accumulated client-side, they remain. If not, the table might be empty.
-    // Ensure `firstSegmentReceived` logic is handled correctly if relying on client-side accumulation.
-     if (!firstSegmentReceived && dom.segmentsTableBody && dom.segmentsTableBody.rows.length > 0 && dom.timeToFirstSegment && dom.totalRequestTime.textContent !== "N/A") {
-        // If segments appeared client-side before final message, but final message lacks segments.
-        // This timing might be based on when the first client-side segment was rendered.
-        // This specific timeToFirstSegment update might need adjustment based on how you measure it for WS.
-        // For now, we ensure it's marked if segments are visible.
-        firstSegmentReceived = true;
-     } else if (!firstSegmentReceived && dom.timeToFirstSegment) {
+    if (dom.result) dom.result.textContent = data.text.trim() || "Transcription complete, no text in final message.";
+    if (dom.segmentsTableBody && dom.segmentsTableBody.rows.length === 0) {
+      renderSegmentsToTable([]); 
+      if (dom.result) dom.result.textContent = data.text.trim() || "Transcription complete, no segments provided.";
+    }
+     if (!firstSegmentReceived && dom.timeToFirstSegment) {
         dom.timeToFirstSegment.textContent = "N/A (no segments in final)";
      }
   } else {
-    // No segments in the final message, and no explicit text.
-    // The segments table (if populated by client-side streaming) remains.
-    // The main result text might just indicate completion.
     if (dom.result && dom.segmentsTableBody && dom.segmentsTableBody.rows.length === 0) {
-         dom.result.textContent = data.text || "Transcription complete. No segments were reported or accumulated.";
-    } else if (dom.result && !data.text) {
-        // Keep existing result text if it was being built incrementally
+         dom.result.textContent = data.text || "Transcription complete. No segments or text reported.";
+         renderSegmentsToTable([]); 
     }
     if (!firstSegmentReceived && dom.segmentsTableBody && dom.segmentsTableBody.rows.length > 0) {
-        firstSegmentReceived = true; // Segments were accumulated client-side
+        firstSegmentReceived = true; 
+    } else if (!firstSegmentReceived && dom.timeToFirstSegment) {
+        dom.timeToFirstSegment.textContent = "N/A";
     }
   }
 
@@ -929,10 +931,10 @@ function displayFinalTranscriptionResult(data, modeName) {
 
   setControlsDisabled(false);
   if (currentWebSocket && currentWebSocket.readyState === WebSocket.OPEN && modeName.toLowerCase().includes("websocket")) {
-    try { currentWebSocket.close(1000); } catch (e) { logDebug("Error closing WS in displayFinalTranscriptionResult", e); }
+    try { currentWebSocket.close(1000, "Transcription complete, client closing."); } catch (e) { logDebug("Error closing WS in displayFinalTranscriptionResult", e); }
   }
   if (watchdogInterval) { clearInterval(watchdogInterval); watchdogInterval = null; }
-  if (modeName.toLowerCase().includes('live stream') && dom.streamingStatsContainer) updateStreamingStatsUI();
+  if (modeName.toLowerCase().includes('live stream') && dom.streamingStatsContainer) updateStreamingStatsUI(); 
 }
 
     /**
@@ -943,29 +945,39 @@ function displayFinalTranscriptionResult(data, modeName) {
       const formData = new FormData();
       formData.append("file", file);
       const settings = getClientSettings();
-      const queryParams = new URLSearchParams({ long_audio_threshold: settings.longAudioThreshold });
+      const queryParams = new URLSearchParams({ 
+        long_audio_threshold: settings.longAudioThreshold,
+        batch_size: settings.batchSize
+      });
+
       if (dom.progressBar) { dom.progressBar.style.display = "block"; dom.progressBar.value = 0; }
       updateStatus("Uploading and processing (REST)...", "info");
       ['time', 'timeToFirstSegment', 'totalRequestTime'].forEach(k => { if (dom[k]) dom[k].textContent = "Calculating..."; });
+      
       let pVal = 0;
       const pInt = setInterval(() => {
-        pVal = Math.min(95, pVal + 5);
+        pVal = Math.min(95, pVal + 5); 
         if (dom.progressBar) dom.progressBar.value = pVal;
       }, 200);
+
       try {
-        const res = await fetch(`${getBaseUrl()}/v1/audio/transcriptions?${queryParams.toString()}`, { method: "POST", body: formData });
+        const res = await fetch(`${getBaseUrl()}/v1/audio/transcriptions?${queryParams.toString()}`, { 
+          method: "POST", 
+          body: formData 
+        });
         if (pInt) clearInterval(pInt);
-        if (dom.progressBar) dom.progressBar.value = 100;
+        if (dom.progressBar) dom.progressBar.value = 100; 
+
         if (!res.ok) {
-          const errData = await res.json().catch(() => ({ error: "Unknown" }));
-          throw new Error(`Server ${res.status}: ${errData.error || errData.detail || "Error"}`);
+          const errData = await res.json().catch(() => ({ error: "Unknown server error", detail: `Status: ${res.status}` }));
+          throw new Error(`Server ${res.status}: ${errData.error || errData.detail || "Error processing request"}`);
         }
         const json = await res.json();
         displayFinalTranscriptionResult(json, "REST");
       } catch (err) {
         logDebug("REST Error:", err);
         updateStatus("REST Error: " + err.message, "warning");
-        if (pInt) clearInterval(pInt);
+        if (pInt) clearInterval(pInt); 
         if (dom.progressBar) dom.progressBar.style.display = "none";
         setControlsDisabled(false);
       }
@@ -984,34 +996,43 @@ function displayFinalTranscriptionResult(data, modeName) {
       if (dom.segmentsTableBody) dom.segmentsTableBody.innerHTML = "";
       if (dom.result) dom.result.textContent = "Connecting (WS Full Upload)...";
       ['time', 'timeToFirstSegment', 'totalRequestTime'].forEach(k => { if (dom[k]) dom[k].textContent = "Calculating..."; });
+
       try {
         if (currentWebSocket?.readyState === WebSocket.OPEN) currentWebSocket.close();
-        const wsUrl = `${getBaseUrl().replace(/^http/, 'ws')}/v1/audio/transcriptions/ws`;
+        const wsUrl = `${getBaseUrl().replace(/^http/, 'ws')}/v1/audio/transcriptions/ws_upload`;
         currentWebSocket = new WebSocket(wsUrl);
         const socket = currentWebSocket;
+
         if (watchdogInterval) clearInterval(watchdogInterval);
         watchdogInterval = setInterval(() => {
-          if (uploadCompleted && (Date.now() - lastMessageTime > 20000)) {
-            updateStatus("No server response >20s (WS Full Upload).", "warning");
-            lastMessageTime = Date.now();
+          if (uploadCompleted && (Date.now() - lastMessageTime > 20000)) { 
+            updateStatus("No server response >20s after upload (WS Full Upload). Check server logs.", "warning");
+            lastMessageTime = Date.now(); 
+          } else if (!uploadCompleted && (Date.now() - lastMessageTime > 60000)) { 
+             updateStatus("No server activity >60s during upload (WS Full Upload).", "warning");
+             lastMessageTime = Date.now();
           }
-        }, 10000);
+        }, 10000); 
+
         socket.onopen = async () => {
           updateStatus("WS connected (Full Upload). Sending config & file...", "info");
+          lastMessageTime = Date.now();
           const config = {
             sample_rate: dom.wsSampleRateSelect.value === "other" ? headerInfo.sampleRate : parseInt(dom.wsSampleRateSelect.value),
             channels: dom.wsChannelsSelect.value === "other" ? headerInfo.channels : parseInt(dom.wsChannelsSelect.value),
-            format: headerInfo.fmt,
             bytes_per_sample: parseInt(dom.wsBytesPerSampleSelect.value),
+            format: headerInfo.fmt, // Use actual sniffed format (e.g., "wav", "mp3")
+
             chunk_length: clientSettings.chunkLength,
             chunk_overlap: clientSettings.chunkOverlap,
             batch_size: clientSettings.batchSize,
-            long_audio_threshold: clientSettings.longAudioThreshold
+            long_audio_threshold: clientSettings.longAudioThreshold,
           };
           socket.send(JSON.stringify(config));
           logDebug(`Sent config (WS Full Upload)`, config);
+
           try {
-            await uploadFileInChunks(file, socket);
+            await uploadFileInChunks(file, socket); 
             if (socket.readyState === WebSocket.OPEN) {
               socket.send("END");
               uploadCompleted = true;
@@ -1020,25 +1041,30 @@ function displayFinalTranscriptionResult(data, modeName) {
             }
           } catch (e) {
             updateStatus(`Upload error: ${e.message}`, "warning");
-            if (socket.readyState === WebSocket.OPEN) socket.close();
+            logDebug("WS Full Upload: Upload error in onopen", e);
+            if (socket.readyState === WebSocket.OPEN) socket.close(1011, "Client upload error");
           }
         };
-        let accumulatedTextForDisplay = "";
+
+        let accumulatedTextForDisplay = ""; 
         socket.onmessage = (event) => {
           lastMessageTime = Date.now();
           let msg;
           try {
             msg = JSON.parse(event.data);
           } catch (e) {
-            updateStatus(`Parse error: ${e.message}`, "warning");
+            updateStatus(`Error parsing server message: ${e.message}`, "warning");
+            logDebug("WS Full Upload: JSON Parse error", event.data);
             return;
           }
           logDebug("WS Message (Full Upload)", msg);
+
           if (msg.type === "error") {
             updateStatus(`Server error: ${msg.error}`, "warning");
-            socket.close();
+            socket.close(); 
             return;
           }
+
           if (msg.type === "final_transcription") {
             displayFinalTranscriptionResult(msg, "WebSocket Full Upload");
           } else if (msg.type === "segments_batch") {
@@ -1048,38 +1074,45 @@ function displayFinalTranscriptionResult(data, modeName) {
             }
             if (msg.segments?.length && dom.segmentsTableBody) {
               msg.segments.forEach(seg => {
-                addSegmentRow(seg, dom.segmentsTableBody);
+                addSegmentRow(seg, dom.segmentsTableBody); 
                 accumulatedTextForDisplay += seg.text + " ";
               });
-              if (dom.result) dom.result.textContent = accumulatedTextForDisplay.trim() + (uploadCompleted ? "" : "... (transcribing)");
-              updateStatus(`Full Upload: Batch received. Segments: ${dom.segmentsTableBody.rows.length}.`, "info");
+              if (dom.result) {
+                 dom.result.textContent = accumulatedTextForDisplay.trim() + (uploadCompleted ? "" : "... (transcribing)");
+              }
+              updateStatus(`Full Upload: Batch received. Total segments in table: ${dom.segmentsTableBody.rows.length}.`, "info");
               if (dom.segmentsTableContainer) dom.segmentsTableContainer.scrollTop = dom.segmentsTableContainer.scrollHeight;
             }
           }
         };
+
         socket.onerror = (e) => {
-          logDebug("WS Error(Full Up)", e);
-          updateStatus("WS Error.", "warning");
+          logDebug("WS Error (Full Upload)", e);
+          updateStatus("WebSocket connection error (Full Upload).", "warning");
           if (dom.progressBar) dom.progressBar.style.display = "none";
-          if (watchdogInterval) clearInterval(watchdogInterval);
-          watchdogInterval = null;
+          if (watchdogInterval) clearInterval(watchdogInterval); watchdogInterval = null;
           setControlsDisabled(false);
         };
+
         socket.onclose = (e) => {
-          logDebug("WS Closed(Full Up)", e);
-          if (dom.result && !dom.result.textContent.includes("Complete (WebSocket Full Upload)") && e.code !== 1000)
-            updateStatus(`WS Closed (Code: ${e.code}).`, "warning");
+          logDebug("WS Closed (Full Upload)", {code: e.code, reason: e.reason, wasClean: e.wasClean});
+          if (!e.wasClean && e.code !== 1000 && !(dom.statusBox.textContent || "").toLowerCase().includes("complete")) {
+             updateStatus(`WebSocket connection closed (Full Upload). Code: ${e.code}. Reason: ${e.reason || 'N/A'}`, "warning");
+          } else if ((dom.statusBox.textContent || "").toLowerCase().includes("complete")) {
+          } else {
+             updateStatus(`WebSocket connection closed (Full Upload). Code: ${e.code}.`, "info");
+          }
           if (dom.progressBar) dom.progressBar.style.display = "none";
-          if (watchdogInterval) clearInterval(watchdogInterval);
-          watchdogInterval = null;
-          setControlsDisabled(false);
+          if (watchdogInterval) clearInterval(watchdogInterval); watchdogInterval = null;
+          setControlsDisabled(false); 
           currentWebSocket = null;
         };
-      } catch (err) {
-        updateStatus(`Client WS Setup Error: ${err.message}`, "warning");
+
+      } catch (err) { 
+        updateStatus(`Client WS Setup Error (Full Upload): ${err.message}`, "warning");
+        logDebug("WS Full Upload: Client Setup Error", err);
         if (dom.progressBar) dom.progressBar.style.display = "none";
-        if (watchdogInterval) clearInterval(watchdogInterval);
-        watchdogInterval = null;
+        if (watchdogInterval) clearInterval(watchdogInterval); watchdogInterval = null;
         setControlsDisabled(false);
       }
     }
@@ -1092,24 +1125,39 @@ function displayFinalTranscriptionResult(data, modeName) {
     async function uploadFileInChunks(file, socket) {
       const fileSize = file.size;
       let offset = 0;
-      if (!file.stream) throw new Error("File streaming not supported.");
+      if (!file.stream) {
+        logDebug("File streaming (file.stream()) not supported by this browser.");
+        throw new Error("File streaming not supported by this browser. Cannot upload in chunks this way.");
+      }
       const reader = file.stream().getReader();
       try {
         while (offset < fileSize) {
-          if (socket.readyState !== WebSocket.OPEN) throw new Error("WS closed during upload.");
+          if (socket.readyState !== WebSocket.OPEN) {
+            logDebug("WebSocket closed during chunk upload.");
+            throw new Error("WebSocket closed during upload.");
+          }
           const { done, value } = await reader.read();
-          if (done) break;
-          if (value) {
-            socket.send(value);
+          if (done) break; 
+          if (value) { 
+            socket.send(value); 
             offset += value.byteLength;
             if (dom.progressBar) dom.progressBar.value = Math.min(100, (offset / fileSize) * 100);
           }
         }
+        logDebug(`File upload streamed ${offset} of ${fileSize} bytes.`);
       } catch (error) {
         logDebug(`Chunk upload error: ${error.message}`, error);
-        throw error;
+        if (socket.readyState === WebSocket.OPEN) {
+             throw error;
+        }
       } finally {
-        if (reader) try { reader.releaseLock(); } catch (e) { logDebug("Error releasing reader lock", e); }
+        if (reader) {
+            try { 
+                reader.releaseLock(); 
+            } catch (e_rl) { 
+                logDebug("Error releasing reader lock", e_rl); 
+            }
+        }
       }
     }
 
@@ -1121,51 +1169,66 @@ function displayFinalTranscriptionResult(data, modeName) {
     async function processWithLiveStream(file, headerInfo) {
       const clientSettings = getClientSettings();
       if (dom.progressBar) { dom.progressBar.style.display = "block"; dom.progressBar.value = 0; }
-      firstSegmentReceived = false;
-      if (dom.segmentsTableBody) dom.segmentsTableBody.innerHTML = "";
+      firstSegmentReceived = false; 
+      if (dom.segmentsTableBody) dom.segmentsTableBody.innerHTML = ""; 
       if (dom.result) dom.result.textContent = "Starting Live Stream...";
       ['time', 'timeToFirstSegment', 'totalRequestTime'].forEach(k => { if (dom[k]) dom[k].textContent = "Calculating..."; });
+
       try {
         if (currentWebSocket?.readyState === WebSocket.OPEN) currentWebSocket.close();
-        const wsUrl = `${getBaseUrl().replace(/^http/, 'ws')}/v1/audio/transcriptions/ws`;
+        const wsUrl = `${getBaseUrl().replace(/^http/, 'ws')}/v1/audio/transcriptions/ws_stream`;
         currentWebSocket = new WebSocket(wsUrl);
         const socket = currentWebSocket;
+
         socket.onopen = async () => {
           updateStatus("WS Connected (Live Stream). Sending config...", "info");
           const config = {
             sample_rate: dom.wsSampleRateSelect.value === "other" ? headerInfo.sampleRate : parseInt(dom.wsSampleRateSelect.value),
             channels: dom.wsChannelsSelect.value === "other" ? headerInfo.channels : parseInt(dom.wsChannelsSelect.value),
-            format: "pcm",
-            bytes_per_sample: parseInt(dom.wsBytesPerSampleSelect.value),
-            source_original_format: headerInfo.fmt,
+            bytes_per_sample: parseInt(dom.wsBytesPerSampleSelect.value), 
+            
+            format: headerInfo.fmt, // Client sends the actual file format (wav, mp3, etc.)
+            // source_original_format: headerInfo.fmt, // Can be redundant if 'format' is always original. Kept for now.
+
             chunk_length: clientSettings.chunkLength,
             chunk_overlap: clientSettings.chunkOverlap,
             batch_size: clientSettings.batchSize,
             long_audio_threshold: clientSettings.longAudioThreshold,
-            streaming_chunk_size_bytes: clientSettings.streamingChunkSizeBytes,
-            network_delay_ms: clientSettings.networkDelayMs
+
+            streaming_chunk_size_bytes: clientSettings.streamingChunkSizeBytes, 
+            network_delay_ms: clientSettings.networkDelayMs 
           };
           socket.send(JSON.stringify(config));
           logDebug(`Sent config (Live Stream WS)`, config);
+
           await streamFileBytesForLiveMode(file, clientSettings, headerInfo);
         };
-        socket.onmessage = handleStreamingMessage;
+
+        socket.onmessage = handleStreamingMessage; 
+
         socket.onerror = (e) => {
-          logDebug("WS Error(Live Stream)", e);
-          updateStatus("WS Error.", "warning");
+          logDebug("WS Error (Live Stream)", e);
+          updateStatus("WebSocket connection error (Live Stream).", "warning");
           if (dom.progressBar) dom.progressBar.style.display = "none";
-          setControlsDisabled(false);
+          setControlsDisabled(false); 
         };
+
         socket.onclose = (e) => {
-          logDebug("WS Closed(Live Stream)", e);
-          if (dom.result && !dom.result.textContent.includes("Complete (WebSocket Live Stream)") && e.code !== 1000)
-            updateStatus(`Live Stream Closed (Code: ${e.code}).`, "info");
+          logDebug("WS Closed (Live Stream)", {code: e.code, reason: e.reason, wasClean: e.wasClean});
+           if (!e.wasClean && e.code !== 1000 && !(dom.statusBox.textContent || "").toLowerCase().includes("complete")) {
+             updateStatus(`Live Stream WebSocket closed. Code: ${e.code}. Reason: ${e.reason || 'N/A'}`, "warning");
+          } else if ((dom.statusBox.textContent || "").toLowerCase().includes("complete")) {
+          } else {
+             updateStatus(`Live Stream WebSocket closed. Code: ${e.code}.`, "info");
+          }
           if (dom.progressBar) dom.progressBar.style.display = "none";
-          setControlsDisabled(false);
+          setControlsDisabled(false); 
           currentWebSocket = null;
         };
-      } catch (err) {
-        updateStatus(`Client WS Setup Error: ${err.message}`, "warning");
+
+      } catch (err) { 
+        updateStatus(`Client WS Setup Error (Live Stream): ${err.message}`, "warning");
+        logDebug("WS Live Stream: Client Setup Error", err);
         if (dom.progressBar) dom.progressBar.style.display = "none";
         setControlsDisabled(false);
       }
@@ -1173,175 +1236,205 @@ function displayFinalTranscriptionResult(data, modeName) {
 
     /**
      * Stream file bytes for live mode processing.
+     * Sends the entire file content in chunks.
      * @param {File} file - The audio file.
-     * @param {Object} clientSettings - Client settings.
-     * @param {Object} headerInfo - The file header info.
+     * @param {Object} clientSettings - Client settings from the UI.
+     * @param {Object} headerInfo - Detected properties of the file (not used for skipping anymore).
      */
     async function streamFileBytesForLiveMode(file, clientSettings, headerInfo) {
       let reader;
       try {
         updateStatus("Streaming file content (Live Stream mode)...", "info");
-        if (dom.streamingStatsContainer) dom.streamingStatsContainer.style.display = 'flex';
-        const skipBytes = (headerInfo.fmt === 'wav' && file.size > 44) ? 44 : 0;
-        logDebug(`Live Stream: File ${headerInfo.fmt}, Skipping ${skipBytes} bytes.`);
-        const dataSize = file.size - skipBytes;
+        if (dom.streamingStatsContainer) dom.streamingStatsContainer.style.display = 'flex'; 
+
+        const dataSize = file.size; // Process the entire file
         if (dataSize <= 0) {
-          updateStatus(`No data in "${file.name}" after header skip.`, "warning");
+          updateStatus(`File "${file.name}" is empty. Cannot stream.`, "warning");
           if (currentWebSocket && currentWebSocket.readyState === WebSocket.OPEN) {
-            currentWebSocket.close(1003, "No audio data");
+            currentWebSocket.close(1003, "No audio data to stream"); 
           }
           return;
         }
+
         streamingStats.uploadStartTime = performance.now();
         streamingStats.totalBytesUploaded = 0;
         streamingStats.totalChunksSent = 0;
+        
         if (dom.progressBar) dom.progressBar.value = 0;
+
+        if (!file.stream) {
+            logDebug("File streaming (file.stream()) not supported by this browser for live mode.");
+            throw new Error("File streaming not supported by browser for live mode.");
+        }
         reader = file.stream().getReader();
-        let internalBuffer = new Uint8Array(0);
-        let headerSkippedCount = 0;
+        let internalBuffer = new Uint8Array(0); 
         const clientSendPacketSizeBytes = clientSettings.streamingChunkSizeBytes;
-        async function sendPacket(packet) {
-          if (!currentWebSocket || currentWebSocket.readyState !== WebSocket.OPEN) return false;
-          currentWebSocket.send(packet);
-          streamingStats.totalBytesUploaded += packet.byteLength;
+
+        async function sendPacket(packetData) {
+          if (!currentWebSocket || currentWebSocket.readyState !== WebSocket.OPEN) return false; 
+          currentWebSocket.send(packetData); 
+          streamingStats.totalBytesUploaded += packetData.byteLength;
           streamingStats.totalChunksSent++;
           if (dom.progressBar) dom.progressBar.value = Math.min(100, Math.round((streamingStats.totalBytesUploaded / dataSize) * 100));
-          updateStreamingStatsUI();
-          if (clientSettings.networkDelayMs > 0)
-            await new Promise(r => setTimeout(r, clientSettings.networkDelayMs));
+          updateStreamingStatsUI(); 
+
+          if (clientSettings.networkDelayMs > 0) {
+            await new Promise(resolve => setTimeout(resolve, clientSettings.networkDelayMs));
+          }
           return true;
         }
+
         let continueStreaming = true;
         while (continueStreaming) {
           if (!currentWebSocket || currentWebSocket.readyState !== WebSocket.OPEN) {
-            continueStreaming = false;
+            continueStreaming = false; 
             break;
           }
-          const { done, value } = await reader.read();
+
+          const { done, value } = await reader.read(); 
           if (done) {
-            continueStreaming = false;
+            continueStreaming = false; 
             break;
           }
-          let currentAudioData = value;
-          if (headerSkippedCount < skipBytes) {
-            const remainingHeader = skipBytes - headerSkippedCount;
-            if (currentAudioData.length <= remainingHeader) {
-              headerSkippedCount += currentAudioData.length;
-              continue;
-            }
-            currentAudioData = currentAudioData.subarray(remainingHeader);
-            headerSkippedCount = skipBytes;
-          }
-          const newCombined = new Uint8Array(internalBuffer.length + currentAudioData.length);
-          newCombined.set(internalBuffer);
-          newCombined.set(currentAudioData, internalBuffer.length);
-          internalBuffer = newCombined;
+
+          // Append new data to internal buffer
+          const newCombinedBuffer = new Uint8Array(internalBuffer.length + value.length);
+          newCombinedBuffer.set(internalBuffer);
+          newCombinedBuffer.set(value, internalBuffer.length);
+          internalBuffer = newCombinedBuffer;
+
+          // Send full packets from the internal buffer
           while (internalBuffer.length >= clientSendPacketSizeBytes && continueStreaming) {
             if (!currentWebSocket || currentWebSocket.readyState !== WebSocket.OPEN) {
               continueStreaming = false;
               break;
             }
-            const packet = internalBuffer.subarray(0, clientSendPacketSizeBytes);
-            internalBuffer = internalBuffer.subarray(clientSendPacketSizeBytes);
-            if (!(await sendPacket(packet.slice().buffer))) {
-              continueStreaming = false;
+            const packetToSend = internalBuffer.subarray(0, clientSendPacketSizeBytes);
+            internalBuffer = internalBuffer.subarray(clientSendPacketSizeBytes); 
+            
+            if (!(await sendPacket(packetToSend.slice().buffer))) { 
+              continueStreaming = false; 
               break;
             }
           }
-        }
+        } 
+
+        // Send any remaining data in the internal buffer
         if (internalBuffer.length > 0 && currentWebSocket && currentWebSocket.readyState === WebSocket.OPEN) {
+          logDebug(`Sending final partial packet of ${internalBuffer.length} bytes.`);
           await sendPacket(internalBuffer.slice().buffer);
         }
+
         if (currentWebSocket && currentWebSocket.readyState === WebSocket.OPEN) {
           currentWebSocket.send("END");
           updateStatus("Streaming complete. Awaiting final transcription...", "info");
-          updateStreamingStatsUI();
+          updateStreamingStatsUI(); 
         }
+
       } catch (error) {
         logDebug("Error in streamFileBytesForLiveMode:", error);
-        updateStatus(`Error streaming: ${error.message}`, "warning");
+        updateStatus(`Error streaming file: ${error.message}`, "warning");
         if (currentWebSocket && currentWebSocket.readyState === WebSocket.OPEN) {
           try {
             currentWebSocket.send(JSON.stringify({ type: "error", message: `Client stream error: ${error.message}` }));
-          } catch (e) {
-            logDebug("Failed to send error to WS after streamFileBytesForLiveMode error.", e);
+          } catch (e_send_err) {
+            logDebug("Failed to send error to WS after streamFileBytesForLiveMode error.", e_send_err);
           }
         }
       } finally {
         if (reader) {
           try {
             reader.releaseLock();
-          } catch (e) {
-            logDebug("Error releasing reader lock in streamFileBytesForLiveMode finally block:", e);
+          } catch (e_rl_final) {
+            logDebug("Error releasing reader lock in streamFileBytesForLiveMode finally block:", e_rl_final);
           }
         }
       }
     }
 
     /**
-     * Handle incoming streaming messages for live mode.
+     * Handle incoming streaming messages for live mode (and potentially full upload intermediate segments).
      * @param {MessageEvent} event - The WebSocket message event.
      */
     function handleStreamingMessage(event) {
       try {
         const msg = JSON.parse(event.data);
-        const currentMode = dom.modeSelect.value;
-        logDebug(`Streaming Message (${currentMode}):`, msg);
+        const currentMode = dom.modeSelect.value; 
+        logDebug(`Streaming Message (Mode: ${currentMode}):`, msg);
+
         if (msg.type === "error") {
           updateStatus(`Server error: ${msg.error}`, "warning");
           return;
         }
+
         if (msg.type === "segment" || (msg.type === "segments_batch" && msg.segments)) {
           const segmentsToProcess = msg.type === "segment" ? [msg] : msg.segments;
-          if (!segmentsToProcess || segmentsToProcess.length === 0) return;
+          if (!segmentsToProcess || segmentsToProcess.length === 0) return; 
+
           const receiveTime = performance.now();
+
           if (!firstSegmentReceived && dom.timeToFirstSegment) {
             dom.timeToFirstSegment.textContent = `${((performance.now() - transcriptionStartTime) / 1000).toFixed(2)}s`;
             firstSegmentReceived = true;
-            if (dom.modeSelect.value === 'ws_live_stream') {
-              if (dom.segmentsTableBody) dom.segmentsTableBody.innerHTML = "";
-              if (dom.result) dom.result.textContent = "";
-              streamingStats.firstSegmentTime = receiveTime;
+            if (currentMode === 'ws_live_stream') { 
+              if (dom.segmentsTableBody) dom.segmentsTableBody.innerHTML = ""; 
+              if (dom.result) dom.result.textContent = ""; 
+              streamingStats.firstSegmentTime = receiveTime; 
             }
           }
+
           let accumulatedTextCurrentBatch = "";
           segmentsToProcess.forEach(seg => {
-            if (dom.segmentsTableBody) addSegmentRow(seg, dom.segmentsTableBody);
+            if (dom.segmentsTableBody) addSegmentRow(seg, dom.segmentsTableBody); 
             accumulatedTextCurrentBatch += seg.text + " ";
-            if (dom.modeSelect.value === 'ws_live_stream' && streamingStats) {
+
+            if (currentMode === 'ws_live_stream' && streamingStats) {
               streamingStats.segmentsReceived++;
               streamingStats.lastSegmentAudioTime = Math.max(streamingStats.lastSegmentAudioTime, seg.end || 0);
-              if (streamingStats.firstSegmentTime > 0) streamingStats.totalSegmentLatencyMs += (receiveTime - streamingStats.firstSegmentTime);
+              if (streamingStats.firstSegmentTime > 0) {
+                 streamingStats.totalSegmentLatencyMs += (receiveTime - streamingStats.firstSegmentTime);
+              }
             }
           });
-          if (dom.modeSelect.value === 'ws_live_stream' && dom.result) {
-            let currentFullText = dom.result.textContent.endsWith("... (transcribing)") ? dom.result.textContent.slice(0, -19) : dom.result.textContent;
+          
+          if (currentMode === 'ws_live_stream' && dom.result) {
+            let currentFullText = dom.result.textContent.endsWith("... (transcribing)") 
+                                  ? dom.result.textContent.slice(0, -19) 
+                                  : dom.result.textContent;
             dom.result.textContent = (currentFullText + " " + accumulatedTextCurrentBatch.trim()).trim() + "... (transcribing)";
           }
+
           if (dom.segmentsTableContainer) dom.segmentsTableContainer.scrollTop = dom.segmentsTableContainer.scrollHeight;
           updateStatus(`Stream: Segments received. Total in table: ${dom.segmentsTableBody ? dom.segmentsTableBody.rows.length : 0}.`, "info");
-          if (dom.modeSelect.value === 'ws_live_stream' && dom.streamingStatsContainer) updateStreamingStatsUI();
-        }
+          
+          if (currentMode === 'ws_live_stream' && dom.streamingStatsContainer) {
+            updateStreamingStatsUI();
+          }
+        } 
+
         if (msg.type === "final_transcription") {
           const modeOption = dom.modeSelect.options[dom.modeSelect.selectedIndex];
-          const modeFriendlyName = modeOption ? modeOption.text : "Unknown Mode";
+          const modeFriendlyName = modeOption ? modeOption.text : (currentMode === "ws_live_stream" ? "WebSocket Live Stream" : "WebSocket");
           displayFinalTranscriptionResult(msg, modeFriendlyName);
         }
+
       } catch (error) {
-        logDebug("Error parsing streaming message:", error);
+        logDebug("Error parsing or handling streaming message:", error);
         updateStatus(`Error handling server message: ${error.message}`, "warning");
       }
     }
 
-    // Initialize event listeners after DOM content is loaded
     document.addEventListener('DOMContentLoaded', () => {
-      if (dom.enableDebugCheckbox) toggleDebug();
+      if (dom.enableDebugCheckbox) toggleDebug(); 
       if (dom.modeSelect) {
         dom.modeSelect.addEventListener('change', (e) => updateSettingsVisibility(e.target.value));
-        updateSettingsVisibility(dom.modeSelect.value);
+        updateSettingsVisibility(dom.modeSelect.value); 
       }
       [dom.wsSampleRateSelect, dom.wsChannelsSelect, dom.wsBytesPerSampleSelect].forEach(sel => {
-        if (sel && ![...sel.options].some(o => o.value === 'other')) sel.add(new Option("Other", "other"));
+        if (sel && ![...sel.options].some(o => o.value === 'other')) {
+           const otherOption = new Option("Other", "other");
+           sel.add(otherOption);
+        }
       });
     });
   </script>

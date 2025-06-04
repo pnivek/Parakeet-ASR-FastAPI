@@ -2,16 +2,18 @@ import gc
 import os
 import io
 import time
+import json
 import shutil
 import tempfile
 import base64
 import asyncio
 import logging
 from pathlib import Path
-import json
-from typing import Optional, Tuple, List, Any 
+from typing import Optional, Tuple, List
+import subprocess
+import uvicorn
 
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, Query, Request
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, Query
 from fastapi.websockets import WebSocketState
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,8 +24,7 @@ import torch
 import torchaudio
 import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.models.asr_model import ASRModel as NeMoASRModelType
-from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis 
-from omegaconf import OmegaConf
+from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 
 from dotenv import load_dotenv
 
@@ -34,7 +35,9 @@ from utils import (
 
 load_dotenv()
 
-# Logging Configuration
+# --- Logging Configuration ---
+# Configure logging level and format for the application.
+# Level can be set via LOG_LEVEL environment variable (e.g., "DEBUG", "INFO", "WARNING").
 log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
 log_level = getattr(logging, log_level_str, logging.INFO)
 logging.basicConfig(
@@ -45,1273 +48,1830 @@ logging.basicConfig(
 logger = logging.getLogger("parakeet-asr.main")
 logger.info(f"Logging configured with level: {log_level_str}")
 
-# App Configuration
-REST_BATCH_SIZE = 1
+# --- Application Configuration ---
+# Core application settings, mostly loaded from environment variables with defaults.
+
+# Number of workers for NeMo's internal DataLoader during transcription.
+# 0 typically means operations run in the main data loading thread.
 NUM_WORKERS = int(os.getenv("NUM_WORKERS", 0))
+
+# Target sample rate for the ASR model. Audio will be resampled to this rate.
 MODEL_SAMPLE_RATE = 16000
+
+# For uvicorn server
+HOST = os.getenv("HOST", "localhost")
 PORT = int(os.getenv("PORT", 8777))
+
+# Name of the NeMo ASR model to load from HuggingFace or local cache.
 ASR_MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v2"
+
+# Threshold (in seconds) to determine if "long audio" specific model settings
+# (like local attention) should be applied. This applies to the decision duration,
+# which can be total audio length (REST) or ASR chunk length (WebSockets).
 LONG_AUDIO_THRESHOLD_S = float(os.getenv("LONG_AUDIO_THRESHOLD", 480.0))
 
-# Chunking Configuration
-TRANSCRIBE_CHUNK_LEN = float(os.getenv("TRANSCRIBE_CHUNK_LEN", 30.0))
-TRANSCRIBE_OVERLAP = float(os.getenv("TRANSCRIBE_OVERLAP", 5.0))
-CHUNKING_BATCH_SIZE = int(os.getenv("BATCH_SIZE", 1))
+# Server-side ASR chunking configuration. These can be overridden by client in requests.
+TRANSCRIBE_CHUNK_LEN = float(os.getenv("TRANSCRIBE_CHUNK_LEN", 30.0)) # Duration of each ASR processing chunk.
+TRANSCRIBE_OVERLAP = float(os.getenv("TRANSCRIBE_OVERLAP", 5.0))   # Overlap between ASR processing chunks.
+CHUNKING_BATCH_SIZE = int(os.getenv("BATCH_SIZE", 1)) # Max number of ASR chunks processed together by the model.
+
+# Size of PCM data chunks read from ffmpeg's stdout in the streaming producer.
+FFMPEG_PCM_CHUNK_SIZE_BYTES = int(os.getenv("FFMPEG_PCM_CHUNK_SIZE_BYTES", 16384))
 
 logger.info(
     f"Configuration loaded:\n"
-    f"  Chunking: length={TRANSCRIBE_CHUNK_LEN}s, overlap={TRANSCRIBE_OVERLAP}s, batch={CHUNKING_BATCH_SIZE}\n"
-    f"  App: rest_batch={REST_BATCH_SIZE}, workers={NUM_WORKERS}, "
-    f"sample_rate={MODEL_SAMPLE_RATE}, port={PORT}\n"
-    f"  Model: {ASR_MODEL_NAME}, long_audio_threshold={LONG_AUDIO_THRESHOLD_S}s"
+    f"  App: workers={NUM_WORKERS}, sample_rate={MODEL_SAMPLE_RATE}, port={PORT}\n"
+    f"  Model: {ASR_MODEL_NAME}, long_audio_threshold_for_model_settings={LONG_AUDIO_THRESHOLD_S}s\n"
+    f"  Chunking Defaults: length={TRANSCRIBE_CHUNK_LEN}s, overlap={TRANSCRIBE_OVERLAP}s, batch_cap={CHUNKING_BATCH_SIZE}\n"
+    f"  Streaming (ffmpeg): pcm_read_chunk_size={FFMPEG_PCM_CHUNK_SIZE_BYTES}B"
 )
 
-# FastAPI App Setup
-app = FastAPI()
+# --- FastAPI App Setup ---
+app = FastAPI(title="Parakeet ASR Service", version="1.0.0")
 app.add_middleware(
-    CORSMiddleware, 
-    allow_origins=["*"], 
-    allow_credentials=True, 
-    allow_methods=["*"], 
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Static Files Setup
+# Static Files Setup for serving index.html
 current_dir = os.path.dirname(os.path.abspath(__file__))
 static_dir = os.path.join(current_dir, "static")
-os.makedirs(static_dir, exist_ok=True)
+if not os.path.exists(static_dir): # Ensure static directory exists
+    os.makedirs(static_dir, exist_ok=True)
+    logger.info(f"Created static directory at {static_dir}")
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def get_index_page():
+    """Serves the main HTML page for the UI."""
     index_path = os.path.join(static_dir, "index.html")
     if os.path.exists(index_path):
         return FileResponse(index_path)
     else:
-        return HTMLResponse(f"UI not found at {index_path}.", status_code=404)
+        logger.warning(f"index.html not found at {index_path}")
+        return HTMLResponse("<h1>ASR Service UI not found.</h1><p>Ensure index.html is in the 'static' directory.</p>", status_code=404)
 
-# Global Model Variables
-asr_model: Optional[NeMoASRModelType] = None 
-original_model_attention_config_dict: Optional[dict] = None 
-original_model_subsampling_config_dict: Optional[dict] = None 
-global_original_model_device_str: str = "cpu" 
-global_original_model_dtype_torch: torch.dtype = torch.float32
+# --- Global Model Variables & Initialization ---
+asr_model: Optional[NeMoASRModelType] = None
+global_original_model_device_str: str = "cpu"  # Default, will be updated after model load
+global_original_model_dtype_torch: torch.dtype = torch.float32 # Default
 
 try:
     logger.info(f"Loading ASR model: {ASR_MODEL_NAME}...")
+    # Load the pre-trained NeMo ASR model
     asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=ASR_MODEL_NAME)
-    asr_model.preprocessor.featurizer.dither = 0.0
-    asr_model.eval()
-    
-    # Store original model configuration for restoration
-    if hasattr(asr_model, 'cfg') and hasattr(asr_model.cfg, 'encoder'):
-        if hasattr(asr_model.cfg.encoder, 'attention'):
-            original_model_attention_config_dict = OmegaConf.to_container(
-                asr_model.cfg.encoder.attention, resolve=True
-            )
-        if hasattr(asr_model.cfg.encoder, 'conv_subsampling'):
-            original_model_subsampling_config_dict = OmegaConf.to_container(
-                asr_model.cfg.encoder.conv_subsampling, resolve=True
-            )
-    
-    # Store original device and dtype for restoration
-    global_original_model_device_str = str(next(asr_model.parameters()).device)
-    global_original_model_dtype_torch = next(asr_model.parameters()).dtype
-    
-    logger.info(
-        f"ASR model '{ASR_MODEL_NAME}' loaded. "
-        f"Original device: {global_original_model_device_str}, "
-        f"dtype: {global_original_model_dtype_torch}."
-    )
+    if asr_model is not None:
+        # Disable dithering in the preprocessor for consistent feature extraction in eval mode
+        asr_model.preprocessor.featurizer.dither = 0.0
+        asr_model.eval() # Set model to evaluation mode
+
+        # Store the model's initial device and dtype to revert to after processing
+        global_original_model_device_str = str(next(asr_model.parameters()).device)
+        global_original_model_dtype_torch = next(asr_model.parameters()).dtype
+
+        logger.info(
+            f"ASR model '{ASR_MODEL_NAME}' loaded successfully. "
+            f"Original device: {global_original_model_device_str}, "
+            f"dtype: {global_original_model_dtype_torch}."
+        )
 except Exception as e:
+    asr_model = None # Ensure asr_model is None if loading fails
     logger.critical(
-        f"FATAL: Could not load ASR model '{ASR_MODEL_NAME}'. Error: {e}", 
+        f"FATAL: Could not load ASR model '{ASR_MODEL_NAME}'. Application might not function correctly. Error: {e}",
         exc_info=True
     )
-    asr_model = None
 
+# Asynchronous lock to ensure exclusive access to the ASR model during transcription calls.
+# This prevents concurrent modifications to model state (e.g., device, dtype, attention settings).
 model_access_lock = asyncio.Lock()
 
+
 async def load_and_preprocess_audio(
-    audio_source: str | io.BytesIO, 
-    target_sample_rate: int, 
+    audio_source: str | io.BytesIO,
+    target_sample_rate: int,
     request_id: str = "req"
 ) -> Tuple[Optional[torch.Tensor], float]:
     """
-    Load and preprocess audio from file path or BytesIO stream.
-    
+    Asynchronously loads audio from a file path or BytesIO object,
+    resamples it to the target sample rate, converts to mono,
+    and returns it as a 1D PyTorch tensor along with its duration.
+
+    Args:
+        audio_source: Path to the audio file (str) or a BytesIO object.
+        target_sample_rate: The desired sample rate for the output waveform.
+        request_id: Identifier for logging purposes.
+
     Returns:
-        Tuple of (waveform_tensor, audio_duration_seconds)
+        A tuple containing the waveform tensor (1D float32) and its duration in seconds.
+        Returns (None, 0.0) if loading or processing fails.
     """
     waveform_tensor: Optional[torch.Tensor] = None
     audio_duration_s: float = 0.0
-    source_description = audio_source if isinstance(audio_source, str) else "BytesIO stream"
-    
+    source_description = audio_source if isinstance(audio_source, str) else "BytesIO object"
+
     try:
+        # Offload synchronous torchaudio.load to a separate thread
         wf, sr = await asyncio.to_thread(torchaudio.load, audio_source)
-        
+
         # Resample if necessary
-        if sr != target_sample_rate: 
+        if sr != target_sample_rate:
             wf = await asyncio.to_thread(
                 torchaudio.functional.resample, wf, sr, target_sample_rate
             )
         
-        # Convert stereo to mono if needed
-        if wf.shape[0] > 1: 
+        # Convert to mono by averaging channels if stereo or multi-channel
+        if wf.shape[0] > 1:
             wf = torch.mean(wf, dim=0, keepdim=True)
-        
-        waveform_tensor = wf.squeeze(0)
+
+        waveform_tensor = wf.squeeze(0) # Remove channel dimension if mono, ensure 1D
         audio_duration_s = waveform_tensor.shape[0] / target_sample_rate
         
-        if waveform_tensor.numel() == 0: 
+        if waveform_tensor.numel() == 0: # Check for empty tensor after processing
+            logger.warning(f"({request_id}) Audio processing resulted in an empty waveform from {source_description}.")
             return None, 0.0
             
         return waveform_tensor, audio_duration_s
         
     except Exception as e_load:
         logger.error(
-            f"({request_id}): Failed to load/preprocess audio from {source_description}. "
-            f"Error: {e_load}", 
+            f"({request_id}) Failed to load/preprocess audio from {source_description}. Error: {e_load}",
             exc_info=True
         )
         return None, 0.0
 
-async def convert_audio_chunk_to_target_pcm(
-    audio_chunk_bytes: bytes, 
-    client_format: str, 
-    client_sample_rate: int,
-    client_channels: int, 
-    client_bytes_per_sample: int, 
-    target_sample_rate: int,
-    request_id: str = "req"
-) -> Optional[bytes]:
-    """
-    Convert audio chunk from client format to target PCM format.
-    
-    Returns:
-        PCM bytes in target format, or None if conversion failed
-    """
-    try:
-        waveform: Optional[torch.Tensor] = None
-        source_sr: int = client_sample_rate
-        
-        if not audio_chunk_bytes: 
-            return None
-        
-        if client_format == "pcm":
-            # Handle different PCM bit depths
-            if client_bytes_per_sample == 2: 
-                waveform = torch.frombuffer(audio_chunk_bytes, dtype=torch.int16).float() / 32768.0
-            elif client_bytes_per_sample == 4: 
-                waveform = torch.frombuffer(audio_chunk_bytes, dtype=torch.int32).float() / 2147483648.0
-            elif client_bytes_per_sample == 1: 
-                waveform = torch.frombuffer(audio_chunk_bytes, dtype=torch.uint8).float() / 128.0 - 1.0
-            else: 
-                return None
-                
-            if waveform.numel() == 0: 
-                return None
-                
-            # Handle multi-channel audio
-            if client_channels > 1:
-                if waveform.numel() % client_channels != 0: 
-                    return None
-                try: 
-                    waveform = waveform.view(-1, client_channels).transpose(0, 1)
-                except RuntimeError: 
-                    return None 
-            else: 
-                waveform = waveform.unsqueeze(0)
-        else:
-            # Handle other audio formats
-            wf_temp, sr_temp = await asyncio.to_thread(
-                torchaudio.load, 
-                io.BytesIO(audio_chunk_bytes), 
-                format=client_format if client_format not in ["raw", "pcm"] else None
-            )
-            waveform = wf_temp
-            source_sr = sr_temp
-            
-            if waveform.numel() == 0: 
-                return None
-        
-        # Ensure waveform is 2D
-        if waveform.ndim == 1: 
-            waveform = waveform.unsqueeze(0)
-        
-        # Resample if necessary
-        if source_sr != target_sample_rate: 
-            waveform = await asyncio.to_thread(
-                torchaudio.functional.resample, waveform, source_sr, target_sample_rate
-            )
-        
-        # Convert to mono
-        if waveform.shape[0] > 1: 
-            waveform = torch.mean(waveform, dim=0, keepdim=False) 
-        elif waveform.ndim == 2 and waveform.shape[0] == 1: 
-            waveform = waveform.squeeze(0) 
-        
-        if waveform.numel() == 0: 
-            return None
-        
-        # Convert to 16-bit PCM
-        pcm_int16 = (waveform.clamp(-1.0, 1.0) * 32767).to(torch.int16)
-        return pcm_int16.numpy().tobytes()
-        
-    except Exception: 
-        return None
 
-async def _apply_model_settings_for_asr_call(
-    audio_duration_s: float, 
-    target_processing_device: str, 
+async def _apply_model_settings_for_session(
+    decision_duration_s: float,
+    target_processing_device: str,
+    target_operational_dtype: torch.dtype,
+    long_audio_threshold_config: float,
     request_id: str = "req"
 ) -> bool:
     """
-    Apply appropriate model settings based on audio duration and target device.
+    Configures the ASR model ONCE per session for device, dtype, and long/short audio settings.
     
+    The order of operations is important:
+    1. Move to target device.
+    2. Ensure model is float32 (for safety before structural changes).
+    3. Apply attention/subsampling changes (long or short audio mode).
+    4. Convert to final target_operational_dtype (e.g., bfloat16) for ASR computation.
+
+    Args:
+        decision_duration_s: The audio duration (can be total file or ASR chunk length)
+                             used to decide if long audio settings are needed.
+        target_processing_device: "cuda" or "cpu".
+        target_operational_dtype: The desired dtype for ASR computation (e.g., torch.bfloat16 or torch.float32).
+        long_audio_threshold_config: Duration threshold to activate long audio settings.
+        request_id: Identifier for logging.
+
     Returns:
-        bool: True if long audio settings were applied, False otherwise
+        True if long-audio specific settings (attention/subsampling) were activated for the session.
     """
     global asr_model
-    if asr_model is None: 
+    if asr_model is None:
+        logger.error(f"({request_id}) ASR model is None in _apply_model_settings_for_session.")
         return False
     
-    long_audio_applied_flag = False
-    current_device = str(next(asr_model.parameters()).device)
-    
-    # Move model to target device if needed
-    if current_device != target_processing_device: 
+    long_audio_settings_activated_for_session = False
+
+    # 1. Set model to target_processing_device for the session
+    if str(next(asr_model.parameters()).device) != target_processing_device:
         await asyncio.to_thread(asr_model.to, device=target_processing_device)
-    
-    # Ensure model is in float32 precision
-    if next(asr_model.parameters()).dtype != torch.float32: 
+        logger.debug(f"({request_id}) Session: Model moved to device: {target_processing_device}")
+
+    # 2. Ensure model is float32 BEFORE any structural changes (e.g., attention/subsampling)
+    # This ensures that model parameter modifications happen from a known, stable dtype.
+    if next(asr_model.parameters()).dtype != torch.float32:
         await asyncio.to_thread(asr_model.to, dtype=torch.float32)
-    
-    # Apply long audio optimizations for lengthy audio
-    if audio_duration_s > LONG_AUDIO_THRESHOLD_S:
+        logger.debug(f"({request_id}) Session: Model temporarily set to float32 before structural changes.")
+
+    # 3. Apply/Ensure attention and subsampling settings based on decision_duration_s (model is currently float32)
+    if decision_duration_s > long_audio_threshold_config:
+        logger.info(f"({request_id}) Session: Decision duration {decision_duration_s:.2f}s > threshold {long_audio_threshold_config:.2f}s. Applying long audio settings.")
         try:
-            await asyncio.to_thread(
-                asr_model.change_attention_model, "rel_pos_local_attn", [256, 256]
-            )
+            await asyncio.to_thread(asr_model.change_attention_model, "rel_pos_local_attn", [256, 256])
             await asyncio.to_thread(asr_model.change_subsampling_conv_chunking_factor, 1)
-            long_audio_applied_flag = True
-        except Exception: 
-            pass
-    
-    # Use bfloat16 on CUDA if supported for better performance
-    if (target_processing_device == "cuda" and 
-        torch.cuda.is_available() and 
-        torch.cuda.is_bf16_supported()):
-        if next(asr_model.parameters()).dtype != torch.bfloat16: 
-            await asyncio.to_thread(asr_model.to, dtype=torch.bfloat16)
-    
-    return long_audio_applied_flag
+            long_audio_settings_activated_for_session = True
+            logger.debug(f"({request_id}) Session: Long audio settings (attention: rel_pos_local_attn, subsampling_factor: 1) applied.")
+        except Exception as e_long:
+            logger.warning(f"({request_id}) Session: Failed to apply long audio settings: {e_long}")
+    else:
+        logger.info(f"({request_id}) Session: Decision duration {decision_duration_s:.2f}s <= threshold {long_audio_threshold_config:.2f}s. Ensuring short audio settings.")
+        try:
+            await asyncio.to_thread(asr_model.change_attention_model, "rel_pos") # Default attention
+            await asyncio.to_thread(asr_model.change_subsampling_conv_chunking_factor, -1) # Default subsampling
+            logger.debug(f"({request_id}) Session: Short audio settings (attention: rel_pos, subsampling_factor: -1) ensured.")
+        except Exception as e_short:
+            logger.warning(f"({request_id}) Session: Failed to ensure short audio settings: {e_short}")
+            
+    # 4. Set model to the final target_operational_dtype (e.g., bfloat16) AFTER structural changes
+    if next(asr_model.parameters()).dtype != target_operational_dtype:
+        await asyncio.to_thread(asr_model.to, dtype=target_operational_dtype)
+        logger.info(f"({request_id}) Session: Model set to final operational dtype: {target_operational_dtype} for ASR computation.")
+    else:
+        logger.debug(f"({request_id}) Session: Model already in final operational dtype: {target_operational_dtype}.")
+            
+    return long_audio_settings_activated_for_session
+
 
 async def _revert_model_to_global_original_state(
-    long_audio_applied_for_call: bool, 
-    processing_device_this_call: str, 
+    long_audio_settings_were_active_for_session: bool,
+    session_processing_device: str, # The device the model was on during the session
     request_id: str = "req"
 ):
     """
-    Revert model to its original state after processing.
-    
+    Reverts the ASR model to its globally original state (device and dtype) ONCE at the end of a session.
+    If long audio settings were active, it reverts attention/subsampling to their defaults first.
+    Clears CUDA cache if CUDA was used.
+
     Args:
-        long_audio_applied_for_call: Whether long audio settings were applied
-        processing_device_this_call: Device used for this processing call
-        request_id: Request ID for logging
+        long_audio_settings_were_active_for_session: Flag indicating if long audio settings need reversion.
+        session_processing_device: The device ("cuda" or "cpu") used during the session.
+        request_id: Identifier for logging.
     """
-    global asr_model
-    if asr_model is None: 
+    global asr_model, global_original_model_device_str, global_original_model_dtype_torch
+    if asr_model is None:
+        logger.error(f"({request_id}) ASR model is None in _revert_model_to_global_original_state.")
         return
-    
+
     try:
-        # Move model back to CPU first
-        if str(next(asr_model.parameters()).device) != "cpu": 
-            await asyncio.to_thread(asr_model.cpu)
-        
-        # Revert long audio settings if they were applied
-        if long_audio_applied_for_call: 
+        # This should be done while the model is still on its compute device and operational dtype,
+        # before moving to the global original device/dtype, in case these changes expect that state.
+        if long_audio_settings_were_active_for_session:
+            logger.info(f"({request_id}) End of Session: Reverting long audio specific model settings (attention to rel_pos, subsampling to -1).")
             try:
-                await asyncio.to_thread(asr_model.change_attention_model, "rel_pos") 
-                await asyncio.to_thread(asr_model.change_subsampling_conv_chunking_factor, -1) 
-            except Exception: 
-                pass
-        
-        # Restore original device and dtype
-        if (str(next(asr_model.parameters()).device) != global_original_model_device_str or 
-            next(asr_model.parameters()).dtype != global_original_model_dtype_torch):
-            await asyncio.to_thread(
-                asr_model.to, 
-                device=global_original_model_device_str, 
-                dtype=global_original_model_dtype_torch
-            )
-        
-        # Clean up CUDA memory if it was used
-        if processing_device_this_call == "cuda" and torch.cuda.is_available():
+                # Ensure model is float32 if structural changes expect it (safer)
+                if next(asr_model.parameters()).dtype != torch.float32:
+                    await asyncio.to_thread(asr_model.to, dtype=torch.float32)
+                    logger.debug(f"({request_id}) End of Session: Model temporarily set to float32 for reverting structural changes.")
+
+                await asyncio.to_thread(asr_model.change_attention_model, "rel_pos")
+                await asyncio.to_thread(asr_model.change_subsampling_conv_chunking_factor, -1)
+            
+            except Exception as e_rev_long_specific:
+                 logger.warning(f"({request_id}) End of Session: Failed to revert long-audio specific settings: {e_rev_long_specific}")
+
+        # 2. ALWAYS revert model to its globally original device and dtype (from initial load)
+        current_device_after_session_ops = str(next(asr_model.parameters()).device)
+        current_dtype_after_session_ops = next(asr_model.parameters()).dtype
+
+        if (current_device_after_session_ops != global_original_model_device_str or
+            current_dtype_after_session_ops != global_original_model_dtype_torch):
+            logger.info(f"({request_id}) End of Session: Reverting model to global original device ('{global_original_model_device_str}') and dtype ({global_original_model_dtype_torch}).")
+            await asyncio.to_thread(asr_model.to, device=global_original_model_device_str, dtype=global_original_model_dtype_torch)
+        else:
+            logger.debug(f"({request_id}) End of Session: Model already on global original device/dtype. No change needed.")
+            
+        # 3. Clean up CUDA cache if CUDA was used during the session
+        if session_processing_device == "cuda" and torch.cuda.is_available():
             await asyncio.to_thread(gc.collect)
             await asyncio.to_thread(torch.cuda.empty_cache)
+            logger.debug(f"({request_id}) End of Session: CUDA cache cleared as '{session_processing_device}' was used.")
             
-    except Exception: 
-        pass
+    except Exception as e_restore_globally:
+        logger.error(f"({request_id}) Error during final model state reversion: {e_restore_globally}", exc_info=True)
+
 
 async def _perform_asr_transcription(
-    asr_model_instance: NeMoASRModelType, 
-    audio_input_list: List[torch.Tensor],
-    batch_size_for_transcribe_call: int, 
-    num_asr_workers: int, 
+    asr_model_instance: NeMoASRModelType,
+    audio_input_list: List[torch.Tensor], # Expected to be float32 from load_and_preprocess_audio
+    batch_size_for_transcribe_call: int,
+    num_asr_workers: int,
     request_id: str = "asr"
 ) -> Tuple[Optional[List[Hypothesis]], float]:
     """
-    Perform ASR transcription on a list of audio tensors.
-    
+    Performs ASR transcription using the NeMo model.
+
+    Args:
+        asr_model_instance: The loaded NeMo ASR model.
+        audio_input_list: A list of 1D float32 audio tensors for transcription.
+        batch_size_for_transcribe_call: Batch size for the model's transcribe method.
+        num_asr_workers: Number of workers for the model's internal DataLoader.
+        request_id: Identifier for logging.
+
     Returns:
-        Tuple of (hypotheses_list, transcription_duration_seconds)
+        A tuple containing the list of Hypothesis objects and the ASR processing time in seconds.
+        Returns (None, 0.0) on failure.
     """
-    if not audio_input_list or not asr_model_instance: 
+    if not audio_input_list or not asr_model_instance:
+        logger.warning(f"({request_id}) _perform_asr_transcription called with no audio or no model.")
         return None, 0.0
-    
+        
     hypotheses: Optional[List[Hypothesis]] = None
-    duration: float = 0.0
+    asr_processing_duration_s: float = 0.0
     
-    # Get model device and move audio to same device
-    try: 
+    try:
         model_device = next(asr_model_instance.parameters()).device
-    except Exception as e_dev: 
-        logger.error(f"({request_id}) Error getting model device: {e_dev}")
+        # The model's compute layers (encoder, decoder) should be in target_operational_dtype (e.g. bfloat16)
+        # as set by _apply_model_settings_for_session.
+        # The NeMo AudioPreprocessor internally expects/handles float32 input signals.
+    except Exception as e_dev:
+        logger.error(f"({request_id}) Error getting model device: {e_dev}", exc_info=True)
         raise
     
-    try: 
-        audio_on_device = [audio.to(model_device) for audio in audio_input_list]
-    except Exception as e_mov: 
-        logger.error(f"({request_id}) Error moving audio to device: {e_mov}")
+    audio_for_preprocessor_on_device: List[torch.Tensor] = []
+    try:
+        # Ensure audio tensors are on the model's device AND are float32 for the preprocessor
+        # (as per NeMo preprocessor warning/behavior).
+        for audio_tensor in audio_input_list:
+            if audio_tensor.dtype != torch.float32:
+                logger.warning(f"({request_id}) Input audio tensor was not float32 ({audio_tensor.dtype}), casting.")
+            audio_for_preprocessor_on_device.append(
+                audio_tensor.to(device=model_device, dtype=torch.float32)
+            )
+    except Exception as e_mov:
+        logger.error(f"({request_id}) Error moving audio to device '{model_device}' and ensuring float32: {e_mov}", exc_info=True)
         raise
     
-    transcribe_call_start_time = time.time()
+    start_time = time.time()
     try:
         raw_hypotheses = await asyncio.to_thread(
-            asr_model_instance.transcribe, 
-            audio=audio_on_device, 
+            asr_model_instance.transcribe,
+            audio=audio_for_preprocessor_on_device, # Pass float32 audio list
             batch_size=batch_size_for_transcribe_call,
-            num_workers=num_asr_workers, 
-            return_hypotheses=True, 
-            timestamps=True, 
-            verbose=False
+            num_workers=num_asr_workers,
+            return_hypotheses=True,  # Required for accessing detailed timestamp info
+            timestamps=True,         # Request word/segment timestamps
+            verbose=False            # Reduce NeMo's internal verbosity
         )
-        duration = round(time.time() - transcribe_call_start_time, 3)
-        
-        # Process raw hypotheses into standardized format
+        asr_processing_duration_s = round(time.time() - start_time, 3)
+
+        # Process raw_hypotheses which can be List[Hypothesis] or List[List[Hypothesis]]
         if raw_hypotheses:
-            if all(isinstance(h, Hypothesis) for h in raw_hypotheses): 
+            if all(isinstance(h, Hypothesis) for h in raw_hypotheses):
                 hypotheses = raw_hypotheses
-            elif all(isinstance(h_list, list) for h_list in raw_hypotheses): 
-                hypotheses = [h_list[0] for h_list in raw_hypotheses if h_list and isinstance(h_list[0], Hypothesis)]
-            elif isinstance(raw_hypotheses, Hypothesis): 
+            elif all(isinstance(h_list, list) for h_list in raw_hypotheses): # Handle list of lists (common for batch>1)
+                hypotheses = [h_item for h_sublist in raw_hypotheses for h_item in h_sublist if isinstance(h_item, Hypothesis)]
+            elif isinstance(raw_hypotheses, Hypothesis): # Single hypothesis for single audio
                 hypotheses = [raw_hypotheses]
+            else:
+                logger.warning(f"({request_id}) Unexpected hypothesis format from model.transcribe: {type(raw_hypotheses)}")
         
-        return hypotheses, duration
+        if hypotheses:
+             logger.debug(f"({request_id}) Transcription successful, {len(hypotheses)} hypotheses obtained in {asr_processing_duration_s}s.")
+        else:
+            logger.warning(f"({request_id}) Transcription yielded no valid hypotheses in {asr_processing_duration_s}s.")
+            
+        return hypotheses, asr_processing_duration_s
         
-    except Exception as e_transcribe: 
-        logger.error(f"({request_id}) Error in asr_model.transcribe: {e_transcribe}", exc_info=True)
+    except Exception as e_trans:
+        logger.error(f"({request_id}) Error during asr_model.transcribe call: {e_trans}", exc_info=True)
         raise
 
+
 def _process_hypotheses_to_segments(
-    batch_hypotheses: List[Hypothesis],
+    batch_hypotheses: Optional[List[Hypothesis]], # Made Optional
     batch_offsets_s: List[float],
     request_id: str = "seg_proc"
 ) -> List[dict]:
     """
-    Converts a list of Hypothesis objects and their corresponding time offsets
-    into a flat list of segment dictionaries with global timestamps.
-    
-    Args:
-        batch_hypotheses: List of NeMo Hypothesis objects
-        batch_offsets_s: List of time offsets in seconds for each hypothesis
-        request_id: Request ID for logging
-        
-    Returns:
-        List of segment dictionaries with global timestamps
-    """
-    all_segments = []
-    
-    if (not batch_hypotheses or not batch_offsets_s or 
-        len(batch_hypotheses) != len(batch_offsets_s)):
-        logger.warning(
-            f"({request_id}) Mismatched hypotheses and offsets or empty input. "
-            f"Hyps: {len(batch_hypotheses) if batch_hypotheses else 0}, "
-            f"Offsets: {len(batch_offsets_s) if batch_offsets_s else 0}"
-        )
-        return all_segments
+    Converts a list of NeMo Hypothesis objects into a list of segment dictionaries.
+    Each segment contains start time, end time, and text.
 
+    Args:
+        batch_hypotheses: A list of Hypothesis objects from NeMo ASR.
+        batch_offsets_s: A list of time offsets (in seconds) corresponding to the
+                         start of each audio chunk that generated a hypothesis.
+        request_id: Identifier for logging.
+
+    Returns:
+        A list of segment dictionaries.
+    """
+    all_segments: List[dict] = []
+    if not batch_hypotheses: # Check if None or empty
+        logger.debug(f"({request_id}) No hypotheses provided to process into segments.")
+        return all_segments
+        
+    if len(batch_hypotheses) != len(batch_offsets_s):
+        logger.warning(f"({request_id}) Mismatch between number of hypotheses ({len(batch_hypotheses)}) and offsets ({len(batch_offsets_s)}). Cannot process segments accurately.")
+        return all_segments 
+    
     for hyp_idx, hyp_obj in enumerate(batch_hypotheses):
         if hyp_obj is None:
             logger.debug(f"({request_id}) Hypothesis at index {hyp_idx} is None, skipping.")
             continue
-        
+            
         chunk_offset_s = batch_offsets_s[hyp_idx]
         
-        # Process timestamp data if available
-        if (hasattr(hyp_obj, "timestamp") and 
-            hyp_obj.timestamp and 
-            isinstance(hyp_obj.timestamp, dict)):
-            
-            for seg_meta in hyp_obj.timestamp.get("segment", []):
+        # Check for NeMo's detailed timestamp structure
+        if hasattr(hyp_obj, "timestamp") and hyp_obj.timestamp and isinstance(hyp_obj.timestamp, dict):
+            # 'segment' level timestamps are usually word groups or phrases
+            segments_in_hyp = hyp_obj.timestamp.get("segment", []) 
+            if not segments_in_hyp and hasattr(hyp_obj, "text") and hyp_obj.text:
+                 # Fallback if 'segment' is empty but 'word' timestamps might exist or just plain text
+                word_timestamps = hyp_obj.timestamp.get("word", [])
+                if word_timestamps:
+                    logger.debug(f"({request_id}) No 'segment' timestamps, but found {len(word_timestamps)} 'word' timestamps for hypothesis {hyp_idx}. Combining them.")
+                    current_segment_text = []
+                    current_segment_start = -1
+                    for i, word_info in enumerate(word_timestamps):
+                        word_text = word_info.get("word", "").strip()
+                        word_start = word_info.get("start_offset", -1.0) # NeMo uses start_offset/end_offset for words
+                        word_end = word_info.get("end_offset", -1.0)
+                        if not word_text or word_start < 0 or word_end < word_start : continue
+
+                        if current_segment_start == -1:
+                            current_segment_start = word_start
+                        current_segment_text.append(word_text)
+                        
+                        # Heuristic: end segment on punctuation or if next word is significantly later
+                        is_last_word = (i == len(word_timestamps) - 1)
+                        next_word_start = word_timestamps[i+1].get("start_offset", -1.0) if not is_last_word else -1.0
+                        
+                        if word_text.endswith(('.', '?', '!')) or is_last_word or \
+                           (not is_last_word and next_word_start > word_end + 0.5): # End segment if >0.5s gap
+                            segment_text_final = " ".join(current_segment_text)
+                            start_time = round(current_segment_start + chunk_offset_s, 3)
+                            end_time = round(word_end + chunk_offset_s, 3)
+                            all_segments.append({"start": start_time, "end": end_time, "text": segment_text_final})
+                            current_segment_text = []
+                            current_segment_start = -1
+                    if current_segment_text : # remaining text
+                        segment_text_final = " ".join(current_segment_text)
+                        start_time = round(current_segment_start + chunk_offset_s, 3)
+                        # Estimate end time if only one word and no proper end
+                        end_time = round((word_timestamps[-1].get("end_offset", current_segment_start + 1.0)) + chunk_offset_s, 3)
+                        all_segments.append({"start": start_time, "end": end_time, "text": segment_text_final})
+
+                elif hyp_obj.text: # No segment or word timestamps, use full text as one segment
+                     logger.debug(f"({request_id}) No 'segment' or 'word' timestamps, using full hypothesis text for hypothesis {hyp_idx}.")
+                     all_segments.append({
+                        "start": chunk_offset_s, 
+                        "end": round(chunk_offset_s + (len(hyp_obj.text.split()) * 0.5), 3), # Rough estimate for end
+                        "text": hyp_obj.text.strip()
+                    })
+
+            for seg_idx, seg_meta in enumerate(segments_in_hyp): # Original loop for 'segment' level
                 seg_text = seg_meta.get("segment", "").strip()
-                if not seg_text:
-                    continue
+                if not seg_text: continue
                 
                 start_time = round(seg_meta.get("start", 0.0) + chunk_offset_s, 3)
                 end_time = round(seg_meta.get("end", 0.0) + chunk_offset_s, 3)
-
-                # Basic validation for segment times
+                
                 if start_time < 0 or end_time < start_time:
-                    logger.warning(
-                        f"({request_id}) Invalid segment times: start={start_time}, "
-                        f"end={end_time} for text='{seg_text}'. "
-                        f"Original: {seg_meta}, Offset: {chunk_offset_s}. Skipping segment."
-                    )
+                    logger.warning(f"({request_id}) Invalid segment timing: start={start_time}, end={end_time} for text '{seg_text}'. Skipping.")
                     continue
+                all_segments.append({"start": start_time, "end": end_time, "text": seg_text})
+        
+        elif hasattr(hyp_obj, "text") and hyp_obj.text: # Fallback if no timestamp attribute at all
+            logger.debug(f"({request_id}) Hypothesis {hyp_idx} has no 'timestamp' attribute, using full text.")
+            all_segments.append({
+                "start": chunk_offset_s, 
+                "end": round(chunk_offset_s + (len(hyp_obj.text.split()) * 0.5), 3), # Rough estimate
+                "text": hyp_obj.text.strip()
+            })
+            
+    # Add default keys if missing from any segment (simplifies downstream processing)
+    final_output_segments = []
+    for i, seg in enumerate(all_segments):
+        seg_template = {"id": i, "seek":0, "tokens":[], "temperature":0.0, "avg_logprob":None, "compression_ratio":None, "no_speech_prob":None}
+        seg_template.update(seg) # Override defaults with actual segment data
+        final_output_segments.append(seg_template)
 
-                new_segment = {
-                    "start": start_time,
-                    "end": end_time,
-                    "text": seg_text,
-                    # Standard Whisper-like fields
-                    "seek": 0, 
-                    "tokens": [], 
-                    "temperature": 0.0, 
-                    "avg_logprob": None, 
-                    "compression_ratio": None, 
-                    "no_speech_prob": None
-                }
-                all_segments.append(new_segment)
-        else:
-            logger.debug(
-                f"({request_id}) Hypothesis at index {hyp_idx} "
-                f"(offset {chunk_offset_s}s) has no valid timestamp data."
-            )
+    logger.debug(f"({request_id}) Processed {len(batch_hypotheses)} hypotheses into {len(final_output_segments)} segments.")
+    return final_output_segments
 
-    return all_segments
 
 def _deduplicate_segments(
-    raw_segments: List[dict], 
+    raw_segments: List[dict],
     overlap_threshold_seconds: float = 0.3
 ) -> List[dict]:
     """
-    Deduplicates a list of segment dictionaries that may overlap.
-    Sorts segments and merges/replaces based on start/end times and text length.
-    Assigns final 'id' to segments.
-    
+    Deduplicates a list of transcribed segments by merging or removing overlapping ones.
+
+    The function sorts segments by start time. It iterates through them, deciding whether
+    to keep, merge, or discard segments based on their temporal relationship with the
+    previously accepted segment and the `overlap_threshold_seconds`.
+
     Args:
-        raw_segments: List of segment dictionaries to deduplicate
-        overlap_threshold_seconds: Overlap threshold for considering segments for merging
-        
+        raw_segments: A list of segment dictionaries. Each dictionary is expected
+                      to have at least 'start', 'end', and 'text' keys.
+        overlap_threshold_seconds: The maximum allowed overlap (in seconds) between
+                                   the end of one segment and the start of the next
+                                   before they are considered significantly overlapping.
+                                   This also influences merging logic.
+
     Returns:
-        List of deduplicated segments with assigned IDs
+        A list of deduplicated and cleaned segment dictionaries, with updated 'id' fields.
+        Returns an empty list if input is empty or segments are malformed.
     """
     if not raw_segments:
         return []
 
-    # Sort by start time, then by end time as secondary criterion
+    # Attempt to sort segments; return empty if essential keys are missing causing TypeError
     try:
-        # Ensure all segments have required keys for sorting
-        for i, seg_check in enumerate(raw_segments):
-            if 'start' not in seg_check or 'end' not in seg_check:
-                logger.error(
-                    f"Deduplication: Segment at index {i} missing 'start' or 'end': {seg_check}"
-                )
-        
-        # Sort segments chronologically
-        sorted_segments = sorted(
-            raw_segments, 
-            key=lambda s: (s.get('start', float('inf')), s.get('end', float('inf')))
-        )
-    except TypeError as e_sort:
-        logger.error(
-            f"Error sorting segments for deduplication: {e_sort}. "
-            f"Segments: {raw_segments[:5]}..."
-        )
-        return []
+        # Sort by start time, then by end time as a secondary criterion.
+        sorted_segments = sorted(raw_segments, key=lambda s: (s.get('start', float('inf')), s.get('end', float('inf'))))
+    except TypeError:
+        logger.warning("(_deduplicate_segments) Segments list contained items missing 'start' or 'end' keys, or they were not comparable. Returning empty list.")
+        return [] # Segments are malformed for sorting
 
-    final_deduped_segments: List[dict] = []
-    prev_seg_final: Optional[dict] = None
+    final_segments: List[dict] = []
+    prev_seg: Optional[dict] = None
 
-    for current_seg in sorted_segments:
-        # Ensure essential keys are present
-        if not all(k in current_seg for k in ["start", "end", "text"]):
-            logger.warning(f"Deduplication: Skipping segment with missing keys: {current_seg}")
+    for current_segment in sorted_segments:
+        # Ensure basic structure of the current segment
+        if not all(key in current_segment for key in ["start", "end", "text"]):
+            logger.debug(f"(_deduplicate_segments) Skipping segment due to missing keys: {current_segment.get('text', 'N/A')[:30]}")
             continue
 
-        if (prev_seg_final is None or 
-            current_seg["start"] >= prev_seg_final["end"] - overlap_threshold_seconds):
-            # No overlap or minimal overlap, treat as new segment
-            current_seg["id"] = len(final_deduped_segments)
-            final_deduped_segments.append(current_seg)
-            prev_seg_final = current_seg
-        else:
-            # Segments overlap significantly, decide whether to merge or replace
-            current_duration = current_seg["end"] - current_seg["start"]
-            prev_duration = prev_seg_final["end"] - prev_seg_final["start"]
+        if prev_seg is None:
+            # This is the first valid segment
+            current_segment["id"] = len(final_segments)
+            final_segments.append(current_segment)
+            prev_seg = current_segment
+            continue
 
-            # Check if current segment is better or extends the previous one
-            is_better_or_extends = current_seg["end"] > prev_seg_final["end"] - overlap_threshold_seconds/2
+        # prev_seg is guaranteed to be not None here
+        current_start = current_segment["start"]
+        prev_end = prev_seg["end"]
+
+        # Condition 1: Current segment starts after (or very slightly before) previous segment ends.
+        # This means they are distinct or have a minor, acceptable overlap.
+        if current_start >= prev_end - overlap_threshold_seconds:
+            # If there's a slight overlap, adjust the end of the previous segment
+            # to ensure no temporal overlap in the final list.
+            if current_start < prev_end:
+                # Ensure prev_seg end doesn't go before its start
+                prev_seg["end"] = max(prev_seg["start"], current_start - 0.001)
             
-            # Avoid replacing with a much shorter segment unless it extends significantly
-            if (is_better_or_extends and 
-                current_duration > prev_duration * 0.7):
-                current_seg["id"] = prev_seg_final["id"]
-                final_deduped_segments[-1] = current_seg
-                prev_seg_final = current_seg
+            current_segment["id"] = len(final_segments)
+            final_segments.append(current_segment)
+            prev_seg = current_segment
+        else:
+            # Condition 2: Current segment overlaps significantly with the previous segment.
+            # This is the more complex case requiring a decision to replace or discard.
+            
+            # Heuristic: If the current segment is much shorter and ends not much later
+            # than the previous one, it's likely a less complete version of the same utterance.
+            # The 0.7 factor means if current is less than 70% of prev's duration.
+            # The overlap_threshold_seconds / 2 provides a small buffer for the end time.
+            current_duration = current_segment["end"] - current_segment["start"]
+            prev_duration = prev_seg["end"] - prev_seg["start"]
 
-    return final_deduped_segments
+            if current_segment["end"] < prev_end + (overlap_threshold_seconds / 2.0) and \
+               current_duration < prev_duration * 0.7:
+                # Discard current segment as it seems to be a less complete, overlapping part
+                logger.debug(f"(_deduplicate_segments) Discarding shorter overlapping segment: '{current_segment['text'][:30]}...'")
+                continue
+            else:
+                # Replace previous segment with current segment if current segment is preferred
+                # (e.g., longer, or starts earlier but considered more complete by this logic path).
+                logger.debug(f"(_deduplicate_segments) Replacing segment '{prev_seg['text'][:30]}...' with '{current_segment['text'][:30]}...'")
+                current_segment["id"] = prev_seg["id"] # Retain ID of the segment being replaced
+                final_segments[-1] = current_segment
+                prev_seg = current_segment
+
+    # Final cleanup: ensure segments have valid durations (end > start)
+    cleaned_segments: List[dict] = []
+    for i, seg in enumerate(final_segments):
+        if seg["end"] <= seg["start"]:
+            # If duration is zero or negative, but there's text, give it a minimal duration.
+            if seg["text"].strip():
+                seg["end"] = seg["start"] + 0.001 # Minimal positive duration
+                seg["id"] = len(cleaned_segments)
+                cleaned_segments.append(seg)
+            # If no text and invalid duration, it's likely an artifact; discard.
+        else:
+            seg["id"] = len(cleaned_segments) # Re-assign ID based on final position
+            cleaned_segments.append(seg)
+            
+    logger.info(f"(_deduplicate_segments) Raw segments: {len(raw_segments)}, Deduplicated segments: {len(cleaned_segments)}")
+    return cleaned_segments
+
 
 def parse_request_config(
-    chunk_length: Optional[float] = None, 
-    chunk_overlap: Optional[float] = None,
-    batch_size: Optional[int] = None, 
-    long_audio_threshold: Optional[float] = None
+    c_len: Optional[float] = None,
+    c_ov: Optional[float] = None,
+    b_size: Optional[int] = None,
+    l_thresh: Optional[float] = None
 ) -> dict:
     """
-    Parse and validate request configuration parameters.
-    
+    Parses and validates common ASR request configuration parameters.
+
+    Uses global default values (TRANSCRIBE_CHUNK_LEN, etc.) if specific
+    parameters are not provided. Raises ValueError for invalid parameter values.
+
+    Args:
+        c_len: Desired chunk length in seconds for ASR processing.
+        c_ov: Desired chunk overlap in seconds for ASR processing.
+        b_size: Batch size for ASR model inference.
+        l_thresh: Long audio threshold in seconds to determine model settings
+                  (e.g., attention mechanism).
+
     Returns:
-        Dictionary with validated configuration values
+        A dictionary containing the validated configuration parameters.
+
+    Raises:
+        ValueError: If any parameter value is outside its allowed range.
     """
     config = {
-        "chunk_length": chunk_length if chunk_length is not None else TRANSCRIBE_CHUNK_LEN,
-        "chunk_overlap": chunk_overlap if chunk_overlap is not None else TRANSCRIBE_OVERLAP,
-        "batch_size": batch_size if batch_size is not None else CHUNKING_BATCH_SIZE,
-        "long_audio_threshold": (long_audio_threshold if long_audio_threshold is not None 
-                               else LONG_AUDIO_THRESHOLD_S),
+        "chunk_length": c_len if c_len is not None else TRANSCRIBE_CHUNK_LEN,
+        "chunk_overlap": c_ov if c_ov is not None else TRANSCRIBE_OVERLAP,
+        "batch_size": b_size if b_size is not None else CHUNKING_BATCH_SIZE,
+        "long_audio_threshold": l_thresh if l_thresh is not None else LONG_AUDIO_THRESHOLD_S
     }
-    
-    # Validation
-    if not (0 < config["chunk_length"] <= 300): 
-        raise ValueError("chunk_length must be > 0 and <= 300s")
-    if not (0 <= config["chunk_overlap"] < config["chunk_length"]): 
-        raise ValueError("chunk_overlap must be >= 0 and < chunk_length")
-    if not (1 <= config["batch_size"] <= 32): 
-        raise ValueError("batch_size must be 1-32")
-    if not (0 <= config["long_audio_threshold"] <= 3600): 
-        raise ValueError("long_audio_threshold must be 0-3600s")
-    
+
+    if not (0 < config["chunk_length"] <= 300): # Max 5 minutes chunk
+        raise ValueError("chunk_length must be > 0 and <= 300 seconds.")
+    if not (0 <= config["chunk_overlap"] < config["chunk_length"]):
+        raise ValueError("chunk_overlap must be >= 0 and less than chunk_length.")
+    if not (1 <= config["batch_size"] <= 32): # Practical limit for batch size
+        raise ValueError("batch_size must be between 1 and 32.")
+    if not (0 <= config["long_audio_threshold"] <= 3600): # Max 1 hour threshold
+        raise ValueError("long_audio_threshold must be >= 0 and <= 3600 seconds.")
+        
     return config
 
-def parse_websocket_config(client_config: dict) -> dict:
+
+def parse_websocket_config(client_cfg: dict) -> dict:
     """
-    Parse and validate WebSocket client configuration.
-    
+    Parses and validates WebSocket-specific client configuration.
+
+    This extends `parse_request_config` with parameters relevant to
+    audio stream characteristics like sample rate, channels, and format.
+
     Args:
-        client_config: Client configuration dictionary
-        
+        client_cfg: A dictionary containing configuration sent by the WebSocket client.
+                    Expected keys include "sample_rate", "channels", "bytes_per_sample",
+                    "format", and optionally "chunk_length", "chunk_overlap", etc.
+
     Returns:
-        Dictionary with validated configuration values
+        A dictionary containing the validated and combined configuration.
+
+    Raises:
+        ValueError: If required fields are missing or parameter values are invalid.
+                    Specifically, client must send a real file format (e.g. "wav", "mp3")
+                    and not "pcm" for the 'format' field in streaming mode, as ffmpeg
+                    needs to know the input container/codec.
     """
     required_fields = ["sample_rate", "channels", "bytes_per_sample", "format"]
-    missing = [f for f in required_fields if f not in client_config]
-    if missing: 
-        raise ValueError(f"Missing required WebSocket fields: {', '.join(missing)}")
-    
-    # Parse base configuration
-    config = parse_request_config(
-        chunk_length=client_config.get("chunk_length"),
-        chunk_overlap=client_config.get("chunk_overlap"),
-        batch_size=client_config.get("batch_size"),
-        long_audio_threshold=client_config.get("long_audio_threshold"),
+    missing_fields = [field for field in required_fields if field not in client_cfg]
+    if missing_fields:
+        raise ValueError(f"Missing required WebSocket configuration fields: {', '.join(missing_fields)}")
+
+    # Client must specify the actual audio format for ffmpeg to decode.
+    # 'pcm' is too generic for ffmpeg's input format detection.
+    audio_format = str(client_cfg["format"]).lower()
+
+    # Get common ASR config (chunk_length, overlap, batch_size, long_audio_threshold)
+    asr_config = parse_request_config(
+        client_cfg.get("chunk_length"),
+        client_cfg.get("chunk_overlap"),
+        client_cfg.get("batch_size"),
+        client_cfg.get("long_audio_threshold")
     )
-    
-    # Add WebSocket-specific fields
-    config.update({
-        "sample_rate": int(client_config["sample_rate"]),
-        "channels": int(client_config["channels"]),
-        "bytes_per_sample": int(client_config["bytes_per_sample"]),
-        "format": str(client_config["format"]).lower(),
+
+    # Combine with WebSocket-specific audio stream parameters
+    asr_config.update({
+        "sample_rate": int(client_cfg["sample_rate"]),
+        "channels": int(client_cfg["channels"]),
+        "bytes_per_sample": int(client_cfg["bytes_per_sample"]), # Bytes per sample of original audio
+        "format": audio_format,
     })
     
-    return config
+    # Add any other client-provided parameters that aren't already handled
+    for key, value in client_cfg.items():
+        if key not in asr_config and key not in required_fields:
+            asr_config[key] = value
+            
+    if not (1 <= asr_config["channels"] <= 8): # Practical limit for channels
+        raise ValueError("Number of audio channels must be between 1 and 8.")
+    # sample_rate and bytes_per_sample are noted but primarily used by ffmpeg or initial processing;
+    # the ASR model itself expects MODEL_SAMPLE_RATE mono.
+
+    return asr_config
+
 
 async def handle_streaming_pcm(
-    websocket: WebSocket, 
-    session_id: str, 
-    processing_device: str, 
-    client_config: dict,
+    websocket: WebSocket,
+    session_id: str,
+    processing_device: str,
+    client_config: dict
 ):
     """
-    Handle streaming PCM audio processing for WebSocket connections.
-    
+    Handles the audio streaming pipeline for a WebSocket connection using ffmpeg.
+
+    This function sets up a producer-consumer pattern:
+    - Producer:
+        - Receives audio byte chunks from the WebSocket client.
+        - Pipes these bytes to an `ffmpeg` subprocess.
+        - `ffmpeg` decodes/resamples the input audio to 16kHz mono PCM.
+        - Reads the standardized PCM output from `ffmpeg`.
+        - Buffers and segments this PCM data into ASR-ready chunks (fixed duration).
+        - Puts these (audio_tensor, offset_s) tuples onto an asyncio Queue.
+    - Consumer:
+        - Retrieves ASR chunks from the queue.
+        - Batches them according to `client_config["batch_size"]`.
+        - Performs ASR transcription using `_perform_asr_transcription`.
+        - Processes hypotheses into segments.
+        - Sends `segments_batch` messages back to the client via WebSocket.
+
+    Finally, it sends a `final_transcription` message with aggregated results.
+
     Args:
-        websocket: WebSocket connection
-        session_id: Unique session identifier
-        processing_device: Device to use for processing (cuda/cpu)
-        client_config: Client audio configuration
+        websocket: The active WebSocket connection.
+        session_id: A unique identifier for this streaming session.
+        processing_device: The device ("cuda" or "cpu") for ASR model inference.
+        client_config: Parsed configuration dictionary from the client, including
+                       chunk_length, overlap, batch_size, format, etc.
     """
-    # Initialize buffers and tracking variables
-    pcm_buffer = bytearray()
-    sent_segments_pcm = []
-    prev_segment_pcm = None
-    chunks_processed_count = 0
-    total_samples_processed_pcm = 0
+    sent_segments_pcm: List[dict] = [] # Stores all segments sent to client for final aggregation
     
-    # Extract configuration parameters
-    chunk_length = client_config["chunk_length"]
-    chunk_overlap = client_config["chunk_overlap"]
-    samples_per_chunk = int(chunk_length * MODEL_SAMPLE_RATE)
-    samples_per_stride = int((chunk_length - chunk_overlap) * MODEL_SAMPLE_RATE)
-    bytes_per_sample_for_processing_chunks = 2
-    bytes_per_chunk = samples_per_chunk * bytes_per_sample_for_processing_chunks
-    bytes_per_stride = samples_per_stride * bytes_per_sample_for_processing_chunks
+    # ASR chunking parameters based on target 16kHz mono PCM from ffmpeg
+    asr_chunk_len_s = client_config["chunk_length"]
+    asr_chunk_overlap_s = client_config["chunk_overlap"]
     
-    # Client audio format parameters
-    client_format = client_config["format"]
-    client_sr = client_config["sample_rate"]
-    client_channels = client_config["channels"]
-    client_bps = client_config["bytes_per_sample"]
+    # Target PCM characteristics (output from ffmpeg, input to ASR chunker)
+    target_pcm_sample_rate = MODEL_SAMPLE_RATE # 16000 Hz
+    target_pcm_bytes_per_sample = 2 # For s16le (16-bit signed little-endian PCM)
     
-    # Check if format conversion is needed
-    needs_format_conversion = (
-        client_format != "pcm" or 
-        client_sr != MODEL_SAMPLE_RATE or 
-        client_channels != 1 or 
-        client_bps != 2
+    samples_per_asr_chunk = int(asr_chunk_len_s * target_pcm_sample_rate)
+    samples_per_asr_stride = int((asr_chunk_len_s - asr_chunk_overlap_s) * target_pcm_sample_rate)
+    
+    bytes_per_asr_chunk_target_pcm = samples_per_asr_chunk * target_pcm_bytes_per_sample
+    bytes_per_asr_stride_target_pcm = samples_per_asr_stride * target_pcm_bytes_per_sample
+
+    # Queue for (audio_tensor, offset_s) tuples from producer to consumer
+    # Maxsize helps manage backpressure if consumer is slower.
+    chunk_queue: asyncio.Queue[Optional[Tuple[torch.Tensor, float]]] = asyncio.Queue(
+        maxsize=client_config["batch_size"] * 2 # Allow some buffering
     )
+    producer_done_event = asyncio.Event() # Signals producer has finished all its tasks
     
-    # Format conversion setup
-    convert_buffer = bytearray()
-    convert_threshold_bytes = 0
-    if needs_format_conversion:
-        estimated_bytes_for_one_asr_chunk_duration = int(
-            client_sr * client_channels * client_bps * chunk_length
-        )
-        convert_threshold_bytes = (
-            estimated_bytes_for_one_asr_chunk_duration 
-            if estimated_bytes_for_one_asr_chunk_duration > 0 
-            else 32768
-        )
+    accumulated_asr_processing_time_s: float = 0.0
+    total_duration_processed_seconds_for_asr: float = 0.0 # Based on PCM from ffmpeg
 
-    # Producer-consumer setup
-    chunk_queue: asyncio.Queue = asyncio.Queue(maxsize=client_config["batch_size"] * 2)
-    producer_done_event = asyncio.Event()
-    accumulated_asr_processing_time_s = 0.0
+    def _create_asr_tensor_from_bytes(pcm_bytes: bytes) -> torch.Tensor:
+        """Synchronous helper to convert raw s16le PCM bytes to a float32 tensor."""
+        # Convert s16le bytes to int16 tensor, then to float32 in range [-1.0, 1.0]
+        return torch.frombuffer(pcm_bytes, dtype=torch.int16).float() / 32768.0
 
-    async def pcm_producer():
-        """Producer coroutine that reads WebSocket data and creates audio chunks."""
-        nonlocal total_samples_processed_pcm, chunks_processed_count, convert_threshold_bytes, pcm_buffer
+    async def producer():
+        """
+        Producer coroutine:
+        1. Receives audio from WebSocket.
+        2. Feeds it to ffmpeg.
+        3. Reads standardized PCM from ffmpeg.
+        4. Creates ASR chunks (tensors) and puts them on `chunk_queue`.
+        """
+        nonlocal total_duration_processed_seconds_for_asr
+        # Buffer for PCM data read from ffmpeg, used to form ASR chunks
+        pcm_buffer_for_asr_chunks = bytearray()
+        # Keeps track of total samples *advanced* in the ffmpeg output stream
+        # to calculate correct time offsets for ASR chunks.
+        total_samples_in_pcm_buffer_for_offset_calc = 0
+        total_bytes_fed_to_ffmpeg = 0 # For logging/debugging
+
+        # ffmpeg command:
+        # -i pipe:0 : Read input from stdin
+        # -f s16le : Output format: signed 16-bit little-endian PCM
+        # -ac 1 : Output audio channels: 1 (mono)
+        # -ar str(MODEL_SAMPLE_RATE) : Output audio sample rate: 16000 Hz
+        # -acodec pcm_s16le : Output codec: PCM s16le
+        # pipe:1 : Write output to stdout
+        # -hide_banner -loglevel error : Reduce ffmpeg's console noise
+        ffmpeg_command = [
+            'ffmpeg', '-hide_banner', '-loglevel', 'error',
+            '-i', 'pipe:0',  # Input from stdin
+            '-f', 's16le',   # Output format: signed 16-bit PCM
+            '-ac', '1',      # Output channels: mono
+            '-ar', str(MODEL_SAMPLE_RATE), # Output sample rate
+            '-acodec', 'pcm_s16le', # Output codec
+            'pipe:1'         # Output to stdout
+        ]
+        logger.info(f"({session_id}) Stream Producer: Starting ffmpeg with command: {' '.join(ffmpeg_command)}")
         
-        try:
-            while websocket.application_state == WebSocketState.CONNECTED:
-                try: 
-                    message = await asyncio.wait_for(websocket.receive(), timeout=30.0)
-                except asyncio.TimeoutError: 
-                    break
-                
-                # Check for end signal
-                if 'text' in message and message['text'] == "END": 
-                    break
-                
-                # Process audio bytes
-                if 'bytes' in message and message['bytes']:
-                    if needs_format_conversion:
-                        convert_buffer.extend(message['bytes'])
-                        
-                        # Convert chunks when buffer is large enough
-                        while len(convert_buffer) >= convert_threshold_bytes and convert_threshold_bytes > 0:
+        process = await asyncio.create_subprocess_exec(
+            *ffmpeg_command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE  # Capture stderr for error reporting
+        )
+        logger.info(f"({session_id}) Stream Producer: ffmpeg process started (PID: {process.pid}).")
+
+        async def feed_ffmpeg_stdin():
+            """Reads from WebSocket and writes to ffmpeg's stdin."""
+            nonlocal total_bytes_fed_to_ffmpeg
+            try:
+                while True:
+                    if websocket.application_state != WebSocketState.CONNECTED:
+                        logger.info(f"({session_id}) Feed ffmpeg: WebSocket no longer connected. Closing ffmpeg stdin.")
+                        if process.stdin and not process.stdin.is_closing():
+                            process.stdin.close()
+                        break
+                    
+                    try:
+                        # Timeout for receive to prevent indefinite blocking if client goes silent
+                        message = await asyncio.wait_for(websocket.receive(), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"({session_id}) Feed ffmpeg: Timeout waiting for message from client. Assuming stream ended.")
+                        if process.stdin and not process.stdin.is_closing():
+                            process.stdin.close() # Close stdin to signal ffmpeg to finish
+                        break
+                    except RuntimeError as e_ws_recv: # FastAPI can raise this on disconnect
+                        if "disconnect" in str(e_ws_recv).lower():
+                             logger.info(f"({session_id}) Feed ffmpeg: WebSocket disconnected during receive.")
+                        else:
+                            logger.error(f"({session_id}) Feed ffmpeg: WebSocket receive error: {e_ws_recv}", exc_info=True)
+                        if process.stdin and not process.stdin.is_closing():
+                            process.stdin.close()
+                        break # Exit loop on disconnect or critical error
+
+                    if 'text' in message and message['text'].upper() == "END":
+                        logger.info(f"({session_id}) Feed ffmpeg: 'END' signal received from client. Closing ffmpeg stdin.")
+                        if process.stdin and not process.stdin.is_closing():
+                            process.stdin.close()
+                        break # End of stream signaled by client
+                    
+                    if 'bytes' in message and message['bytes']:
+                        chunk_data = message['bytes']
+                        if process.stdin and not process.stdin.is_closing():
                             try:
-                                chunk_to_convert = bytes(convert_buffer[:convert_threshold_bytes])
-                                convert_buffer[:] = convert_buffer[convert_threshold_bytes:]
-                                
-                                converted_pcm_bytes = await convert_audio_chunk_to_target_pcm(
-                                    chunk_to_convert, client_format, client_sr, 
-                                    client_channels, client_bps, MODEL_SAMPLE_RATE, session_id
-                                )
-                                
-                                if converted_pcm_bytes: 
-                                    pcm_buffer.extend(converted_pcm_bytes)
-                                else: 
-                                    if convert_threshold_bytes > 8192: 
-                                        convert_threshold_bytes //= 2
-                            except Exception:
-                                if convert_threshold_bytes > 8192: 
-                                    convert_threshold_bytes //= 2
-                                else: 
-                                    convert_buffer[:] = convert_buffer[1024:] 
-                    else: 
-                        pcm_buffer.extend(message['bytes'])
-                
-                # Create chunks from buffer
-                while len(pcm_buffer) >= bytes_per_chunk:
-                    chunk_bytes = bytes(pcm_buffer[:bytes_per_chunk])
-                    tensor = torch.frombuffer(chunk_bytes, dtype=torch.int16).float() / 32768.0
-                    offset = total_samples_processed_pcm / MODEL_SAMPLE_RATE
-                    await chunk_queue.put((tensor, offset))
-                    pcm_buffer[:] = pcm_buffer[bytes_per_stride:]
-                    total_samples_processed_pcm += samples_per_stride
-                    chunks_processed_count += 1
-            
-            # Handle remaining conversion buffer
-            if needs_format_conversion and convert_buffer:
-                try:
-                    converted_pcm_bytes = await convert_audio_chunk_to_target_pcm(
-                        bytes(convert_buffer), client_format, client_sr, 
-                        client_channels, client_bps, MODEL_SAMPLE_RATE, session_id
-                    )
-                    if converted_pcm_bytes: 
-                        pcm_buffer.extend(converted_pcm_bytes)
-                except Exception: 
-                    pass
-                convert_buffer.clear()
-            
-            # Handle remaining PCM buffer
-            if len(pcm_buffer) > bytes_per_sample_for_processing_chunks * MODEL_SAMPLE_RATE * 0.5:
-                tensor_tail = torch.frombuffer(bytes(pcm_buffer), dtype=torch.int16).float() / 32768.0
-                await chunk_queue.put((tensor_tail, total_samples_processed_pcm / MODEL_SAMPLE_RATE))
-            pcm_buffer.clear()
-            
-        except WebSocketDisconnect: 
-            pass
-        except Exception: 
-            pass
-        finally: 
-            producer_done_event.set()
-            await chunk_queue.put(None)
+                                process.stdin.write(chunk_data)
+                                await process.stdin.drain()
+                                total_bytes_fed_to_ffmpeg += len(chunk_data)
+                            except (BrokenPipeError, ConnectionResetError) as e_pipe:
+                                logger.warning(f"({session_id}) Feed ffmpeg: Pipe to ffmpeg broken: {e_pipe}. Ffmpeg might have exited.")
+                                break # ffmpeg likely terminated
+                        else:
+                            logger.warning(f"({session_id}) Feed ffmpeg: ffmpeg stdin closed or unavailable, cannot send data.")
+                            break
+            except WebSocketDisconnect:
+                logger.info(f"({session_id}) Feed ffmpeg: WebSocket disconnected by client. Closing ffmpeg stdin.")
+                if process.stdin and not process.stdin.is_closing():
+                    process.stdin.close()
+            except Exception as e_feed:
+                logger.error(f"({session_id}) Feed ffmpeg: Unexpected error: {e_feed}", exc_info=True)
+                if process.stdin and not process.stdin.is_closing():
+                    process.stdin.close() # Attempt to clean up
+            finally:
+                logger.info(f"({session_id}) Feed ffmpeg: Exiting task. Total bytes sent to ffmpeg stdin: {total_bytes_fed_to_ffmpeg}.")
+                # Ensure stdin is closed if not already
+                if process.stdin and not process.stdin.is_closing():
+                    try:
+                        process.stdin.close()
+                        # await process.stdin.wait_closed() # Optional: ensure it's fully closed
+                    except Exception as e_close_stdin:
+                        logger.warning(f"({session_id}) Feed ffmpeg: Error closing ffmpeg stdin in finally: {e_close_stdin}")
 
-    async def pcm_consumer():
-        """Consumer coroutine that processes audio chunks and generates transcriptions."""
-        # `prev_segment_pcm` is no longer needed here for on-the-fly stitching
-        # `sent_segments_pcm` will still accumulate all segments for the final CSV/SRT.
-        nonlocal accumulated_asr_processing_time_s, sent_segments_pcm 
+
+        async def read_ffmpeg_stdout_and_queue_chunks():
+            """Reads PCM from ffmpeg's stdout, creates ASR chunks, and queues them."""
+            nonlocal pcm_buffer_for_asr_chunks, total_samples_in_pcm_buffer_for_offset_calc
+            nonlocal total_duration_processed_seconds_for_asr
+            
+            temp_total_pcm_bytes_read_from_ffmpeg = 0 # For calculating total_duration_processed_seconds_for_asr
+            try:
+                while True:
+                    if process.stdout is None:
+                        logger.warning(f"({session_id}) Read ffmpeg: stdout stream is None. Cannot read.")
+                        break
+                    
+                    # Read a block of PCM data from ffmpeg's stdout
+                    pcm_data_from_ffmpeg = await process.stdout.read(FFMPEG_PCM_CHUNK_SIZE_BYTES)
+                    
+                    if not pcm_data_from_ffmpeg:
+                        logger.info(f"({session_id}) Read ffmpeg: EOF received from ffmpeg stdout. Stream finished.")
+                        break # ffmpeg closed its stdout, indicating end of conversion
+                    
+                    pcm_buffer_for_asr_chunks.extend(pcm_data_from_ffmpeg)
+                    temp_total_pcm_bytes_read_from_ffmpeg += len(pcm_data_from_ffmpeg)
+                    
+                    chunks_created_this_read_cycle = 0
+                    # Create as many full ASR chunks as possible from the current buffer
+                    while len(pcm_buffer_for_asr_chunks) >= bytes_per_asr_chunk_target_pcm:
+                        asr_chunk_bytes = bytes(pcm_buffer_for_asr_chunks[:bytes_per_asr_chunk_target_pcm])
+                        
+                        # Offload tensor creation as it can be a minor CPU blip
+                        tensor = await asyncio.to_thread(_create_asr_tensor_from_bytes, asr_chunk_bytes)
+                        
+                        # Calculate time offset for this chunk
+                        current_chunk_offset_s = total_samples_in_pcm_buffer_for_offset_calc / target_pcm_sample_rate
+                        
+                        await chunk_queue.put((tensor, current_chunk_offset_s))
+                        chunks_created_this_read_cycle += 1
+                        
+                        # Advance the buffer by the stride (not the full chunk length due to overlap)
+                        pcm_buffer_for_asr_chunks = pcm_buffer_for_asr_chunks[bytes_per_asr_stride_target_pcm:]
+                        total_samples_in_pcm_buffer_for_offset_calc += samples_per_asr_stride
+                    
+                    if chunks_created_this_read_cycle > 0:
+                        logger.debug(f"({session_id}) Read ffmpeg: Created {chunks_created_this_read_cycle} ASR chunks. "
+                                     f"PCM buffer size: {len(pcm_buffer_for_asr_chunks)}B. Queue size: {chunk_queue.qsize()}")
+
+            except Exception as e_read_stdout:
+                logger.error(f"({session_id}) Read ffmpeg: Error reading ffmpeg stdout: {e_read_stdout}", exc_info=True)
+            finally:
+                logger.info(f"({session_id}) Read ffmpeg: Exiting stdout reading task.")
+                # After EOF, process any remaining data in the buffer as a final partial chunk
+                min_final_asr_chunk_samples = int(target_pcm_sample_rate * 0.1) # e.g., 0.1 seconds minimum
+                min_final_asr_chunk_bytes = target_pcm_bytes_per_sample * min_final_asr_chunk_samples
+                
+                if len(pcm_buffer_for_asr_chunks) >= min_final_asr_chunk_bytes:
+                    final_asr_chunk_bytes = bytes(pcm_buffer_for_asr_chunks)
+                    final_tensor = await asyncio.to_thread(_create_asr_tensor_from_bytes, final_asr_chunk_bytes)
+                    
+                    if final_tensor.numel() > 0: # Ensure tensor is not empty
+                        final_chunk_offset_s = total_samples_in_pcm_buffer_for_offset_calc / target_pcm_sample_rate
+                        await chunk_queue.put((final_tensor, final_chunk_offset_s))
+                        logger.info(f"({session_id}) Read ffmpeg: Queued final partial ASR chunk of {final_tensor.shape[0]} samples.")
+                    else:
+                        logger.debug(f"({session_id}) Read ffmpeg: Final partial ASR chunk resulted in an empty tensor. Discarding.")
+                elif len(pcm_buffer_for_asr_chunks) > 0:
+                    logger.debug(f"({session_id}) Read ffmpeg: Discarding final remaining {len(pcm_buffer_for_asr_chunks)} bytes from PCM buffer (too small).")
+
+                # Calculate total duration based on all PCM bytes successfully read from ffmpeg
+                total_duration_processed_seconds_for_asr = temp_total_pcm_bytes_read_from_ffmpeg / \
+                                                           (target_pcm_sample_rate * target_pcm_bytes_per_sample)
+                logger.info(f"({session_id}) Read ffmpeg: Total raw PCM bytes read from ffmpeg: {temp_total_pcm_bytes_read_from_ffmpeg}B "
+                            f"({total_duration_processed_seconds_for_asr:.2f}s of audio).")
+        try:
+            # Run stdin feeder and stdout reader concurrently
+            feed_task = asyncio.create_task(feed_ffmpeg_stdin())
+            read_task = asyncio.create_task(read_ffmpeg_stdout_and_queue_chunks())
+            
+            await asyncio.gather(feed_task, read_task) # Wait for both to complete
+            
+            # Ensure ffmpeg process is cleaned up
+            if process.stdin and not process.stdin.is_closing():
+                process.stdin.close() # Should be closed by feed_ffmpeg_stdin already
+
+            # Wait for ffmpeg to exit and capture any remaining stderr
+            # communicate() should be called after stdin is closed and stdout/stderr pipes are drained (by read_task)
+            stdout_rem, stderr_rem = await process.communicate()
+            
+            if stderr_rem:
+                logger.warning(f"({session_id}) ffmpeg stderr output: {stderr_rem.decode(errors='ignore').strip()}")
+            
+            if process.returncode != 0 and process.returncode is not None:
+                logger.error(f"({session_id}) ffmpeg process exited with error code {process.returncode}.")
+            else:
+                logger.info(f"({session_id}) ffmpeg process finished successfully (return code: {process.returncode}).")
+
+        except Exception as e_prod_ffmpeg_main:
+            logger.error(f"({session_id}) Stream Producer (ffmpeg main loop) Error: {e_prod_ffmpeg_main}", exc_info=True)
+            if process and process.returncode is None: # If ffmpeg is still running
+                try:
+                    logger.warning(f"({session_id}) Terminating ffmpeg process due to error.")
+                    process.terminate()
+                    await asyncio.wait_for(process.wait(), timeout=5.0) # Wait for termination
+                except ProcessLookupError:
+                    logger.debug(f"({session_id}) ffmpeg process already exited.")
+                except asyncio.TimeoutError:
+                    logger.warning(f"({session_id}) Timeout waiting for ffmpeg to terminate. Killing.")
+                    process.kill()
+                    await process.wait()
+                except Exception as e_term:
+                    logger.error(f"({session_id}) Error during ffmpeg termination: {e_term}")
+        finally:
+            logger.info(f"({session_id}) Stream Producer (ffmpeg): Signaling completion to consumer.")
+            producer_done_event.set() # Signal that producer is done
+            await chunk_queue.put(None) # Sentinel to signal consumer to stop
+
+    async def consumer():
+        """
+        Consumer coroutine:
+        1. Gets (audio_tensor, offset_s) from `chunk_queue`.
+        2. Batches them for ASR.
+        3. Performs transcription.
+        4. Sends results back via WebSocket.
+        """
+        nonlocal accumulated_asr_processing_time_s, sent_segments_pcm
         
-        consumer_batch_size_cap = client_config["batch_size"] # Max ASR input tensors per ASR call
+        consumer_batch_size_cap = client_config["batch_size"]
+        total_asr_chunks_processed_by_consumer = 0
         
         while True:
-            batch_audio_tensors, batch_offsets, first_item_is_sentinel = [], [], False
-            
-            # Collect a batch of ASR input audio tensors from the queue,
-            # up to consumer_batch_size_cap.
-            # This loop processes what's available, even if less than the cap.
+            batch_audio_tensors: List[torch.Tensor] = []
+            batch_offsets_s: List[float] = []
+            first_item_in_batch_is_sentinel = False
+
+            # Try to fill a batch up to consumer_batch_size_cap
             for _ in range(consumer_batch_size_cap):
-                timeout = 0.02 if batch_audio_tensors else None # Wait indefinitely for the first item, short timeout for subsequent
-                item = None
-                
+                item: Optional[Tuple[torch.Tensor, float]] = None
                 try:
+                    # Determine timeout for queue.get()
+                    # If batch is partially full, use short timeout to quickly process it.
+                    # If producer is done and queue is empty, short timeout to exit soon.
+                    # Otherwise, wait longer if batch is empty and producer is active.
+                    timeout_val = None # Default: wait indefinitely if producer is active and batch empty
+                    if batch_audio_tensors: # Batch is partially filled
+                        timeout_val = 0.02 # Short timeout to process what we have
+                    elif producer_done_event.is_set(): # Producer is done
+                        timeout_val = 0.1 # Short timeout to quickly check for remaining items or sentinel
+
                     if producer_done_event.is_set() and chunk_queue.empty() and not batch_audio_tensors:
-                        try: item = chunk_queue.get_nowait()
-                        except asyncio.QueueEmpty: break
-                    else: 
-                        item = await asyncio.wait_for(chunk_queue.get(), timeout=timeout)
-                except (asyncio.TimeoutError, asyncio.QueueEmpty): 
-                    # Timeout occurred or queue empty after getting at least one item, or queue initially empty for non-first.
+                        # Optimization: if producer is done, queue is empty, and batch is empty,
+                        # try non-blocking get to fetch potential sentinel quickly.
+                        try:
+                            item = chunk_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            # This means queue is truly empty and sentinel might have been processed or is next.
+                            # The outer loop's break condition will handle exit.
+                            break 
+                    else:
+                        item = await asyncio.wait_for(chunk_queue.get(), timeout=timeout_val)
+                
+                except (asyncio.TimeoutError, asyncio.QueueEmpty):
+                    # Timeout or queue empty means no more items for this batching iteration.
+                    # Break inner loop to process current batch (if any).
                     break 
                 
-                if item is None: # Sentinel value from producer
-                    if not batch_audio_tensors: # This was the first item fetched, and it's the sentinel
-                        first_item_is_sentinel = True
-                    chunk_queue.task_done()
-                    break # Stop trying to collect for this batch
+                if item is None: # Sentinel received
+                    chunk_queue.task_done() # Acknowledge sentinel
+                    # If this sentinel is the first thing we got for this batch,
+                    # it means no more audio data will come.
+                    if not batch_audio_tensors:
+                        first_item_in_batch_is_sentinel = True
+                    # Else, if batch_audio_tensors is not empty, the sentinel was picked up after some data.
+                    # We'll process the current batch, then the outer loop will break.
+                    break # Exit inner loop to process current batch (if any) before stopping.
                 
-                tensor, offset = item
-                batch_audio_tensors.append(tensor)
-                batch_offsets.append(offset)
-                chunk_queue.task_done()
-                
-                # If producer is done and queue is now empty, process what we have
-                if producer_done_event.is_set() and chunk_queue.empty(): 
+                # Valid audio item received
+                audio_tensor, offset_s = item
+                batch_audio_tensors.append(audio_tensor)
+                batch_offsets_s.append(offset_s)
+                chunk_queue.task_done() # Acknowledge item
+
+                # If producer is done and queue is now empty, break to process current batch.
+                if producer_done_event.is_set() and chunk_queue.empty():
                     break
             
-            # If no audio tensors were collected (e.g., first item was sentinel or initial timeout),
-            # check if we should exit or continue waiting.
             if not batch_audio_tensors:
-                if first_item_is_sentinel or (producer_done_event.is_set() and chunk_queue.empty()): 
-                    logger.debug(f"({session_id}) PCM Consumer: No more audio tensors to process. Exiting consumer.")
-                    break # Exit the main while loop
-                else: 
-                    # This case should be rare if timeout for first item is None,
-                    # unless producer_done_event is set and queue becomes empty.
-                    logger.debug(f"({session_id}) PCM Consumer: No audio tensors in current attempt, but producer not done or queue not confirmed empty. Continuing.")
-                    continue # Go back to waiting for items from the queue
+                # No data collected for this batch.
+                # If it's because we got a sentinel as the first item, or if producer is done and queue is drained,
+                # then it's time to exit the consumer.
+                if first_item_in_batch_is_sentinel or (producer_done_event.is_set() and chunk_queue.empty()):
+                    logger.info(f"({session_id}) Stream Consumer: No more audio chunks to process. Exiting.")
+                    break 
+                else:
+                    # No data, but producer might still be working, or sentinel not yet received. Continue waiting.
+                    continue 
+
+            # We have a batch of audio tensors to process
+            total_asr_chunks_processed_by_consumer += len(batch_audio_tensors)
+            logger.info(f"({session_id}) Stream Consumer: Processing ASR batch of {len(batch_audio_tensors)} audio chunks. "
+                        f"(Total ASR chunks processed by consumer so far: {total_asr_chunks_processed_by_consumer})")
             
-            # Perform ASR transcription on the collected batch of audio tensors
-            logger.info(f"({session_id}) PCM Consumer: Processing batch of {len(batch_audio_tensors)} ASR input tensor(s).")
-            hyps_list, asr_call_duration = await _perform_asr_transcription(
-                asr_model_instance=asr_model, 
+            hypotheses_list, asr_call_duration_s = await _perform_asr_transcription(
+                asr_model_instance=asr_model, # type: ignore # Checked at endpoint start
                 audio_input_list=batch_audio_tensors,
-                batch_size_for_transcribe_call=len(batch_audio_tensors), # Pass all collected tensors to NeMo
+                batch_size_for_transcribe_call=len(batch_audio_tensors), # Process the whole collected batch
                 num_asr_workers=NUM_WORKERS,
-                request_id=f"WS-PCM-{session_id}-b" # Log a batch ID if useful
+                request_id=f"WS-Stream-{session_id}-b{total_asr_chunks_processed_by_consumer}"
             )
-            accumulated_asr_processing_time_s += asr_call_duration
-
-            if processing_device == "cuda" and torch.cuda.is_available(): 
+            accumulated_asr_processing_time_s += asr_call_duration_s
+            
+            # Clear CUDA cache periodically if using CUDA to manage memory
+            if processing_device == "cuda" and torch.cuda.is_available():
                 await asyncio.to_thread(torch.cuda.empty_cache)
-            
-            segments_generated_this_asr_call = []
-            if hyps_list:
-                segments_generated_this_asr_call = _process_hypotheses_to_segments(
-                    hyps_list, batch_offsets, session_id # batch_offsets correspond to batch_audio_tensors
+
+            if hypotheses_list:
+                segments_from_batch = _process_hypotheses_to_segments(
+                    hypotheses_list, batch_offsets_s, f"{session_id}-segproc"
                 )
-                logger.info(f"({session_id}) PCM Consumer: ASR call yielded {len(segments_generated_this_asr_call)} segments.")
-
-
-            # --- MODIFIED SEGMENT SENDING LOGIC ---
-            if segments_generated_this_asr_call:
-                if websocket.application_state == WebSocketState.CONNECTED:
-                    # Segments are already chronologically ordered by _process_hypotheses_to_segments
-                    # if hypotheses and offsets are ordered.
-                    # No temporary IDs needed here unless client specifically expects them per intermediate batch.
-                    await websocket.send_json({
-                        "type": "segments_batch", # Mirroring full file upload message type
-                        "segments": segments_generated_this_asr_call
-                    })
-                    logger.debug(f"({session_id}) PCM Consumer: Sent segments_batch with {len(segments_generated_this_asr_call)} segments.")
+                logger.info(f"({session_id}) Stream Consumer: Generated {len(segments_from_batch)} segments from "
+                            f"{len(hypotheses_list)} hypotheses for the current batch.")
                 
-                # Accumulate all segments for the final SRT/CSV in the final_transcription message
-                sent_segments_pcm.extend(segments_generated_this_asr_call)
-            # --- END OF MODIFIED SEGMENT SENDING LOGIC ---
-            
-            # Check for completion (this condition is met if 'item is None' was processed,
-            # and this was the last batch to clear out the queue after producer was done).
-            if (producer_done_event.is_set() and 
-                chunk_queue.empty() and 
-                first_item_is_sentinel and # Ensures we recognized the sentinel
-                not batch_audio_tensors): # And no actual data was in this final processing loop
-                logger.debug(f"({session_id}) PCM Consumer: Post-processing sentinel check, exiting consumer.")
-                break
+                if segments_from_batch and websocket.application_state == WebSocketState.CONNECTED:
+                    try:
+                        await websocket.send_json({"type": "segments_batch", "segments": segments_from_batch})
+                        sent_segments_pcm.extend(segments_from_batch) # Track all sent segments
+                        logger.info(f"({session_id}) Stream Consumer: Successfully sent {len(segments_from_batch)} segments to client. "
+                                    f"(Total segments sent this session: {len(sent_segments_pcm)})")
+                        await asyncio.sleep(0.001) # Tiny sleep to allow other tasks (e.g., network I/O)
+                    except Exception as e_send:
+                        logger.warning(f"({session_id}) Stream Consumer: Failed to send segments batch to client: {e_send}", exc_info=True)
+                        # If send fails, we still add to sent_segments_pcm for the final transcription if connection is restored
+                        # or if we want to log what *would* have been sent.
+                        sent_segments_pcm.extend(segments_from_batch)
+                elif segments_from_batch: # Segments generated but WebSocket no longer connected
+                    sent_segments_pcm.extend(segments_from_batch)
+                    logger.info(f"({session_id}) Stream Consumer: Generated {len(segments_from_batch)} segments, "
+                                f"but WebSocket is disconnected. Segments stored for potential final summary.")
+            else:
+                logger.info(f"({session_id}) Stream Consumer: No hypotheses generated from ASR for the current batch, thus no segments to send.")
+
+            # If the sentinel was received and processed along with the last batch of data,
+            # now is the time to exit the consumer loop.
+            if first_item_in_batch_is_sentinel and not batch_audio_tensors : # Should have been handled by the top break
+                 pass # This case should be caught by the break at the start of the loop
+            elif item is None and not batch_audio_tensors : # Also should be caught
+                 pass
 
 
+        logger.info(f"({session_id}) Stream Consumer: Finished processing. "
+                    f"Total ASR chunks processed: {total_asr_chunks_processed_by_consumer}. "
+                    f"Total segments generated and queued/sent: {len(sent_segments_pcm)}.")
+
+    # Main execution block for handle_streaming_pcm
     try:
+        logger.info(f"({session_id}) Streaming Pipeline (ffmpeg-based): Starting producer and consumer tasks.")
         # Run producer and consumer concurrently
-        await asyncio.gather(pcm_producer(), pcm_consumer())
-        
-        # Send final transcription
-        final_text_pcm = " ".join(s["text"] for s in sent_segments_pcm).strip()
+        await asyncio.gather(producer(), consumer())
+        logger.info(f"({session_id}) Streaming Pipeline (ffmpeg-based): Producer and consumer tasks have completed.")
+
+        # Consolidate all transcribed text from segments
+        # Note: sent_segments_pcm might not be perfectly ordered if deduplication is added later for streaming.
+        # For now, assume they are appended in rough chronological order.
+        final_transcribed_text_pcm = " ".join(s["text"] for s in sent_segments_pcm).strip()
+
         if websocket.application_state == WebSocketState.CONNECTED:
-            final_msg_pcm = {
+            logger.info(f"({session_id}) Streaming: Sending final_transcription message to client. "
+                        f"Total ASR input duration (from ffmpeg PCM): {total_duration_processed_seconds_for_asr:.2f}s")
+            
+            final_message_payload = {
                 "type": "final_transcription",
-                "text": final_text_pcm,
-                "language": "en",
+                "text": final_transcribed_text_pcm,
+                "language": "en", # Assuming English, could be made configurable
                 "transcription_time": round(accumulated_asr_processing_time_s, 3),
                 "total_segments": len(sent_segments_pcm),
-                "final_duration_processed_seconds": round(total_samples_processed_pcm / MODEL_SAMPLE_RATE, 3),
-                "csv_content": generate_csv_content(sent_segments_pcm),
-                "srt_content": generate_srt_content(sent_segments_pcm),
-                "streaming_mode": "pcm"
+                "final_duration_processed_seconds": round(total_duration_processed_seconds_for_asr, 3),
+                "csv_content": generate_csv_content(sent_segments_pcm), # Utility function
+                "srt_content": generate_srt_content(sent_segments_pcm), # Utility function
+                "streaming_mode": client_config.get("format", "unknown") # Reflect client-declared format
             }
-            await websocket.send_json(final_msg_pcm)
-            
-    except Exception as e_pcm_pipeline:
-        if websocket.application_state == WebSocketState.CONNECTED: 
-            await websocket.send_json({"type": "error", "error": str(e_pcm_pipeline)})
+            await websocket.send_json(final_message_payload)
+            logger.info(f"({session_id}) Streaming: Final transcription message sent.")
+        else:
+            logger.info(f"({session_id}) Streaming: WebSocket disconnected before final_transcription could be sent.")
+
+    except Exception as e_pipeline_main:
+        logger.error(f"({session_id}) Main Streaming Pipeline Error: {e_pipeline_main}", exc_info=True)
+        if websocket.application_state == WebSocketState.CONNECTED:
+            try:
+                await websocket.send_json({"type": "error", "error": f"Critical server error in streaming pipeline: {str(e_pipeline_main)}"})
+            except Exception as e_send_err_critical:
+                logger.warning(f"({session_id}) Could not send critical error message to client after pipeline failure: {e_send_err_critical}")
     finally:
-        if not producer_done_event.is_set(): 
+        logger.info(f"({session_id}) Streaming Pipeline (ffmpeg-based): Final cleanup.")
+        # Ensure producer_done_event is set, and a sentinel is in the queue if not already guaranteed by producer's finally.
+        if not producer_done_event.is_set():
             producer_done_event.set()
         try:
-            chunk_queue.put_nowait(None) 
-        except: 
-            pass
+            # Try to put a sentinel if producer might have exited prematurely without doing so.
+            # This helps ensure consumer exits cleanly.
+            if chunk_queue.empty(): # Only if empty, to avoid multiple sentinels if one is already there
+                chunk_queue.put_nowait(None)
+        except (asyncio.QueueFull, Exception):
+            # Queue might be full if consumer also exited prematurely, or other rare conditions.
+            logger.warning(f"({session_id}) Streaming: Could not put sentinel in queue during final pipeline cleanup (queue full or other error).")
+
 
 def create_audio_chunks(
-    waveform: torch.Tensor, 
-    sample_rate: int = MODEL_SAMPLE_RATE, 
-    chunk_len_s: float = TRANSCRIBE_CHUNK_LEN, 
+    waveform: torch.Tensor,
+    sample_rate: int = MODEL_SAMPLE_RATE,
+    chunk_len_s: float = TRANSCRIBE_CHUNK_LEN,
     overlap_s: float = TRANSCRIBE_OVERLAP
-):
+) -> Tuple[List[torch.Tensor], List[float]]:
     """
-    Create overlapping audio chunks from a waveform tensor.
-    
+    Splits a long audio waveform tensor into smaller, overlapping chunks.
+
+    This is typically used for processing very long audio files that cannot be
+    fed to the ASR model in one go.
+
     Args:
-        waveform: 1D audio tensor
-        sample_rate: Audio sample rate
-        chunk_len_s: Chunk length in seconds
-        overlap_s: Overlap between chunks in seconds
-        
+        waveform: A 1D PyTorch tensor containing the audio data.
+        sample_rate: The sample rate of the input waveform (in Hz).
+        chunk_len_s: The desired length of each chunk in seconds.
+        overlap_s: The desired overlap between consecutive chunks in seconds.
+
     Returns:
-        Tuple of (chunks_list, offsets_list)
+        A tuple containing:
+            - chunks (List[torch.Tensor]): A list of 1D audio tensors, each representing a chunk.
+            - offsets (List[float]): A list of floats, where each float is the starting
+                                     time (in seconds) of the corresponding chunk in the
+                                     original waveform.
+    Raises:
+        AssertionError: If the input waveform is not 1D.
+        ValueError: If `overlap_s` is not less than `chunk_len_s` (i.e., stride <= 0).
     """
-    assert waveform.ndim == 1
-    total_dur = waveform.shape[0] / sample_rate
-    stride = chunk_len_s - overlap_s
+    assert waveform.ndim == 1, "Input waveform must be a 1D tensor."
     
-    if stride <= 0: 
-        raise ValueError("Overlap must be < chunk length")
+    total_duration_s = waveform.shape[0] / sample_rate
     
-    chunks, offsets = [], []
-    cur = 0.0
+    stride_s = chunk_len_s - overlap_s
+    if stride_s <= 0:
+        raise ValueError("Overlap duration must be less than chunk length duration for a positive stride.")
+
+    chunks: List[torch.Tensor] = []
+    offsets_s: List[float] = []
     
-    while cur < total_dur:
-        start_s = max(0.0, cur - overlap_s)
-        end_s = min(total_dur, cur + chunk_len_s)
-        s_idx, e_idx = int(start_s * sample_rate), int(end_s * sample_rate)
-        
-        if e_idx - s_idx <= 0: 
-            if cur + stride >= total_dur: 
+    current_offset_s = 0.0
+    while current_offset_s < total_duration_s:
+        start_sample_idx = int(current_offset_s * sample_rate)
+        # Ensure end_sample_idx does not exceed waveform length
+        end_sample_idx = int(min(total_duration_s, current_offset_s + chunk_len_s) * sample_rate)
+
+        # If the calculated chunk is empty or too small (e.g., due to rounding at the very end)
+        if end_sample_idx <= start_sample_idx:
+            # If advancing by stride would still be within the audio, continue to next possible chunk
+            if current_offset_s + stride_s < total_duration_s:
+                current_offset_s += stride_s
+                continue
+            else: # No more meaningful chunks can be formed
                 break
-            cur += stride
-            continue
+        
+        chunk_tensor = waveform[start_sample_idx:end_sample_idx].clone() # Clone to avoid views if tensor is modified
+        
+        if chunk_tensor.numel() > 0: # Ensure the chunk is not empty
+            chunks.append(chunk_tensor)
+            offsets_s.append(round(current_offset_s, 3)) # Store offset with precision
+
+        # If this chunk reaches or exceeds the end of the waveform, stop
+        if end_sample_idx >= waveform.shape[0]:
+            break 
             
-        chunk = waveform[s_idx:e_idx].clone()
-        if chunk.numel(): 
-            chunks.append(chunk)
-            offsets.append(start_s) 
-            
-        if end_s >= total_dur: 
-            break
-        cur += stride
-        if cur >= total_dur: 
-            break
-            
-    return chunks, offsets
+        current_offset_s += stride_s
+
+        # Safety break for very tiny residual audio that might cause near-infinite loops if stride is small
+        # and remaining audio is smaller than a full chunk but offsets don't align perfectly.
+        # If we have chunks, and the last chunk's intended end was before total_duration,
+        # but current_offset_s is now >= total_duration, it implies we might be stuck.
+        if current_offset_s >= total_duration_s:
+            if chunks and (offsets_s[-1] + chunk_len_s < total_duration_s - 0.01): # Last chunk didn't cover end
+                 # This condition tries to catch if the last segment was small and we are past the audio
+                 # but there was still a tiny bit left. This usually means the last chunk should be the end.
+                 pass # Allow one more pass if a tiny sliver is left. The outer while will catch it.
+            # Avoid infinite loop if offsets get stuck due to floating point issues on tiny final segments
+            if len(chunks) > 1 and offsets_s[-1] == offsets_s[-2]:
+                logger.warning(f"(create_audio_chunks) Detected potential stuck loop with duplicate offsets. Breaking.")
+                break
+    
+    logger.debug(f"(create_audio_chunks) Created {len(chunks)} chunks from audio of {total_duration_s:.2f}s.")
+    return chunks, offsets_s
+
 
 @app.post("/v1/audio/transcriptions")
 async def transcribe_endpoint_rest(
     file: UploadFile = File(...),
-    chunk_length: Optional[float] = Query(None),
-    chunk_overlap: Optional[float] = Query(None),
-    batch_size: Optional[int] = Query(None),
-    long_audio_threshold: Optional[float] = Query(None)
+    chunk_length: Optional[float] = Query(None, description="Duration of audio chunks for ASR in seconds. Uses server default if not set."),
+    chunk_overlap: Optional[float] = Query(None, description="Overlap between audio chunks in seconds. Uses server default if not set."),
+    batch_size: Optional[int] = Query(None, description="Batch size for ASR model processing. Uses server default if not set."),
+    long_audio_threshold: Optional[float] = Query(None, description="Threshold in seconds to apply long audio model settings. Uses server default if not set.")
 ):
-    """REST endpoint for audio transcription."""
-    if not asr_model: 
-        return JSONResponse(
-            status_code=503,
-            content={"error": "ASR model not available."}
-        )
-    
-    request_id = base64.urlsafe_b64encode(os.urandom(6)).decode()
-    
-    try: 
-        config = parse_request_config(chunk_length, chunk_overlap, batch_size, long_audio_threshold)
-    except ValueError as e_cfg: 
-        return JSONResponse(status_code=400, content={"error": str(e_cfg)})
-    
-    temp_uploaded_file_path: str = ""
-    long_audio_settings_were_applied = False
-    processing_device = "cuda" if torch.cuda.is_available() else "cpu"
-    request_start_time = time.time()
-    response_content_dict: Optional[JSONResponse] = None
+    """
+    Handles REST API requests for audio transcription of a single uploaded file.
+
+    The endpoint expects a file upload. It processes the entire audio file,
+    performs transcription, and returns the results as JSON.
+
+    Query Parameters (Optional):
+        chunk_length: Overrides server default for ASR internal chunking (if model uses it).
+                      Note: For Parakeet TDT, the model might process the whole audio,
+                      but this can influence settings if `_apply_model_settings_for_session`
+                      uses it for decision duration. For this REST endpoint, total audio
+                      duration is used for `_apply_model_settings_for_session`.
+        chunk_overlap: Overrides server default for ASR internal chunking overlap.
+        batch_size: Overrides server default for batch size during NeMo's `transcribe` call.
+        long_audio_threshold: Overrides server default for the threshold that determines
+                              if long-audio specific model settings are applied.
+
+    Returns:
+        JSONResponse: Contains transcription text, segments, language, timing information,
+                      and SRT/CSV content. Returns an error response on failure.
+    """
+    if not asr_model:
+        logger.error("REST Request: ASR model is not available.")
+        return JSONResponse(status_code=503, content={"error": "ASR model not available. Service is initializing or encountered an error."})
+
+    request_id = base64.urlsafe_b64encode(os.urandom(6)).decode() # Short unique ID for logging
+    logger.info(f"({request_id}) REST request received for file: '{file.filename}'. Content-type: {file.content_type}")
 
     try:
-        async with model_access_lock:
-            try:
-                # Save uploaded file temporarily
-                with tempfile.NamedTemporaryFile(
-                    delete=False,
-                    suffix=Path(file.filename if file.filename else ".unk").suffix,
-                    prefix=f"rest_{request_id}_"
-                ) as tmp:
-                    await asyncio.to_thread(shutil.copyfileobj, file.file, tmp)
-                    temp_uploaded_file_path = tmp.name
-                
-                # Load and preprocess audio
-                waveform_tensor, audio_duration_s = await load_and_preprocess_audio(
-                    temp_uploaded_file_path, MODEL_SAMPLE_RATE, request_id
-                )
-                
-                if waveform_tensor is None: 
-                    response_content_dict = JSONResponse(
-                        status_code=400,
-                        content={"error": "Audio processing failed."}
-                    )
-                    raise ValueError("Audio loading failed")
-                
-                # Apply model settings
-                long_audio_settings_were_applied = await _apply_model_settings_for_asr_call(
-                    audio_duration_s, processing_device, request_id
-                )
-                
-                if asr_model is None: 
-                    response_content_dict = JSONResponse(
-                        status_code=503,
-                        content={"error": "ASR model unavailable."}
-                    )
-                    raise RuntimeError("ASR Model None")
-                
-                # Perform transcription
-                hypotheses_list, transcribe_asr_call_duration = await _perform_asr_transcription(
-                    asr_model, [waveform_tensor], config["batch_size"], NUM_WORKERS, f"REST-{request_id}"
-                )
-                
-                # Process segments
-                segments_result = []
-                if hypotheses_list:
-                    segments_result = _process_hypotheses_to_segments(
-                        hypotheses_list, [0.0] * len(hypotheses_list), request_id
-                    )
-                
-                text_result = " ".join(s['text'] for s in segments_result).strip()
-                total_server_request_duration = round(time.time() - request_start_time, 3)
-                
-                response_payload = {
-                    "text": text_result,
-                    "segments": segments_result,
-                    "language": "en",
-                    "transcription_time": transcribe_asr_call_duration,
-                    "total_request_time_server": total_server_request_duration,
-                    "csv_content": generate_csv_content(segments_result),
-                    "srt_content": generate_srt_content(segments_result)
-                }
-                response_content_dict = JSONResponse(content=response_payload)
-                
-            except Exception as e_locked:
-                if response_content_dict is None: 
-                    detail = str(e_locked)
-                    if "CUDA out of memory" in detail: 
-                        err_msg = "CUDA OOM."
-                        response_content_dict = JSONResponse(
-                            status_code=500,
-                            content={"error": err_msg, "detail": detail}
-                        )
-                    elif "Audio loading failed" in detail: 
-                        err_msg = "Audio load fail."
-                        response_content_dict = JSONResponse(
-                            status_code=400,
-                            content={"error": err_msg, "detail": detail}
-                        )
-                    else: 
-                        response_content_dict = JSONResponse(
-                            status_code=500,
-                            content={"error": "Server error.", "detail": detail}
-                        )
-            finally: 
-                await _revert_model_to_global_original_state(
-                    long_audio_settings_were_applied, processing_device, request_id
-                )
-                
-        if response_content_dict: 
-            return response_content_dict
-        return JSONResponse(status_code=500, content={"error": "Internal server error."})
-        
-    except Exception as e_outer: 
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Unexpected server error.", "detail": str(e_outer)}
-        )
-    finally:
-        if temp_uploaded_file_path and os.path.exists(temp_uploaded_file_path):
-            try:
-                await asyncio.to_thread(os.remove, temp_uploaded_file_path)
-            except: 
-                pass
+        # Parse and validate common ASR configuration from query parameters
+        client_config_rest = parse_request_config(chunk_length, chunk_overlap, batch_size, long_audio_threshold)
+        logger.info(f"({request_id}) REST: Parsed request config: {client_config_rest}")
+    except ValueError as e_config:
+        logger.warning(f"({request_id}) REST: Invalid request parameters: {e_config}")
+        return JSONResponse(status_code=400, content={"error": f"Invalid request parameter: {str(e_config)}"})
 
-@app.websocket("/v1/audio/transcriptions/ws")
-async def websocket_transcribe_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint for real-time audio transcription.
+    temp_audio_file_path: str = ""
+    long_audio_settings_applied_this_session = False
     
-    Supports two modes:
-    1. Streaming PCM audio for real-time transcription
-    2. Full file upload for batch processing
+    # Determine processing device and data type for this session
+    session_processing_device = "cuda" if torch.cuda.is_available() else "cpu"
+    session_target_operational_dtype = torch.float32
+    if session_processing_device == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        session_target_operational_dtype = torch.bfloat16
+        logger.info(f"({request_id}) REST Session: Will use bfloat16 on CUDA for ASR computation.")
+    else:
+        logger.info(f"({request_id}) REST Session: Will use float32 on {session_processing_device} for ASR computation.")
+
+    start_time_total_request_processing = time.time()
+    final_response_content: Optional[dict] = None
+    response_status_code: int = 200 # Default to 200 OK
+
+    try:
+        # Acquire lock for exclusive ASR model access
+        async with model_access_lock:
+            logger.debug(f"({request_id}) REST: Acquired ASR model access lock.")
+            try:
+                # Save uploaded file to a temporary location for processing by torchaudio
+                # Using a NamedTemporaryFile ensures it's cleaned up even if errors occur.
+                # delete=False is needed on Windows to allow torchaudio.load to open it by name.
+                with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or ".unknown_audio_ext").suffix, prefix=f"rest_audio_{request_id}_") as tmp_file:
+                    await asyncio.to_thread(shutil.copyfileobj, file.file, tmp_file)
+                    temp_audio_file_path = tmp_file.name
+                
+                logger.info(f"({request_id}) REST: Uploaded file saved temporarily to '{temp_audio_file_path}'.")
+
+                # Load and preprocess the entire audio file
+                waveform_tensor, total_audio_duration_s = await load_and_preprocess_audio(
+                    audio_source=temp_audio_file_path,
+                    target_sample_rate=MODEL_SAMPLE_RATE,
+                    request_id=request_id
+                )
+
+                if waveform_tensor is None or total_audio_duration_s == 0:
+                    logger.warning(f"({request_id}) REST: Audio processing failed or resulted in empty audio.")
+                    response_status_code = 400 # Bad Request
+                    final_response_content = {"error": "Audio processing failed or the audio file is empty/corrupted."}
+                elif asr_model is None: # Re-check, though checked at start
+                    logger.critical(f"({request_id}) REST: ASR model became unavailable during locked operation.")
+                    response_status_code = 503 # Service Unavailable
+                    final_response_content = {"error": "ASR model became unavailable during processing."}
+                else:
+                    # Apply model settings (device, dtype, long/short audio attention) for this session
+                    # For REST, the decision for long/short audio settings is based on the total file duration.
+                    long_audio_settings_applied_this_session = await _apply_model_settings_for_session(
+                        decision_duration_s=total_audio_duration_s,
+                        target_processing_device=session_processing_device,
+                        target_operational_dtype=session_target_operational_dtype,
+                        long_audio_threshold_config=client_config_rest["long_audio_threshold"],
+                        request_id=request_id
+                    )
+                    logger.info(f"({request_id}) REST: ASR model settings applied for session. Long audio specific settings active: {long_audio_settings_applied_this_session}.")
+
+                    # Perform transcription on the entire waveform
+                    # NeMo's `transcribe` can handle batching internally if a list of waveforms is provided.
+                    # Here, we provide a list containing a single tensor.
+                    hypotheses_list, asr_processing_time_s = await _perform_asr_transcription(
+                        asr_model_instance=asr_model,
+                        audio_input_list=[waveform_tensor], # List with one item for single file
+                        batch_size_for_transcribe_call=client_config_rest["batch_size"], # Can be 1
+                        num_asr_workers=NUM_WORKERS,
+                        request_id=f"REST-{request_id}"
+                    )
+
+                    # Process raw hypotheses into structured segments
+                    # For a single, non-chunked audio file, the offset is 0.0 for all hypotheses.
+                    segments = _process_hypotheses_to_segments(
+                        hypotheses_list, 
+                        [0.0] * (len(hypotheses_list) if hypotheses_list else 0), 
+                        request_id
+                    )
+                    
+                    full_transcribed_text = " ".join(s['text'] for s in segments).strip()
+                    total_server_processing_time_s = round(time.time() - start_time_total_request_processing, 3)
+                    
+                    final_response_content = {
+                        "text": full_transcribed_text,
+                        "segments": segments,
+                        "language": "en", # Assuming English
+                        "transcription_time_seconds": round(asr_processing_time_s, 3),
+                        "total_request_time_server_seconds": total_server_processing_time_s,
+                        "csv_content": generate_csv_content(segments),
+                        "srt_content": generate_srt_content(segments),
+                        "audio_duration_seconds": round(total_audio_duration_s, 3)
+                    }
+                    response_status_code = 200 # OK
+                    logger.info(f"({request_id}) REST: Transcription successful. Duration: {total_audio_duration_s:.2f}s, ASR time: {asr_processing_time_s:.2f}s.")
+
+            except Exception as e_locked_rest_processing:
+                logger.error(f"({request_id}) REST: Error occurred during locked ASR processing: {e_locked_rest_processing}", exc_info=True)
+                # Ensure a response is set if not already
+                if final_response_content is None:
+                    response_status_code = 500 # Internal Server Error
+                    final_response_content = {"error": "An unexpected error occurred during transcription processing.", "detail": str(e_locked_rest_processing)}
+            finally:
+                logger.debug(f"({request_id}) REST: Releasing ASR model lock and reverting model state.")
+                # Always revert model state at the end of the locked block
+                await _revert_model_to_global_original_state(
+                    long_audio_settings_were_active_for_session=long_audio_settings_applied_this_session,
+                    session_processing_device=session_processing_device, # The device used in this session
+                    request_id=f"{request_id}-rest_model_revert"
+                )
+                logger.info(f"({request_id}) REST: ASR Model state reverted after session.")
+        
+        # If, after releasing the lock, no specific response was prepared (should be rare)
+        if final_response_content is None:
+            logger.error(f"({request_id}) REST: final_response_content is None after model lock release. Setting generic error.")
+            response_status_code = 500
+            final_response_content = {"error": "An unknown error occurred while processing the REST request."}
+            
+        return JSONResponse(status_code=response_status_code, content=final_response_content)
+
+    except Exception as e_outer_rest_handler:
+        # Catch-all for errors outside the model lock, e.g., initial parameter parsing issues
+        # that were not caught by `parse_request_config`'s ValueError.
+        logger.error(f"({request_id}) REST: Unhandled outer error in endpoint: {e_outer_rest_handler}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": "An unexpected server error occurred in the REST endpoint.", "detail": str(e_outer_rest_handler)})
+    finally:
+        # Clean up the temporary audio file
+        if temp_audio_file_path and os.path.exists(temp_audio_file_path):
+            try:
+                await asyncio.to_thread(os.remove, temp_audio_file_path)
+                logger.debug(f"({request_id}) REST: Successfully removed temporary file '{temp_audio_file_path}'.")
+            except Exception as e_remove_temp:
+                logger.warning(f"({request_id}) REST: Failed to remove temporary file '{temp_audio_file_path}': {e_remove_temp}")
+        
+        # Ensure file object from UploadFile is closed if FastAPI hasn't handled it.
+        if hasattr(file, 'file') and file.file and not file.file.closed:
+            await asyncio.to_thread(file.file.close)
+
+        logger.info(f"({request_id}) REST request for file '{file.filename}' completed with status code {response_status_code if 'response_status_code' in locals() else 'unknown'}.")
+
+
+@app.websocket("/v1/audio/transcriptions/ws_stream")
+async def websocket_transcribe_endpoint_streaming(websocket: WebSocket):
+    """
+    Handles WebSocket connections for live/streaming audio transcription as its received.
+
+    The client first sends a JSON configuration message. Then, it streams
+    audio data in binary chunks. An "END" text message signals the end of the stream.
+    The server uses `ffmpeg` to transcode incoming audio to a standard PCM format,
+    then chunks and transcribes it, sending back `segments_batch` messages with
+    intermediate results and a `final_transcription` message upon completion.
+
+    Protocol:
+    1. Client connects.
+    2. Server accepts.
+    3. Client sends JSON text message with configuration (see `parse_websocket_config`).
+    4. Client sends audio data as binary messages.
+    5. Client sends "END" text message to signal end of audio.
+    6. Server sends `segments_batch` JSON messages with lists of transcribed segments.
+    7. Server sends `final_transcription` JSON message with aggregated results.
+    8. Connection is closed.
+
+    Args:
+        websocket: The WebSocket connection object provided by FastAPI.
+    """
+    session_id = base64.urlsafe_b64encode(os.urandom(6)).decode() # Unique ID for this session
+    await websocket.accept()
+    logger.info(f"({session_id}) WebSocket connection accepted for audio streaming (ffmpeg-based).")
+
+    if not asr_model:
+        logger.error(f"({session_id}) WS Stream: ASR model not available.")
+        await websocket.send_json({"type": "error", "error": "ASR model not available. Service is initializing or encountered an error."})
+        await websocket.close(code=1011) # 1011: Server error
+        return
+
+    session_processing_device = "cuda" if torch.cuda.is_available() else "cpu"
+    long_audio_settings_applied_this_session = False
+    
+    session_target_operational_dtype = torch.float32
+    if session_processing_device == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        session_target_operational_dtype = torch.bfloat16
+    logger.info(f"({session_id}) WS Stream Session: Will use dtype {session_target_operational_dtype} on device {session_processing_device} for ASR computation.")
+
+    client_config: Optional[dict] = None
+    try:
+        # 1. Receive and parse initial client configuration
+        config_text = await asyncio.wait_for(websocket.receive_text(), timeout=20.0) # Timeout for config
+        client_config = parse_websocket_config(json.loads(config_text))
+        logger.info(f"({session_id}) WS Stream: Received valid client configuration: {client_config}")
+
+        # Acquire lock for exclusive ASR model access
+        async with model_access_lock:
+            logger.debug(f"({session_id}) WS Stream: Acquired ASR model access lock.")
+            try:
+                # Apply model settings for this streaming session.
+                # For streaming, decision for long/short audio is based on ASR chunk_length.
+                long_audio_settings_applied_this_session = await _apply_model_settings_for_session(
+                    decision_duration_s=client_config["chunk_length"], 
+                    target_processing_device=session_processing_device,
+                    target_operational_dtype=session_target_operational_dtype,
+                    long_audio_threshold_config=client_config["long_audio_threshold"],
+                    request_id=session_id
+                )
+                logger.info(f"({session_id}) WS Stream: ASR model settings applied for session. Long audio specific settings active: {long_audio_settings_applied_this_session}.")
+
+                # Start the streaming PCM handling pipeline (producer/consumer with ffmpeg)
+                await handle_streaming_pcm(websocket, session_id, session_processing_device, client_config)
+            
+            except Exception as e_locked_ws_processing:
+                # Errors within the locked block (e.g., during handle_streaming_pcm or model setup)
+                logger.error(f"({session_id}) WS Stream: Error during locked operation: {e_locked_ws_processing}", exc_info=True)
+                if websocket.application_state == WebSocketState.CONNECTED:
+                    try:
+                        await websocket.send_json({"type": "error", "error": f"Server error during streaming: {str(e_locked_ws_processing)}"})
+                    except Exception as e_send_err_on_locked_err:
+                        logger.warning(f"({session_id}) WS Stream: Could not send error to client after locked operation error: {e_send_err_on_locked_err}")
+            finally:
+                logger.debug(f"({session_id}) WS Stream: Releasing ASR model lock and reverting model state.")
+                # Always revert model state at the end of the locked block
+                await _revert_model_to_global_original_state(
+                    long_audio_settings_were_active_for_session=long_audio_settings_applied_this_session,
+                    session_processing_device=session_processing_device,
+                    request_id=f"{session_id}-stream_model_revert"
+                )
+                logger.info(f"({session_id}) WS Stream: ASR Model state reverted after session.")
+    
+    except WebSocketDisconnect:
+        logger.info(f"({session_id}) WS Stream: WebSocket disconnected by client.")
+    except asyncio.TimeoutError:
+        logger.warning(f"({session_id}) WS Stream: Timeout occurred, likely waiting for initial client config.")
+        if websocket.application_state == WebSocketState.CONNECTED:
+            try: await websocket.send_json({"type": "error", "error": "Timeout: No configuration received from client."})
+            except Exception: pass # Ignore if send also fails
+    except json.JSONDecodeError as e_json_decode:
+        logger.warning(f"({session_id}) WS Stream: Failed to decode JSON configuration from client: {e_json_decode}")
+        if websocket.application_state == WebSocketState.CONNECTED:
+            try: await websocket.send_json({"type": "error", "error": f"Invalid JSON configuration received: {str(e_json_decode)}"})
+            except Exception: pass
+    except ValueError as e_value_config: # From parse_websocket_config
+        logger.warning(f"({session_id}) WS Stream: Invalid configuration parameters: {e_value_config}")
+        if websocket.application_state == WebSocketState.CONNECTED:
+            try: await websocket.send_json({"type": "error", "error": f"Invalid configuration: {str(e_value_config)}"})
+            except Exception: pass
+    except Exception as e_outer_ws_handler:
+        # Catch-all for other unexpected errors in the WebSocket handler
+        logger.error(f"({session_id}) WS Stream: Unhandled exception in WebSocket endpoint: {e_outer_ws_handler}", exc_info=True)
+        if websocket.application_state == WebSocketState.CONNECTED:
+            try: await websocket.send_json({"type": "error", "error": "An unexpected server error occurred."})
+            except Exception: pass
+    finally:
+        if websocket.application_state == WebSocketState.CONNECTED:
+            logger.info(f"({session_id}) WS Stream: Closing WebSocket connection (endpoint finally block).")
+            try:
+                await websocket.close(code=1000) # 1000: Normal Closure
+            except Exception as e_close_ws:
+                logger.warning(f"({session_id}) WS Stream: Error closing WebSocket in finally block: {e_close_ws}")
+        logger.info(f"({session_id}) Streaming WebSocket session via ffmpeg ended.")
+
+
+@app.websocket("/v1/audio/transcriptions/ws_upload")
+async def websocket_transcribe_endpoint_full_file_upload(websocket: WebSocket):
+    """
+    Handles WebSocket connections for transcribing a full audio file uploaded via WebSocket.
+
+    The client first sends a JSON configuration message. Then, it streams the
+    entire audio file as binary messages, followed by an "END" text message.
+    The server accumulates the entire file, then processes it by chunking the
+    audio and performing ASR on these chunks. Intermediate `segments_batch`
+    messages are sent, followed by a `final_transcription` message.
+
+    Protocol:
+    1. Client connects.
+    2. Server accepts.
+    3. Client sends JSON text message with configuration (see `parse_websocket_config`).
+    4. Client sends all audio data as binary messages.
+    5. Client sends "END" text message.
+    6. Server sends `segments_batch` JSON messages with lists of transcribed segments from ASR batches.
+    7. Server sends `final_transcription` JSON message with aggregated and deduplicated results.
+    8. Connection is closed.
+
+    Args:
+        websocket: The WebSocket connection object provided by FastAPI.
     """
     session_id = base64.urlsafe_b64encode(os.urandom(6)).decode()
     await websocket.accept()
-    
-    # Check if ASR model is available
-    if not asr_model: 
-        await websocket.send_json({
-            "type": "error", 
-            "error": "ASR model not available."
-        })
-        await websocket.close(1011)
+    logger.info(f"({session_id}) WebSocket connection accepted for full file upload transcription.")
+
+    if not asr_model:
+        logger.error(f"({session_id}) WS Upload: ASR model not available.")
+        await websocket.send_json({"type": "error", "error": "ASR model not available. Service is initializing or encountered an error."})
+        await websocket.close(code=1011) # Server error
         return
 
-    # Initialize session variables
-    processing_device_ws = "cuda" if torch.cuda.is_available() else "cpu"
-    long_audio_settings_applied_for_this_session = False
-    ws_response_final_dict: Optional[dict] = None
-    client_audio_fmt_parsed_from_config = "unknown"
+    session_processing_device = "cuda" if torch.cuda.is_available() else "cpu"
+    long_audio_settings_applied_this_session = False
+    final_response_payload: Optional[dict] = None # To store the final message content
+    
+    session_target_operational_dtype = torch.float32
+    if session_processing_device == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        session_target_operational_dtype = torch.bfloat16
+    logger.info(f"({session_id}) WS Upload Session: Will use dtype {session_target_operational_dtype} on device {session_processing_device} for ASR computation.")
 
+    client_config: Optional[dict] = None
     try:
-        # Parse client configuration
-        client_config = parse_websocket_config(
-            json.loads(await asyncio.wait_for(websocket.receive_text(), timeout=20.0))
-        )
-        client_audio_fmt_parsed_from_config = client_config["format"]
-        
+        # 1. Receive and parse initial client configuration
+        config_text = await asyncio.wait_for(websocket.receive_text(), timeout=20.0)
+        client_config = parse_websocket_config(json.loads(config_text))
+        logger.info(f"({session_id}) WS Upload: Received valid client configuration: {client_config}")
+
+        # Acquire lock for exclusive ASR model access
         async with model_access_lock:
+            logger.debug(f"({session_id}) WS Upload: Acquired ASR model access lock.")
             try:
-                if client_config["format"] == "pcm":
-                    # Handle streaming PCM audio
-                    await handle_streaming_pcm(
-                        websocket, session_id, processing_device_ws, client_config
-                    )
-                else:
-                    # Handle full file upload mode
-                    accumulated_raw_bytes_ws = bytearray()
-                    
-                    # Collect audio data
-                    while True: 
-                        if websocket.application_state != WebSocketState.CONNECTED: 
-                            raise WebSocketDisconnect(1001, "Client disconnected")
-                        
-                        try:
-                            message = await asyncio.wait_for(websocket.receive(), timeout=60.0) 
-                            
-                            if message.get("type") == "websocket.disconnect": 
-                                raise WebSocketDisconnect(message.get('code', 1000))
-                            
-                            if 'text' in message and message['text']:
-                                if message['text'].upper() == "END": 
-                                    break 
-                                elif client_config.get("format") == "base64": 
-                                    try:
-                                        accumulated_raw_bytes_ws.extend(
-                                            base64.b64decode(message['text'])
-                                        )
-                                    except: 
-                                        pass
-                            elif 'bytes' in message and message['bytes']: 
-                                accumulated_raw_bytes_ws.extend(message['bytes'])
-                                
-                        except asyncio.TimeoutError: 
-                            raise WebSocketDisconnect(1008, "Timeout before END")
-                    
-                    # Validate collected audio data
-                    if not accumulated_raw_bytes_ws:
-                        if websocket.application_state == WebSocketState.CONNECTED: 
-                            await websocket.send_json({
-                                "type": "error", 
-                                "error": "No audio data."
-                            })
-                        raise ValueError("No audio for WS Full File Upload")
-                    
-                    # Load and preprocess audio
-                    waveform_ws_tensor, audio_duration_s_ws = await load_and_preprocess_audio(
-                        io.BytesIO(bytes(accumulated_raw_bytes_ws)), MODEL_SAMPLE_RATE, session_id
-                    )
-                    accumulated_raw_bytes_ws.clear()
-                    
-                    if waveform_ws_tensor is None: 
-                        raise ValueError("WS Full File: Audio loading failed.")
-                    
-                    # Apply model settings for long audio if needed
-                    long_audio_settings_applied_for_this_session = await _apply_model_settings_for_asr_call(
-                        audio_duration_s_ws, processing_device_ws, session_id
-                    )
-                    
-                    if asr_model is None: 
-                        raise RuntimeError("ASR Model None.")
-                    
-                    # Create audio chunks for processing
-                    manual_chunks_ws, manual_offsets_ws = create_audio_chunks(
-                        waveform_ws_tensor, MODEL_SAMPLE_RATE, 
-                        client_config["chunk_length"], client_config["chunk_overlap"]
-                    )
-                    
-                    all_raw_segments_from_batches = []
-                    asr_total_processing_time_this_mode = 0.0
-                    batch_size_cfg = client_config["batch_size"]
-                    
-                    # Process chunks in batches
-                    for batch_start_idx in range(0, len(manual_chunks_ws), batch_size_cfg):
-                        if websocket.application_state != WebSocketState.CONNECTED: 
-                            break
-                        
-                        current_batch_tensors = manual_chunks_ws[
-                            batch_start_idx:batch_start_idx + batch_size_cfg
-                        ]
-                        current_batch_offsets = manual_offsets_ws[
-                            batch_start_idx:batch_start_idx + batch_size_cfg
-                        ]
-                        
-                        if not current_batch_tensors: 
-                            continue
-                        
-                        # Perform ASR transcription for this batch
-                        hypotheses_batch, batch_duration = await _perform_asr_transcription(
-                            asr_model, current_batch_tensors, len(current_batch_tensors), 
-                            NUM_WORKERS, f"WS-Full-{session_id}-b{batch_start_idx//batch_size_cfg}"
-                        )
-                        asr_total_processing_time_this_mode += batch_duration
-                        
-                        # Process segments from this batch
-                        if hypotheses_batch:
-                            segments_from_this_batch = _process_hypotheses_to_segments(
-                                hypotheses_batch, current_batch_offsets, session_id
-                            )
-                            
-                            if (websocket.application_state == WebSocketState.CONNECTED and 
-                                segments_from_this_batch):
-                                # Sort segments chronologically and assign temporary IDs
-                                segments_from_this_batch.sort(key=lambda s: s["start"])
-                                for idx_s, seg_s in enumerate(segments_from_this_batch): 
-                                    seg_s["id"] = idx_s 
-                                
-                                await websocket.send_json({
-                                    "type": "segments_batch",
-                                    "segments": segments_from_this_batch
-                                })
-                                all_raw_segments_from_batches.extend(segments_from_this_batch)
-                        
-                        # Clean up CUDA memory if used
-                        if processing_device_ws == "cuda" and torch.cuda.is_available(): 
-                            await asyncio.to_thread(torch.cuda.empty_cache)
-                    
-                    # Deduplicate and finalize segments
-                    final_deduped_segments = _deduplicate_segments(all_raw_segments_from_batches)
-                    final_text = " ".join(s['text'] for s in final_deduped_segments).strip()
-                    
-                    ws_response_final_dict = {
-                        "type": "final_transcription",
-                        "text": final_text,
-                        "language": "en",
-                        "transcription_time": round(asr_total_processing_time_this_mode, 3),
-                        "total_segments": len(final_deduped_segments),
-                        "final_duration_processed_seconds": round(audio_duration_s_ws, 3),
-                        "csv_content": generate_csv_content(final_deduped_segments),
-                        "srt_content": generate_srt_content(final_deduped_segments)
-                    }
-                    
-            except Exception as e_locked_ws: 
-                if websocket.application_state == WebSocketState.CONNECTED:
-                    detail = str(e_locked_ws)
-                    err_type = "CUDA OOM" if "CUDA out of memory" in detail else "Server error"
-                    await websocket.send_json({
-                        "type": "error", 
-                        "error": f"{err_type}: {detail}"
-                    })
-            finally: 
-                await _revert_model_to_global_original_state(
-                    long_audio_settings_applied_for_this_session, 
-                    processing_device_ws, 
-                    session_id
+                # Apply model settings for this session.
+                # For ws_upload, decision for long/short audio is based on ASR chunk_length,
+                # as the full audio duration isn't known until all data is received.
+                long_audio_settings_applied_this_session = await _apply_model_settings_for_session(
+                    decision_duration_s=client_config["chunk_length"],
+                    target_processing_device=session_processing_device,
+                    target_operational_dtype=session_target_operational_dtype,
+                    long_audio_threshold_config=client_config["long_audio_threshold"],
+                    request_id=session_id
                 )
+                logger.debug(f"({session_id}) WS Upload: ASR model settings applied. Long audio specific settings active: {long_audio_settings_applied_this_session}.")
+
+                # 2. Accumulate audio data from client
+                accumulated_raw_audio_bytes = bytearray()
+                logger.info(f"({session_id}) WS Upload: Waiting to receive audio file data...")
+                while True:
+                    if websocket.application_state != WebSocketState.CONNECTED:
+                        # This can happen if client disconnects abruptly during transfer
+                        raise WebSocketDisconnect(code=1001, reason="Client disconnected during file data transfer.")
+                    
+                    try:
+                        # Timeout for each data chunk to detect stalled uploads
+                        message = await asyncio.wait_for(websocket.receive(), timeout=60.0) 
+                    except asyncio.TimeoutError:
+                        logger.warning(f"({session_id}) WS Upload: Timeout waiting for audio data chunk from client.")
+                        raise WebSocketDisconnect(code=1008, reason="Timeout waiting for file data from client.") # Policy Violation
+
+                    if message.get("type") == "websocket.disconnect":
+                        # Explicit disconnect message from FastAPI/Starlette
+                        raise WebSocketDisconnect(code=message.get('code', 1000))
+
+                    if 'text' in message and message['text']:
+                        if message['text'].upper() == "END":
+                            logger.info(f"({session_id}) WS Upload: 'END' signal received. Total bytes received: {len(accumulated_raw_audio_bytes)}.")
+                            break # End of file transfer
+                        else:
+                            logger.warning(f"({session_id}) WS Upload: Received unexpected text message during data transfer: {message['text'][:100]}")
+                    elif 'bytes' in message and message['bytes']:
+                        accumulated_raw_audio_bytes.extend(message['bytes'])
+                        # Log progress sparingly to avoid flooding logs for large files
+                        if len(accumulated_raw_audio_bytes) % (1024 * 1024 * 5) < len(message['bytes']): # Log every ~5MB
+                             logger.debug(f"({session_id}) WS Upload: Received {len(accumulated_raw_audio_bytes)} bytes so far...")
+                    else:
+                        logger.warning(f"({session_id}) WS Upload: Received unexpected message type: {message.get('type')}")
+
+                if not accumulated_raw_audio_bytes:
+                    logger.warning(f"({session_id}) WS Upload: No audio data received before 'END' signal.")
+                    raise ValueError("No audio data was received for full file upload.")
+                
+                # 3. Process accumulated audio data
+                logger.info(f"({session_id}) WS Upload: Processing {len(accumulated_raw_audio_bytes)} bytes of audio data.")
+                waveform_full_upload_tensor, audio_duration_s_full_upload = await load_and_preprocess_audio(
+                    audio_source=io.BytesIO(bytes(accumulated_raw_audio_bytes)), # Process from memory
+                    target_sample_rate=MODEL_SAMPLE_RATE,
+                    request_id=session_id
+                )
+                accumulated_raw_audio_bytes.clear() # Free memory
+
+                if waveform_full_upload_tensor is None or audio_duration_s_full_upload == 0:
+                    logger.error(f"({session_id}) WS Upload: Audio loading/preprocessing failed for uploaded data.")
+                    raise ValueError("Full File Upload: Audio loading or preprocessing resulted in empty audio.")
+                if asr_model is None: # Should be caught by lock, but defensive check
+                    logger.critical(f"({session_id}) WS Upload: ASR Model became None during processing.")
+                    raise RuntimeError("ASR Model is not available during full upload processing.")
+
+                logger.info(f"({session_id}) WS Upload: Audio preprocessed. Duration: {audio_duration_s_full_upload:.2f}s. Creating ASR chunks...")
+                
+                # 4. Manually chunk the full waveform for batched ASR
+                manual_asr_chunks_ws, manual_asr_offsets_ws = create_audio_chunks(
+                    waveform=waveform_full_upload_tensor,
+                    sample_rate=MODEL_SAMPLE_RATE,
+                    chunk_len_s=client_config["chunk_length"],
+                    overlap_s=client_config["chunk_overlap"]
+                )
+                
+                all_raw_segments_from_asr_batches: List[dict] = []
+                total_asr_processing_time_this_session_s: float = 0.0
+                asr_batch_size_for_inference = client_config["batch_size"]
+
+                logger.info(f"({session_id}) WS Upload: Processing {len(manual_asr_chunks_ws)} ASR chunks in batches of {asr_batch_size_for_inference}.")
+                for batch_num, batch_start_idx in enumerate(range(0, len(manual_asr_chunks_ws), asr_batch_size_for_inference)):
+                    if websocket.application_state != WebSocketState.CONNECTED:
+                        logger.warning(f"({session_id}) WS Upload: Client disconnected during ASR batch processing. Aborting.")
+                        break # Stop processing if client disconnected
+
+                    current_batch_audio_tensors = manual_asr_chunks_ws[batch_start_idx : batch_start_idx + asr_batch_size_for_inference]
+                    current_batch_time_offsets = manual_asr_offsets_ws[batch_start_idx : batch_start_idx + asr_batch_size_for_inference]
+                    
+                    if not current_batch_audio_tensors:
+                        continue # Should not happen if range is correct
+
+                    logger.debug(f"({session_id}) WS Upload: Processing ASR batch {batch_num + 1} "
+                                 f"({len(current_batch_audio_tensors)} chunks).")
+                    
+                    hypotheses_for_batch, asr_batch_duration_s = await _perform_asr_transcription(
+                        asr_model_instance=asr_model,
+                        audio_input_list=current_batch_audio_tensors,
+                        batch_size_for_transcribe_call=len(current_batch_audio_tensors),
+                        num_asr_workers=NUM_WORKERS,
+                        request_id=f"WS-FullUpload-{session_id}-b{batch_num}"
+                    )
+                    total_asr_processing_time_this_session_s += asr_batch_duration_s
+                    
+                    if hypotheses_for_batch:
+                        segments_from_this_batch = _process_hypotheses_to_segments(
+                            hypotheses_for_batch, current_batch_time_offsets, f"{session_id}-segproc_b{batch_num}"
+                        )
+                        if websocket.application_state == WebSocketState.CONNECTED and segments_from_this_batch:
+                            # Sort segments within the batch by start time before sending
+                            segments_from_this_batch.sort(key=lambda s: s.get("start", float('inf')))
+                            logger.info(f"({session_id}) WS Upload: Sending {len(segments_from_this_batch)} segments from batch {batch_num + 1} to client.")
+                            await websocket.send_json({"type": "segments_batch", "segments": segments_from_this_batch})
+                        all_raw_segments_from_asr_batches.extend(segments_from_this_batch)
+                    
+                    # Clear CUDA cache periodically
+                    if session_processing_device == "cuda" and torch.cuda.is_available():
+                        await asyncio.to_thread(torch.cuda.empty_cache)
+                
+                # 5. Prepare and send final transcription if still connected
+                if websocket.application_state == WebSocketState.CONNECTED:
+                    logger.info(f"({session_id}) WS Upload: All ASR batches processed. Deduplicating {len(all_raw_segments_from_asr_batches)} raw segments.")
+                    # Deduplicate segments from all batches
+                    final_deduplicated_segments = _deduplicate_segments(
+                        all_raw_segments_from_asr_batches,
+                        client_config["chunk_overlap"] / 2.0 # Use a fraction of overlap as threshold
+                    )
+                    final_transcribed_text = " ".join(s['text'] for s in final_deduplicated_segments).strip()
+                    
+                    final_response_payload = {
+                        "type": "final_transcription",
+                        "text": final_transcribed_text,
+                        "language": "en",
+                        "transcription_time_seconds": round(total_asr_processing_time_this_session_s, 3),
+                        "total_segments": len(final_deduplicated_segments),
+                        "final_duration_processed_seconds": round(audio_duration_s_full_upload, 3),
+                        "csv_content": generate_csv_content(final_deduplicated_segments),
+                        "srt_content": generate_srt_content(final_deduplicated_segments)
+                    }
+                    logger.info(f"({session_id}) WS Upload: Final transcription prepared. Total segments: {len(final_deduplicated_segments)}.")
+                else:
+                    logger.info(f"({session_id}) WS Upload: Client disconnected before final transcription could be prepared.")
+
+            except Exception as e_locked_full_upload_processing:
+                logger.error(f"({session_id}) WS Upload: Error during locked operation: {e_locked_full_upload_processing}", exc_info=True)
+                if websocket.application_state == WebSocketState.CONNECTED:
+                    try:
+                        await websocket.send_json({"type": "error", "error": f"Server error during full file upload processing: {str(e_locked_full_upload_processing)}"})
+                    except Exception: pass # Ignore if send also fails
+            finally:
+                logger.debug(f"({session_id}) WS Upload: Releasing ASR model lock and reverting model state.")
+                await _revert_model_to_global_original_state(
+                    long_audio_settings_were_active_for_session=long_audio_settings_applied_this_session,
+                    session_processing_device=session_processing_device,
+                    request_id=f"{session_id}-full_upload_model_revert"
+                )
+                logger.info(f"({session_id}) WS Upload: ASR Model state reverted after session.")
         
-        # Send final response for non-PCM modes
-        if (client_audio_fmt_parsed_from_config != "pcm" and 
-            ws_response_final_dict and 
-            websocket.application_state == WebSocketState.CONNECTED):
-            await websocket.send_json(ws_response_final_dict)
+        # Send the final response if it was prepared and client is still connected
+        if final_response_payload and websocket.application_state == WebSocketState.CONNECTED:
+            await websocket.send_json(final_response_payload)
+            logger.info(f"({session_id}) WS Upload: Final transcription message sent to client.")
             
-    except asyncio.TimeoutError: 
-        if websocket.application_state == WebSocketState.CONNECTED: 
-            await websocket.send_json({
-                "type": "error", 
-                "error": "Config timeout."
-            })
+    except asyncio.TimeoutError: # For initial config wait
+        logger.warning(f"({session_id}) WS Upload: Timeout waiting for initial client configuration.")
+        if websocket.application_state == WebSocketState.CONNECTED:
+            await websocket.send_json({"type": "error", "error": "Timeout: No configuration received."})
     except json.JSONDecodeError as e_json:
-        if websocket.application_state == WebSocketState.CONNECTED: 
-            await websocket.send_json({
-                "type": "error", 
-                "error": str(e_json)
-            })
-    except ValueError as e_val: 
-        if websocket.application_state == WebSocketState.CONNECTED: 
-            await websocket.send_json({
-                "type": "error", 
-                "error": str(e_val)
-            })
-    except WebSocketDisconnect: 
-        pass
-    except Exception as e_outer: 
-        if websocket.application_state == WebSocketState.CONNECTED: 
-            await websocket.send_json({
-                "type": "error", 
-                "error": "Unhandled exception."
-            })
+        logger.warning(f"({session_id}) WS Upload: Failed to decode JSON configuration: {e_json}")
+        if websocket.application_state == WebSocketState.CONNECTED:
+            await websocket.send_json({"type": "error", "error": f"Invalid JSON configuration: {str(e_json)}"})
+    except ValueError as e_val: # From parse_websocket_config or data validation
+        logger.warning(f"({session_id}) WS Upload: Value error (config or data): {e_val}")
+        if websocket.application_state == WebSocketState.CONNECTED:
+            await websocket.send_json({"type": "error", "error": str(e_val)})
+    except WebSocketDisconnect as e_ws_disconnect:
+        logger.info(f"({session_id}) WS Upload: WebSocket disconnected. Reason: {e_ws_disconnect.reason} (Code: {e_ws_disconnect.code})")
+    except Exception as e_outer_full_upload:
+        logger.error(f"({session_id}) WS Upload: Unhandled exception in endpoint: {e_outer_full_upload}", exc_info=True)
+        if websocket.application_state == WebSocketState.CONNECTED:
+            await websocket.send_json({"type": "error", "error": "An unexpected server error occurred."})
     finally:
-        if websocket.application_state == WebSocketState.CONNECTED: 
-            await websocket.close(1000)
+        if websocket.application_state == WebSocketState.CONNECTED:
+            logger.info(f"({session_id}) WS Upload: Closing WebSocket connection (endpoint finally block).")
+            await websocket.close(code=1000) # Normal closure
+        logger.info(f"({session_id}) Full file upload WebSocket session ended.")
+
 
 if __name__ == "__main__":
-    import uvicorn
-    if not asr_model: 
-        logger.critical(f"ASR Model ('{ASR_MODEL_NAME}') failed. Server cannot start.")
-    else: 
-        uvicorn.run("main:app", host="0.0.0.0", port=PORT, workers=1)
+    
+    if not asr_model:
+        logger.critical(
+            f"ASR Model ('{ASR_MODEL_NAME}') failed to load. "
+            "The Parakeet ASR FastAPI server cannot start. "
+            "Please check model availability, network connection (if downloading), "
+            "and logs for details on the loading error."
+        )
+    else:
+        logger.info(f"Attempting to start Uvicorn server on host 'localhost', port {PORT}.")
+        logger.info("The ASR service will be available once Uvicorn starts successfully.")
+        logger.info(f"Loaded ASR model: {ASR_MODEL_NAME}")
+        logger.info(f"Default ASR chunk length: {TRANSCRIBE_CHUNK_LEN}s, overlap: {TRANSCRIBE_OVERLAP}s")
+        
+        # Note: Uvicorn's `workers` parameter here refers to Uvicorn workers (processes).
+        # NeMo's `NUM_WORKERS` (for DataLoader) is a separate concept.
+        # For simplicity in development, often Uvicorn is run with 1 worker.
+        # For production, multiple Uvicorn workers might be used, but this requires
+        # careful consideration of how the global ASR model is shared or replicated.
+        # The current setup with a global model and asyncio.Lock is best suited for
+        # a single Uvicorn worker process managing multiple concurrent asyncio tasks.
+        uvicorn.run(
+            "main:app",             # FastAPI app instance string
+            host=HOST,              # Host to bind to
+            port=PORT,              # Port to listen on
+            workers=1,              # Number of Uvicorn worker processes (recommend 1 with current global model)
+            log_level=log_level_str.lower() # Sync Uvicorn log level with app's
+        )

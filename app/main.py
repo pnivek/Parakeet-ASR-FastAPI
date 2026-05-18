@@ -357,6 +357,13 @@ async def _apply_model_settings_for_session(
             asr_model.change_attention_model,
             "rel_pos_local_attn", [256, 256], True,
         )
+        # New RelPositionMultiHeadAttentionLongformer modules are constructed
+        # with default float32 weights — even though the rest of the model is
+        # at its pinned dtype (e.g. bf16). Forward then dies with
+        # "mat1 and mat2 must have the same dtype". Cast the whole model to
+        # its current dtype so new modules join the bf16 majority.
+        pinned_dtype = global_original_model_dtype_torch
+        await asyncio.to_thread(asr_model.to, dtype=pinned_dtype)
         return True
     except Exception as e_long:
         logger.warning(f"({request_id}) Session: Failed to apply long-audio attention: {e_long}")
@@ -389,6 +396,11 @@ async def _revert_model_to_global_original_state(
                     asr_model.change_attention_model,
                     "rel_pos", None, True,
                 )
+                # Same dtype-mismatch fix as the apply path: new modules from
+                # change_attention_model are float32 by default; cast back to
+                # the model's pinned dtype.
+                pinned_dtype = global_original_model_dtype_torch
+                await asyncio.to_thread(asr_model.to, dtype=pinned_dtype)
             except Exception as e_rev_long_specific:
                 logger.warning(f"({request_id}) End of Session: Failed to revert long-audio attention: {e_rev_long_specific}")
 

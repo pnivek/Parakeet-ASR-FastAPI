@@ -2,6 +2,7 @@ import gc
 import os
 import io
 import math
+import re
 import time
 import json
 import base64
@@ -1674,15 +1675,50 @@ async def _transcribe_chunked_stateful(
     if not text:
         return [], asr_time
 
-    # Single segment covering the whole audio. Future work: derive per-utterance
-    # segments from frame_asr.all_timestamps / frame_asr.all_alignments.
-    segment = {
-        "start": 0.0,
-        "end": round(audio_duration_s, 3),
-        "text": text.strip(),
-        "id": 0,
-    }
-    return [segment], asr_time
+    segments = _approximate_segments_from_text(text.strip(), audio_duration_s)
+    return segments, asr_time
+
+
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
+
+def _approximate_segments_from_text(text: str, duration_s: float) -> List[dict]:
+    """
+    Split a concatenated transcript on sentence boundaries and distribute
+    timestamps proportionally over the audio duration.
+
+    Used by the stateful chunked engine (BatchedFrameASRTDT.transcribe() only
+    returns a string; its internal all_timestamps tracks per-chunk token
+    timing BEFORE the middle-token merge, so reconstructing per-utterance
+    timestamps after the merge would require duplicating NeMo's merge logic).
+
+    The output timestamps assume uniform speech rate — they're useful for
+    SRT/CSV consumption but not frame-accurate. For exact timestamps, use
+    the legacy independent-chunk path (USE_STATEFUL_CHUNKED=false).
+    """
+    if not text or duration_s <= 0:
+        return []
+    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text.strip()) if p.strip()]
+    if not parts:
+        return [{"start": 0.0, "end": round(duration_s, 3), "text": text.strip(), "id": 0}]
+
+    total_chars = sum(len(p) for p in parts)
+    if total_chars == 0:
+        return [{"start": 0.0, "end": round(duration_s, 3), "text": text.strip(), "id": 0}]
+
+    segments: List[dict] = []
+    cursor_s = 0.0
+    for i, part in enumerate(parts):
+        seg_dur = duration_s * (len(part) / total_chars)
+        start_s = cursor_s
+        end_s = min(cursor_s + seg_dur, duration_s) if i < len(parts) - 1 else duration_s
+        segments.append({
+            "start": round(start_s, 3),
+            "end": round(end_s, 3),
+            "text": part,
+            "id": i,
+        })
+        cursor_s = end_s
+    return segments
 
 
 @app.post("/v1/audio/transcriptions")

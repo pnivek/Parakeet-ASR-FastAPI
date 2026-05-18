@@ -334,10 +334,13 @@ async def _revert_model_to_global_original_state(
             except Exception as e_rev_long_specific:
                 logger.warning(f"({request_id}) End of Session: Failed to revert long-audio attention: {e_rev_long_specific}")
 
-        if session_processing_device == "cuda" and torch.cuda.is_available():
+        # NOTE: gc.collect() + torch.cuda.empty_cache() were previously called
+        # here. Removed for NeMo 2.7.3 debugging — suspected culprit for the
+        # cudaErrorIllegalAddress on the 2nd consecutive transcribe(). Add back
+        # only after confirming the model survives sequential calls without it.
+        if False and session_processing_device == "cuda" and torch.cuda.is_available():
             await asyncio.to_thread(gc.collect)
             await asyncio.to_thread(torch.cuda.empty_cache)
-            logger.debug(f"({request_id}) End of Session: CUDA cache cleared.")
     except Exception as e_restore_globally:
         logger.error(f"({request_id}) Error during final model state reversion: {e_restore_globally}", exc_info=True)
 

@@ -32,7 +32,7 @@ RUN pip install --no-cache-dir \
     python-multipart==0.0.20 \
     python-dotenv==1.1.1
 
-RUN pip install --no-cache-dir nemo_toolkit[asr]==2.2.1
+RUN pip install --no-cache-dir nemo_toolkit[asr]==2.7.3
 
 COPY app/ /app/
 RUN mkdir -p /app/static

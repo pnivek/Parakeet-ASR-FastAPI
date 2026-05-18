@@ -2,7 +2,7 @@ numpy==1.26.4
 fastapi==0.115.12
 websockets==15.0.1
 uvicorn==0.34.2
-nemo_toolkit[asr]==2.2.1
+nemo_toolkit[asr]==2.7.3
 cuda-python==12.8
 torch==2.7.0
 torchaudio==2.7.0

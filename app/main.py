@@ -171,6 +171,11 @@ async def debug_state():
             "offline_right": STREAMING_RIGHT_CONTEXT_S,
         },
     }
+    try:
+        info["decoding_strategy"] = str(asr_model.cfg.decoding.strategy) if asr_model else None
+        info["decoding_preserve_alignments"] = bool(asr_model.cfg.decoding.get("preserve_alignments", False)) if asr_model else None
+    except Exception as e:
+        info["decoding_introspect_error"] = str(e)
     if asr_model is None:
         return info
     try:
@@ -252,6 +257,12 @@ try:
             cfg = asr_model.cfg.decoding
             with open_dict(cfg):
                 cfg.compute_timestamps = True
+                # Explicit fast default — parakeet-tdt checkpoints can ship with
+                # strategy unset or 'greedy', which would make the FULL path and
+                # the legacy chunked fallback fall through to the non-batched
+                # GreedyTDTInfer (~20× slower than GreedyBatchedTDTInfer).
+                cfg.strategy = "greedy_batch"
+                cfg.preserve_alignments = False
                 if "greedy" in cfg:
                     with open_dict(cfg.greedy):
                         cfg.greedy.use_cuda_graph_decoder = False

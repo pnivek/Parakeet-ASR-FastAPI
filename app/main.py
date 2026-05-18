@@ -176,6 +176,20 @@ try:
         except Exception as e_chunk:
             logger.warning(f"change_subsampling_conv_chunking_factor(1) at load failed: {e_chunk}")
 
+        # Disable CUDA graphs on the RNNT greedy decoder. NeMo 2.7.3 enables them
+        # by default (use_cuda_graph_decoder=True). They capture one call's ops
+        # and replay them on subsequent calls — extremely fragile to anything
+        # changing (tensor shapes, addresses, streams). Empirically: first call
+        # always works, second+ crashes inside batched_hyps.scores.cpu() with
+        # cudaErrorIllegalAddress when the replayed graph hits stale pointers.
+        # The fix is to disable graph capture entirely; we re-run the eager
+        # decoder every time. Slight perf cost vs working at all.
+        try:
+            asr_model.decoding.decoding.disable_cuda_graphs()
+            logger.info("RNNT greedy decoder: CUDA graphs disabled at load.")
+        except Exception as e_cg:
+            logger.warning(f"disable_cuda_graphs at load failed: {e_cg}")
+
         # Globals now reflect the pinned resting state, not where NeMo first put it.
         global_original_model_device_str = str(next(asr_model.parameters()).device)
         global_original_model_dtype_torch = next(asr_model.parameters()).dtype
@@ -292,12 +306,13 @@ async def _apply_model_settings_for_session(
         f"switching to rel_pos_local_attn[256,256]."
     )
     try:
-        # Pass device= so the new attention modules land on the model's current
-        # device (NeMo creates them on CPU by default if you don't).
-        model_device = next(asr_model.parameters()).device
+        # ASRModuleMixin.change_attention_model takes only (self_attention_model,
+        # att_context_size, update_config) — it does NOT accept a device kwarg.
+        # Internally it forwards self.device to the encoder, so new modules
+        # land on the model's current device automatically.
         await asyncio.to_thread(
             asr_model.change_attention_model,
-            "rel_pos_local_attn", [256, 256], True, model_device,
+            "rel_pos_local_attn", [256, 256], True,
         )
         return True
     except Exception as e_long:
@@ -326,10 +341,10 @@ async def _revert_model_to_global_original_state(
         if long_audio_settings_were_active_for_session:
             logger.info(f"({request_id}) End of Session: Reverting to rel_pos attention.")
             try:
-                model_device = next(asr_model.parameters()).device
+                # See _apply_model_settings_for_session for signature explanation.
                 await asyncio.to_thread(
                     asr_model.change_attention_model,
-                    "rel_pos", None, True, model_device,
+                    "rel_pos", None, True,
                 )
             except Exception as e_rev_long_specific:
                 logger.warning(f"({request_id}) End of Session: Failed to revert long-audio attention: {e_rev_long_specific}")

@@ -255,16 +255,11 @@ try:
                 if "greedy" in cfg:
                     with open_dict(cfg.greedy):
                         cfg.greedy.use_cuda_graph_decoder = False
-                # When USE_STATEFUL_CHUNKED is on, BatchedFrameASRTDT.transcribe()
-                # needs hyp.alignments populated for its middle-token merge —
-                # which only happens when preserve_alignments=True. Also force
-                # strategy="greedy" because greedy_batch doesn't produce per-hyp
-                # alignment arrays the merger needs (per NeMo's reference
-                # speech_to_text_buffered_infer_rnnt.py:239).
-                if USE_STATEFUL_CHUNKED:
-                    cfg.strategy = "greedy"
-                    cfg.preserve_alignments = True
-                    cfg.fused_batch_size = -1
+            # NOTE: we do NOT switch to strategy=greedy + preserve_alignments here
+            # even when USE_STATEFUL_CHUNKED=true. Doing so globally would force
+            # the FAST greedy_batch decoder off the model and make the legacy
+            # chunked fallback (and the FULL path) ~20× slower. Instead we swap
+            # to greedy transiently inside _transcribe_chunked_stateful only.
             asr_model.change_decoding_strategy(cfg, verbose=False)
             inferer = asr_model.decoding.decoding
             computer = getattr(inferer, "decoding_computer", None)
@@ -1689,14 +1684,42 @@ async def _transcribe_chunked_stateful(
     else:
         waveform_np = waveform.to(dtype=torch.float32).contiguous().cpu().numpy()
 
-    text, asr_time = await asyncio.to_thread(
-        _stateful_chunked_sync,
-        waveform_np,
-        chunk_len,
-        total_buffer,
-        model_stride_in_secs,
-        request_id,
-    )
+    # BatchedFrameASRTDT requires:
+    #   strategy = "greedy"            (greedy_batch loses per-hyp alignments)
+    #   preserve_alignments = True     (the merger needs them)
+    #   fused_batch_size = -1          (disables fused-batch optimization)
+    # Globally pinning these makes the legacy chunked path and the FULL path
+    # ~20× slower (they rely on greedy_batch). Instead: swap transiently here
+    # under the model lock, revert in finally. The decoder rebuild is moderate
+    # cost (~100ms) and only fires per stateful request, not per request.
+    from omegaconf import open_dict
+    decoding_cfg = asr_model.cfg.decoding
+    saved = {
+        "strategy": decoding_cfg.strategy,
+        "preserve_alignments": decoding_cfg.get("preserve_alignments", False),
+        "fused_batch_size": decoding_cfg.get("fused_batch_size", -1),
+    }
+    try:
+        with open_dict(decoding_cfg):
+            decoding_cfg.strategy = "greedy"
+            decoding_cfg.preserve_alignments = True
+            decoding_cfg.fused_batch_size = -1
+        await asyncio.to_thread(asr_model.change_decoding_strategy, decoding_cfg, verbose=False)
+
+        text, asr_time = await asyncio.to_thread(
+            _stateful_chunked_sync,
+            waveform_np,
+            chunk_len,
+            total_buffer,
+            model_stride_in_secs,
+            request_id,
+        )
+    finally:
+        with open_dict(decoding_cfg):
+            decoding_cfg.strategy = saved["strategy"]
+            decoding_cfg.preserve_alignments = saved["preserve_alignments"]
+            decoding_cfg.fused_batch_size = saved["fused_batch_size"]
+        await asyncio.to_thread(asr_model.change_decoding_strategy, decoding_cfg, verbose=False)
 
     if not text:
         return [], asr_time

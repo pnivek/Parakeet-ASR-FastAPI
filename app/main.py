@@ -119,6 +119,14 @@ EARLY_BUFFER_TARGET_S = float(os.getenv("EARLY_BUFFER_TARGET_S", 15.0))
 # the legacy independent-chunk path (which keeps timestamps).
 USE_STATEFUL_CHUNKED = os.getenv("USE_STATEFUL_CHUNKED", "false").lower() == "true"
 
+# Stateful engine ties up the model lock proportional to audio duration
+# (chunks process sequentially with batch_size=1). Measured RTF ≈ 0.022 on
+# DGX Spark — a 30 min file takes ~40s, a 3h file takes ~4min. Above the
+# threshold, fall back to the legacy independent-chunk path (which batches
+# 4 chunks per call and is ~20× faster, at the cost of some boundary
+# quality). Set to 0 to disable the cap (always use stateful when on).
+STATEFUL_MAX_DURATION_S = float(os.getenv("STATEFUL_MAX_DURATION_S", 1800.0))
+
 logger.info(
     f"Configuration loaded:\n"
     f"  App: workers={NUM_WORKERS}, sample_rate={MODEL_SAMPLE_RATE}, port={PORT}\n"
@@ -128,7 +136,8 @@ logger.info(
     f"  Strategy: default={DEFAULT_STRATEGY}, max_full_waveform_s={MAX_FULL_WAVEFORM_S}, early_buffer_target_s={EARLY_BUFFER_TARGET_S}\n"
     f"  Stateful streaming: offline {STREAMING_LEFT_CONTEXT_S}-{STREAMING_CHUNK_S}-{STREAMING_RIGHT_CONTEXT_S}, "
     f"live {STREAMING_LEFT_CONTEXT_S}-{STREAMING_LIVE_CHUNK_S}-{STREAMING_LIVE_RIGHT_CONTEXT_S}\n"
-    f"  Stateful chunked engine: USE_STATEFUL_CHUNKED={USE_STATEFUL_CHUNKED}"
+    f"  Stateful chunked engine: USE_STATEFUL_CHUNKED={USE_STATEFUL_CHUNKED}, "
+    f"STATEFUL_MAX_DURATION_S={STATEFUL_MAX_DURATION_S}"
 )
 
 # --- FastAPI App Setup ---
@@ -155,6 +164,7 @@ async def debug_state():
     info: dict = {
         "model_loaded": asr_model is not None,
         "use_stateful_chunked": USE_STATEFUL_CHUNKED,
+        "stateful_max_duration_s": STATEFUL_MAX_DURATION_S,
         "streaming_context_s": {
             "offline_left": STREAMING_LEFT_CONTEXT_S,
             "offline_chunk": STREAMING_CHUNK_S,
@@ -1695,6 +1705,30 @@ async def _transcribe_chunked_stateful(
     return segments, asr_time
 
 
+def _should_use_stateful_engine(audio_duration_s: Optional[float], request_id: str) -> bool:
+    """
+    Resolve which chunked engine to use for a request.
+
+    Returns True iff USE_STATEFUL_CHUNKED is on AND the audio (if known)
+    fits within STATEFUL_MAX_DURATION_S. Above the threshold (or when 0
+    means disabled), we fall back to the legacy independent-chunk path —
+    it batches 4 chunks per call and is ~20× faster on long audio at the
+    cost of some boundary-merge quality. Logs the bypass for visibility.
+    """
+    if not USE_STATEFUL_CHUNKED:
+        return False
+    if STATEFUL_MAX_DURATION_S <= 0:
+        return True  # explicit "no cap" mode
+    if audio_duration_s is not None and audio_duration_s > STATEFUL_MAX_DURATION_S:
+        logger.info(
+            f"({request_id}) Stateful chunked engine bypassed: duration "
+            f"{audio_duration_s:.1f}s > STATEFUL_MAX_DURATION_S ({STATEFUL_MAX_DURATION_S:.0f}s). "
+            f"Falling back to legacy independent-chunk path."
+        )
+        return False
+    return True
+
+
 _SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
 
 def _approximate_segments_from_text(text: str, duration_s: float) -> List[dict]:
@@ -1849,7 +1883,7 @@ async def transcribe_endpoint_rest(
                         logger.info(f"({request_id}) REST: ASR model settings applied for session. Long audio specific settings active: {long_audio_settings_applied_this_session}.")
 
                         if resolved_strategy == ProcessingStrategy.CHUNKED:
-                            if USE_STATEFUL_CHUNKED:
+                            if _should_use_stateful_engine(total_audio_duration_s, request_id):
                                 segments, asr_processing_time_s = await _transcribe_chunked_stateful(
                                     waveform=waveform_tensor,
                                     audio_duration_s=total_audio_duration_s,
@@ -2017,7 +2051,7 @@ async def _ws_accumulate_then_process(
                 hyps, [0.0] * (len(hyps) if hyps else 0), session_id,
             )
         else:  # CHUNKED
-            if USE_STATEFUL_CHUNKED:
+            if _should_use_stateful_engine(audio_duration_s, session_id):
                 # Stateful engine has no per-batch hook: it computes the whole
                 # thing in one transcribe() call. No intermediate segments_batch.
                 segments, asr_t = await _transcribe_chunked_stateful(

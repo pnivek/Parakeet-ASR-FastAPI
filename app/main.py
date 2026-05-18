@@ -156,13 +156,33 @@ try:
         asr_model.preprocessor.featurizer.dither = 0.0
         asr_model.eval() # Set model to evaluation mode
 
-        # Store the model's initial device and dtype to revert to after processing
+        # Pin the model to its resting state ONCE at load — CUDA+bf16 if available,
+        # else CPU+fp32. We do NOT change device/dtype per request: NeMo 2.7.3 leaves
+        # the encoder in a broken state if you flip device/dtype after a transcribe(),
+        # producing `cudaErrorIllegalAddress` on the next forward. NVIDIA's HF Space
+        # also loads-and-stays; we now mirror that pattern.
+        target_device = "cuda" if torch.cuda.is_available() else "cpu"
+        target_dtype = (
+            torch.bfloat16
+            if (target_device == "cuda" and torch.cuda.is_bf16_supported())
+            else torch.float32
+        )
+        asr_model = asr_model.to(device=target_device, dtype=target_dtype)
+        # change_subsampling_conv_chunking_factor(1) once — works around the
+        # NeMo 2.7.3 bug in subsampling.py:442 where -1 routes to a forward
+        # path calling MaskedConvSequential(x) without the required `lengths` arg.
+        try:
+            asr_model.change_subsampling_conv_chunking_factor(1)
+        except Exception as e_chunk:
+            logger.warning(f"change_subsampling_conv_chunking_factor(1) at load failed: {e_chunk}")
+
+        # Globals now reflect the pinned resting state, not where NeMo first put it.
         global_original_model_device_str = str(next(asr_model.parameters()).device)
         global_original_model_dtype_torch = next(asr_model.parameters()).dtype
 
         logger.info(
-            f"ASR model '{ASR_MODEL_NAME}' loaded successfully. "
-            f"Original device: {global_original_model_device_str}, "
+            f"ASR model '{ASR_MODEL_NAME}' loaded and pinned. "
+            f"Resting device: {global_original_model_device_str}, "
             f"dtype: {global_original_model_dtype_torch}."
         )
 except Exception as e:
@@ -239,148 +259,85 @@ async def _apply_model_settings_for_session(
     request_id: str = "req"
 ) -> bool:
     """
-    Configures the ASR model ONCE per session for device, dtype, and long/short audio settings.
-    
-    The order of operations is important:
-    1. Move to target device.
-    2. Ensure model is float32 (for safety before structural changes).
-    3. Apply attention/subsampling changes (long or short audio mode).
-    4. Convert to final target_operational_dtype (e.g., bfloat16) for ASR computation.
+    Switch to long-audio attention mode if needed for this session.
 
-    Args:
-        decision_duration_s: The audio duration (can be total file or ASR chunk length)
-                             used to decide if long audio settings are needed.
-        target_processing_device: "cuda" or "cpu".
-        target_operational_dtype: The desired dtype for ASR computation (e.g., torch.bfloat16 or torch.float32).
-        long_audio_threshold_config: Duration threshold to activate long audio settings.
-        request_id: Identifier for logging.
+    The model is pinned to its resting state (CUDA+bf16 or CPU+fp32, with
+    subsampling_conv_chunking_factor=1) at load time and stays there. We do
+    NOT change device or dtype per-request — NeMo 2.7.3 leaves the encoder in
+    a broken state when device/dtype is flipped between transcribes, producing
+    cudaErrorIllegalAddress on the next forward. Mirrors NVIDIA's HF Space.
+
+    target_processing_device and target_operational_dtype are accepted for
+    caller compatibility but ignored; the session's actual device/dtype is
+    whatever the model is pinned to.
 
     Returns:
-        True if long-audio specific settings (attention/subsampling) were activated for the session.
+        True iff long-audio attention (rel_pos_local_attn) was activated and
+        will need to be reverted at end of session.
     """
     global asr_model
     if asr_model is None:
         logger.error(f"({request_id}) ASR model is None in _apply_model_settings_for_session.")
         return False
-    
-    long_audio_settings_activated_for_session = False
 
-    # 1. Set model to target_processing_device for the session
-    if str(next(asr_model.parameters()).device) != target_processing_device:
-        await asyncio.to_thread(asr_model.to, device=target_processing_device)
-        logger.debug(f"({request_id}) Session: Model moved to device: {target_processing_device}")
+    if decision_duration_s <= long_audio_threshold_config:
+        logger.debug(
+            f"({request_id}) Session: short audio ({decision_duration_s:.2f}s <= {long_audio_threshold_config:.2f}s); "
+            f"keeping resting attention model. No state change."
+        )
+        return False
 
-    # 2. Ensure model is float32 BEFORE any structural changes (e.g., attention/subsampling)
-    # This ensures that model parameter modifications happen from a known, stable dtype.
-    if next(asr_model.parameters()).dtype != torch.float32:
-        await asyncio.to_thread(asr_model.to, dtype=torch.float32)
-        logger.debug(f"({request_id}) Session: Model temporarily set to float32 before structural changes.")
-
-    # 3. Apply/Ensure attention and subsampling settings based on decision_duration_s (model is currently float32)
-    # change_attention_model in NeMo creates new attention / positional encoding
-    # modules with their parameters on CPU by default. Pass device= so they land
-    # on the session device — otherwise forward mixes CPU and CUDA tensors and
-    # the next CUDA op fails with `cudaErrorIllegalAddress`.
-    session_device_torch = torch.device(target_processing_device)
-    if decision_duration_s > long_audio_threshold_config:
-        logger.info(f"({request_id}) Session: Decision duration {decision_duration_s:.2f}s > threshold {long_audio_threshold_config:.2f}s. Applying long audio settings.")
-        try:
-            await asyncio.to_thread(
-                asr_model.change_attention_model,
-                "rel_pos_local_attn", [256, 256], True, session_device_torch,
-            )
-            await asyncio.to_thread(asr_model.change_subsampling_conv_chunking_factor, 1)
-            long_audio_settings_activated_for_session = True
-            logger.debug(f"({request_id}) Session: Long audio settings (attention: rel_pos_local_attn, subsampling_factor: 1) applied.")
-        except Exception as e_long:
-            logger.warning(f"({request_id}) Session: Failed to apply long audio settings: {e_long}")
-    else:
-        logger.info(f"({request_id}) Session: Decision duration {decision_duration_s:.2f}s <= threshold {long_audio_threshold_config:.2f}s. Ensuring short audio settings.")
-        try:
-            await asyncio.to_thread(
-                asr_model.change_attention_model,
-                "rel_pos", None, True, session_device_torch,
-            )
-            # subsampling_conv_chunking_factor=1 (auto) avoids a NeMo 2.7.3 bug where
-            # the value -1 routes into a forward path that calls MaskedConvSequential(x)
-            # without the required `lengths` arg. With 1, the auto path passes `lengths`
-            # correctly and skips actual splitting when the tensor is small enough.
-            await asyncio.to_thread(asr_model.change_subsampling_conv_chunking_factor, 1)
-            logger.debug(f"({request_id}) Session: Short audio settings (attention: rel_pos, subsampling_factor: 1 auto) ensured.")
-        except Exception as e_short:
-            logger.warning(f"({request_id}) Session: Failed to ensure short audio settings: {e_short}")
-            
-    # 4. Set model to the final target_operational_dtype (e.g., bfloat16) AFTER structural changes
-    if next(asr_model.parameters()).dtype != target_operational_dtype:
-        await asyncio.to_thread(asr_model.to, dtype=target_operational_dtype)
-        logger.info(f"({request_id}) Session: Model set to final operational dtype: {target_operational_dtype} for ASR computation.")
-    else:
-        logger.debug(f"({request_id}) Session: Model already in final operational dtype: {target_operational_dtype}.")
-            
-    return long_audio_settings_activated_for_session
+    logger.info(
+        f"({request_id}) Session: long audio ({decision_duration_s:.2f}s > {long_audio_threshold_config:.2f}s); "
+        f"switching to rel_pos_local_attn[256,256]."
+    )
+    try:
+        # Pass device= so the new attention modules land on the model's current
+        # device (NeMo creates them on CPU by default if you don't).
+        model_device = next(asr_model.parameters()).device
+        await asyncio.to_thread(
+            asr_model.change_attention_model,
+            "rel_pos_local_attn", [256, 256], True, model_device,
+        )
+        return True
+    except Exception as e_long:
+        logger.warning(f"({request_id}) Session: Failed to apply long-audio attention: {e_long}")
+        return False
 
 
 async def _revert_model_to_global_original_state(
     long_audio_settings_were_active_for_session: bool,
-    session_processing_device: str, # The device the model was on during the session
+    session_processing_device: str, # Retained for caller compat; only used for CUDA cache clear
     request_id: str = "req"
 ):
     """
-    Reverts the ASR model to its globally original state (device and dtype) ONCE at the end of a session.
-    If long audio settings were active, it reverts attention/subsampling to their defaults first.
-    Clears CUDA cache if CUDA was used.
+    Revert the long-audio attention switch (if it ran) and clear CUDA cache.
 
-    Args:
-        long_audio_settings_were_active_for_session: Flag indicating if long audio settings need reversion.
-        session_processing_device: The device ("cuda" or "cpu") used during the session.
-        request_id: Identifier for logging.
+    The model's device/dtype is NOT changed — it lives on the resting state
+    set at load time (CUDA+bf16 or CPU+fp32). See _apply_model_settings_for_session
+    for the rationale (NeMo 2.7.3 cudaErrorIllegalAddress on device/dtype churn).
     """
-    global asr_model, global_original_model_device_str, global_original_model_dtype_torch
+    global asr_model
     if asr_model is None:
         logger.error(f"({request_id}) ASR model is None in _revert_model_to_global_original_state.")
         return
 
     try:
-        # This should be done while the model is still on its compute device and operational dtype,
-        # before moving to the global original device/dtype, in case these changes expect that state.
         if long_audio_settings_were_active_for_session:
-            logger.info(f"({request_id}) End of Session: Reverting long audio specific model settings (attention to rel_pos, subsampling to -1).")
+            logger.info(f"({request_id}) End of Session: Reverting to rel_pos attention.")
             try:
-                # Ensure model is float32 if structural changes expect it (safer)
-                if next(asr_model.parameters()).dtype != torch.float32:
-                    await asyncio.to_thread(asr_model.to, dtype=torch.float32)
-                    logger.debug(f"({request_id}) End of Session: Model temporarily set to float32 for reverting structural changes.")
-
-                # Pass device= so new attention modules land on the session device,
-                # not CPU. See _apply_model_settings_for_session for the full rationale.
+                model_device = next(asr_model.parameters()).device
                 await asyncio.to_thread(
                     asr_model.change_attention_model,
-                    "rel_pos", None, True, torch.device(session_processing_device),
+                    "rel_pos", None, True, model_device,
                 )
-                # subsampling_conv_chunking_factor=1 (auto), not -1: see comment in
-                # _apply_model_settings_for_session for the NeMo 2.7.3 bug avoided here.
-                await asyncio.to_thread(asr_model.change_subsampling_conv_chunking_factor, 1)
-            
             except Exception as e_rev_long_specific:
-                 logger.warning(f"({request_id}) End of Session: Failed to revert long-audio specific settings: {e_rev_long_specific}")
+                logger.warning(f"({request_id}) End of Session: Failed to revert long-audio attention: {e_rev_long_specific}")
 
-        # 2. ALWAYS revert model to its globally original device and dtype (from initial load)
-        current_device_after_session_ops = str(next(asr_model.parameters()).device)
-        current_dtype_after_session_ops = next(asr_model.parameters()).dtype
-
-        if (current_device_after_session_ops != global_original_model_device_str or
-            current_dtype_after_session_ops != global_original_model_dtype_torch):
-            logger.info(f"({request_id}) End of Session: Reverting model to global original device ('{global_original_model_device_str}') and dtype ({global_original_model_dtype_torch}).")
-            await asyncio.to_thread(asr_model.to, device=global_original_model_device_str, dtype=global_original_model_dtype_torch)
-        else:
-            logger.debug(f"({request_id}) End of Session: Model already on global original device/dtype. No change needed.")
-            
-        # 3. Clean up CUDA cache if CUDA was used during the session
         if session_processing_device == "cuda" and torch.cuda.is_available():
             await asyncio.to_thread(gc.collect)
             await asyncio.to_thread(torch.cuda.empty_cache)
-            logger.debug(f"({request_id}) End of Session: CUDA cache cleared as '{session_processing_device}' was used.")
-            
+            logger.debug(f"({request_id}) End of Session: CUDA cache cleared.")
     except Exception as e_restore_globally:
         logger.error(f"({request_id}) Error during final model state reversion: {e_restore_globally}", exc_info=True)
 

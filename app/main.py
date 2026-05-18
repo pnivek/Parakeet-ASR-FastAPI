@@ -1,6 +1,7 @@
 import gc
 import os
 import io
+import math
 import time
 import json
 import base64
@@ -10,6 +11,8 @@ from enum import Enum
 from typing import Awaitable, Callable, Optional, Tuple, List
 import subprocess
 import uvicorn
+
+import numpy as np
 
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, Query
 from fastapi.websockets import WebSocketState
@@ -23,6 +26,10 @@ import torchaudio
 import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.models.asr_model import ASRModel as NeMoASRModelType
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
+from nemo.collections.asr.parts.utils.streaming_utils import (
+    BatchedFrameASRTDT,
+    AudioFeatureIterator,
+)
 
 from dotenv import load_dotenv
 
@@ -103,6 +110,14 @@ STREAMING_LIVE_RIGHT_CONTEXT_S = float(os.getenv("STREAMING_LIVE_RIGHT_CONTEXT_S
 # Progressive mode: PCM buffered before emitting the first partial.
 EARLY_BUFFER_TARGET_S = float(os.getenv("EARLY_BUFFER_TARGET_S", 15.0))
 
+# Phase 6 — Stateful chunked engine (BatchedFrameASRTDT). When true, the
+# chunked strategy carries decoder state across chunks instead of running
+# independent overlapping transcribe() calls. Better quality (no boundary
+# duplicates / drops), but currently produces a single concatenated text
+# segment rather than per-utterance timestamps. Toggle false to fall back to
+# the legacy independent-chunk path (which keeps timestamps).
+USE_STATEFUL_CHUNKED = os.getenv("USE_STATEFUL_CHUNKED", "false").lower() == "true"
+
 logger.info(
     f"Configuration loaded:\n"
     f"  App: workers={NUM_WORKERS}, sample_rate={MODEL_SAMPLE_RATE}, port={PORT}\n"
@@ -111,7 +126,8 @@ logger.info(
     f"  Streaming (ffmpeg): pcm_read_chunk_size={FFMPEG_PCM_CHUNK_SIZE_BYTES}B\n"
     f"  Strategy: default={DEFAULT_STRATEGY}, max_full_waveform_s={MAX_FULL_WAVEFORM_S}, early_buffer_target_s={EARLY_BUFFER_TARGET_S}\n"
     f"  Stateful streaming: offline {STREAMING_LEFT_CONTEXT_S}-{STREAMING_CHUNK_S}-{STREAMING_RIGHT_CONTEXT_S}, "
-    f"live {STREAMING_LEFT_CONTEXT_S}-{STREAMING_LIVE_CHUNK_S}-{STREAMING_LIVE_RIGHT_CONTEXT_S}"
+    f"live {STREAMING_LEFT_CONTEXT_S}-{STREAMING_LIVE_CHUNK_S}-{STREAMING_LIVE_RIGHT_CONTEXT_S}\n"
+    f"  Stateful chunked engine: USE_STATEFUL_CHUNKED={USE_STATEFUL_CHUNKED}"
 )
 
 # --- FastAPI App Setup ---
@@ -135,7 +151,15 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 @app.get("/v1/debug/state", include_in_schema=False)
 async def debug_state():
     """Internal debug — current model + decoder state. Temporary; will move under /health later."""
-    info: dict = {"model_loaded": asr_model is not None}
+    info: dict = {
+        "model_loaded": asr_model is not None,
+        "use_stateful_chunked": USE_STATEFUL_CHUNKED,
+        "streaming_context_s": {
+            "offline_left": STREAMING_LEFT_CONTEXT_S,
+            "offline_chunk": STREAMING_CHUNK_S,
+            "offline_right": STREAMING_RIGHT_CONTEXT_S,
+        },
+    }
     if asr_model is None:
         return info
     try:
@@ -1535,6 +1559,132 @@ async def _transcribe_chunked_waveform(
     return deduped, total_asr_time
 
 
+def _stateful_chunked_sync(
+    waveform_np: np.ndarray,
+    chunk_len_s: float,
+    total_buffer_s: float,
+    model_stride_s: float,
+    request_id: str,
+) -> Tuple[str, float]:
+    """
+    Synchronous core of the BatchedFrameASRTDT stateful chunked engine.
+
+    Designed to be called via asyncio.to_thread from `_transcribe_chunked_stateful`.
+    Returns (joined_text, asr_time_s). Runs at batch_size=1 (one waveform per
+    request) to keep memory predictable; callers serialize via model_access_lock.
+    """
+    tokens_per_chunk = math.ceil(chunk_len_s / model_stride_s)
+    mid_delay = math.ceil((chunk_len_s + (total_buffer_s - chunk_len_s) / 2) / model_stride_s)
+
+    frame_asr = BatchedFrameASRTDT(
+        asr_model=asr_model,
+        frame_len=chunk_len_s,
+        total_buffer=total_buffer_s,
+        batch_size=1,
+        stateful_decoding=True,
+    )
+    try:
+        # Pad with `mid_delay * stride * sample_rate` trailing zeros (matches NeMo's
+        # `read_audio_file` preprocessing — the "middle token" algorithm needs the
+        # tail context to finalize the last chunk).
+        sr = asr_model._cfg.sample_rate
+        pad_samples = int(mid_delay * model_stride_s * sr)
+        if pad_samples > 0:
+            samples = np.pad(waveform_np, (0, pad_samples))
+        else:
+            samples = waveform_np
+
+        # Build the in-memory frame reader and register it as the only batch slot.
+        frame_reader = AudioFeatureIterator(
+            samples=samples,
+            frame_len=chunk_len_s,
+            preprocessor=frame_asr.raw_preprocessor,
+            device=asr_model.device,
+        )
+        frame_asr.set_frame_reader(frame_reader, 0)
+
+        t0 = time.time()
+        # transcribe() runs infer_logits() (encoder + decoder forward over all
+        # buffered chunks) and emits batch_size string hypotheses with the
+        # middle-token TDT merge applied across chunks.
+        with torch.inference_mode():
+            outputs = frame_asr.transcribe(tokens_per_chunk=tokens_per_chunk, delay=mid_delay)
+        asr_time = time.time() - t0
+        text = outputs[0] if outputs else ""
+        logger.info(
+            f"({request_id}) Stateful: chunk={chunk_len_s}s buf={total_buffer_s}s "
+            f"stride={model_stride_s:.4f}s tpc={tokens_per_chunk} delay={mid_delay} "
+            f"→ {len(text)} chars in {asr_time:.2f}s"
+        )
+        return text, asr_time
+    finally:
+        # Free the per-session decoder state; the FrameBatchASR allocates
+        # per-batch buffers that we don't want lingering between requests.
+        try:
+            frame_asr.reset()
+        except Exception:
+            pass
+
+
+async def _transcribe_chunked_stateful(
+    waveform: torch.Tensor,
+    audio_duration_s: float,
+    client_config: dict,
+    request_id: str = "stateful-chunked",
+) -> Tuple[List[dict], float]:
+    """
+    Stateful chunked transcription via NeMo's BatchedFrameASRTDT.
+
+    Carries decoder state across chunks; the middle-token TDT merge stitches
+    chunk outputs into one coherent transcript without boundary duplicates or
+    drops. Returns a single-segment list `[{start:0, end:duration, text:...}]`
+    — per-token timestamps are present internally (frame_asr.all_timestamps)
+    but extracting per-utterance segments is a future enhancement.
+
+    The 10-10-5 / 10-2-2 NeMo recommendations map to:
+        chunk_len_in_secs  = STREAMING_CHUNK_S
+        total_buffer_in_secs = STREAMING_LEFT_CONTEXT_S + STREAMING_CHUNK_S + STREAMING_RIGHT_CONTEXT_S
+    """
+    if asr_model is None:
+        logger.error(f"({request_id}) Stateful: asr_model is None.")
+        return [], 0.0
+
+    chunk_len = STREAMING_CHUNK_S
+    total_buffer = STREAMING_LEFT_CONTEXT_S + STREAMING_CHUNK_S + STREAMING_RIGHT_CONTEXT_S
+
+    feature_stride = asr_model._cfg.preprocessor["window_stride"]
+    model_stride_in_secs = feature_stride * asr_model.encoder.subsampling_factor
+
+    # Convert torch tensor (likely on CPU after load_and_preprocess_audio) to
+    # a contiguous float32 numpy array — that's what AudioFeatureIterator expects.
+    if waveform.dim() > 1:
+        waveform_np = waveform.squeeze().to(dtype=torch.float32).contiguous().cpu().numpy()
+    else:
+        waveform_np = waveform.to(dtype=torch.float32).contiguous().cpu().numpy()
+
+    text, asr_time = await asyncio.to_thread(
+        _stateful_chunked_sync,
+        waveform_np,
+        chunk_len,
+        total_buffer,
+        model_stride_in_secs,
+        request_id,
+    )
+
+    if not text:
+        return [], asr_time
+
+    # Single segment covering the whole audio. Future work: derive per-utterance
+    # segments from frame_asr.all_timestamps / frame_asr.all_alignments.
+    segment = {
+        "start": 0.0,
+        "end": round(audio_duration_s, 3),
+        "text": text.strip(),
+        "id": 0,
+    }
+    return [segment], asr_time
+
+
 @app.post("/v1/audio/transcriptions")
 async def transcribe_endpoint_rest(
     file: UploadFile = File(...),
@@ -1647,11 +1797,19 @@ async def transcribe_endpoint_rest(
                         logger.info(f"({request_id}) REST: ASR model settings applied for session. Long audio specific settings active: {long_audio_settings_applied_this_session}.")
 
                         if resolved_strategy == ProcessingStrategy.CHUNKED:
-                            segments, asr_processing_time_s = await _transcribe_chunked_waveform(
-                                waveform=waveform_tensor,
-                                client_config=client_config_rest,
-                                request_id=f"REST-{request_id}",
-                            )
+                            if USE_STATEFUL_CHUNKED:
+                                segments, asr_processing_time_s = await _transcribe_chunked_stateful(
+                                    waveform=waveform_tensor,
+                                    audio_duration_s=total_audio_duration_s,
+                                    client_config=client_config_rest,
+                                    request_id=f"REST-{request_id}",
+                                )
+                            else:
+                                segments, asr_processing_time_s = await _transcribe_chunked_waveform(
+                                    waveform=waveform_tensor,
+                                    client_config=client_config_rest,
+                                    request_id=f"REST-{request_id}",
+                                )
                         else:
                             # FULL: feed the entire waveform to NeMo's transcribe in one call.
                             hypotheses_list, asr_processing_time_s = await _perform_asr_transcription(
@@ -1806,22 +1964,33 @@ async def _ws_accumulate_then_process(
             segments = _process_hypotheses_to_segments(
                 hyps, [0.0] * (len(hyps) if hyps else 0), session_id,
             )
-        else:  # CHUNKED — emit segments_batch as each batch completes
-            async def _on_batch(batch_segs: List[dict], batch_num: int) -> bool:
-                if websocket.application_state != WebSocketState.CONNECTED:
-                    return False
-                try:
-                    await websocket.send_json({"type": "segments_batch", "segments": batch_segs})
-                except Exception as e_send:
-                    logger.warning(f"({session_id}) {log_prefix}: send segments_batch failed: {e_send}")
-                    return False
-                return True
-            segments, asr_t = await _transcribe_chunked_waveform(
-                waveform=waveform,
-                client_config=client_config,
-                request_id=f"WS-{session_id}",
-                on_batch_segments=_on_batch,
-            )
+        else:  # CHUNKED
+            if USE_STATEFUL_CHUNKED:
+                # Stateful engine has no per-batch hook: it computes the whole
+                # thing in one transcribe() call. No intermediate segments_batch.
+                segments, asr_t = await _transcribe_chunked_stateful(
+                    waveform=waveform,
+                    audio_duration_s=audio_duration_s,
+                    client_config=client_config,
+                    request_id=f"WS-{session_id}",
+                )
+            else:
+                # Legacy: emit segments_batch as each independent-chunk batch completes.
+                async def _on_batch(batch_segs: List[dict], batch_num: int) -> bool:
+                    if websocket.application_state != WebSocketState.CONNECTED:
+                        return False
+                    try:
+                        await websocket.send_json({"type": "segments_batch", "segments": batch_segs})
+                    except Exception as e_send:
+                        logger.warning(f"({session_id}) {log_prefix}: send segments_batch failed: {e_send}")
+                        return False
+                    return True
+                segments, asr_t = await _transcribe_chunked_waveform(
+                    waveform=waveform,
+                    client_config=client_config,
+                    request_id=f"WS-{session_id}",
+                    on_batch_segments=_on_batch,
+                )
     finally:
         # Revert under the lock owner's lifecycle (we are still inside the lock).
         await _revert_model_to_global_original_state(

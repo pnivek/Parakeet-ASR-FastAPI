@@ -3,12 +3,10 @@ import os
 import io
 import time
 import json
-import shutil
-import tempfile
 import base64
 import asyncio
 import logging
-from pathlib import Path
+from enum import Enum
 from typing import Optional, Tuple, List
 import subprocess
 import uvicorn
@@ -78,12 +76,42 @@ CHUNKING_BATCH_SIZE = int(os.getenv("BATCH_SIZE", 1)) # Max number of ASR chunks
 # Size of PCM data chunks read from ffmpeg's stdout in the streaming producer.
 FFMPEG_PCM_CHUNK_SIZE_BYTES = int(os.getenv("FFMPEG_PCM_CHUNK_SIZE_BYTES", 16384))
 
+
+class ProcessingStrategy(str, Enum):
+    """Transcription dispatch modes. See README and resolve_strategy() for selection rules."""
+    AUTO = "auto"
+    FULL = "full"
+    CHUNKED = "chunked"
+    PROGRESSIVE = "progressive"
+
+
+# Strategy configuration.
+# DEFAULT_STRATEGY=auto lets resolve_strategy() pick based on duration/streaming.
+# MAX_FULL_WAVEFORM_S caps when `full` mode is selected by auto-resolution
+# (NVIDIA's 24-minute full-attention ceiling for parakeet-tdt-0.6b-v2).
+DEFAULT_STRATEGY = os.getenv("DEFAULT_STRATEGY", ProcessingStrategy.AUTO.value).lower()
+MAX_FULL_WAVEFORM_S = float(os.getenv("MAX_FULL_WAVEFORM_S", 1440.0))
+
+# Streaming context windows for the stateful (BatchedFrameASRTDT) engine — Phase 6.
+# NeMo's reference recommends 10-10-5 for offline-like quality, 10-2-2 for live latency.
+STREAMING_LEFT_CONTEXT_S = float(os.getenv("STREAMING_LEFT_CONTEXT_S", 10.0))
+STREAMING_CHUNK_S = float(os.getenv("STREAMING_CHUNK_S", 10.0))
+STREAMING_RIGHT_CONTEXT_S = float(os.getenv("STREAMING_RIGHT_CONTEXT_S", 5.0))
+STREAMING_LIVE_CHUNK_S = float(os.getenv("STREAMING_LIVE_CHUNK_S", 2.0))
+STREAMING_LIVE_RIGHT_CONTEXT_S = float(os.getenv("STREAMING_LIVE_RIGHT_CONTEXT_S", 2.0))
+
+# Progressive mode: PCM buffered before emitting the first partial.
+EARLY_BUFFER_TARGET_S = float(os.getenv("EARLY_BUFFER_TARGET_S", 15.0))
+
 logger.info(
     f"Configuration loaded:\n"
     f"  App: workers={NUM_WORKERS}, sample_rate={MODEL_SAMPLE_RATE}, port={PORT}\n"
     f"  Model: {ASR_MODEL_NAME}, long_audio_threshold_for_model_settings={LONG_AUDIO_THRESHOLD_S}s\n"
     f"  Chunking Defaults: length={TRANSCRIBE_CHUNK_LEN}s, overlap={TRANSCRIBE_OVERLAP}s, batch_cap={CHUNKING_BATCH_SIZE}\n"
-    f"  Streaming (ffmpeg): pcm_read_chunk_size={FFMPEG_PCM_CHUNK_SIZE_BYTES}B"
+    f"  Streaming (ffmpeg): pcm_read_chunk_size={FFMPEG_PCM_CHUNK_SIZE_BYTES}B\n"
+    f"  Strategy: default={DEFAULT_STRATEGY}, max_full_waveform_s={MAX_FULL_WAVEFORM_S}, early_buffer_target_s={EARLY_BUFFER_TARGET_S}\n"
+    f"  Stateful streaming: offline {STREAMING_LEFT_CONTEXT_S}-{STREAMING_CHUNK_S}-{STREAMING_RIGHT_CONTEXT_S}, "
+    f"live {STREAMING_LEFT_CONTEXT_S}-{STREAMING_LIVE_CHUNK_S}-{STREAMING_LIVE_RIGHT_CONTEXT_S}"
 )
 
 # --- FastAPI App Setup ---
@@ -647,7 +675,11 @@ def parse_request_config(
     c_len: Optional[float] = None,
     c_ov: Optional[float] = None,
     b_size: Optional[int] = None,
-    l_thresh: Optional[float] = None
+    l_thresh: Optional[float] = None,
+    strategy: Optional[str] = None,
+    early_buffer_target_s: Optional[float] = None,
+    live_latency: Optional[bool] = None,
+    progressive_refinement: Optional[bool] = None,
 ) -> dict:
     """
     Parses and validates common ASR request configuration parameters.
@@ -661,6 +693,14 @@ def parse_request_config(
         b_size: Batch size for ASR model inference.
         l_thresh: Long audio threshold in seconds to determine model settings
                   (e.g., attention mechanism).
+        strategy: Processing strategy override. One of ProcessingStrategy values.
+                  None falls back to DEFAULT_STRATEGY.
+        early_buffer_target_s: Progressive mode — PCM seconds buffered before
+                  the first partial transcript is emitted.
+        live_latency: When True, progressive mode uses the 10-2-2 streaming preset
+                  for ~4s latency; when False/None, uses 10-10-5 for offline-like quality.
+        progressive_refinement: When True (default), progressive mode runs an
+                  extra full-pass at EOF if duration <= MAX_FULL_WAVEFORM_S.
 
     Returns:
         A dictionary containing the validated configuration parameters.
@@ -668,11 +708,28 @@ def parse_request_config(
     Raises:
         ValueError: If any parameter value is outside its allowed range.
     """
+    requested_strategy = (strategy or DEFAULT_STRATEGY).lower()
+    try:
+        strategy_enum = ProcessingStrategy(requested_strategy)
+    except ValueError:
+        raise ValueError(
+            f"Invalid strategy '{requested_strategy}'. "
+            f"Must be one of: {[s.value for s in ProcessingStrategy]}."
+        )
+
     config = {
         "chunk_length": c_len if c_len is not None else TRANSCRIBE_CHUNK_LEN,
         "chunk_overlap": c_ov if c_ov is not None else TRANSCRIBE_OVERLAP,
         "batch_size": b_size if b_size is not None else CHUNKING_BATCH_SIZE,
-        "long_audio_threshold": l_thresh if l_thresh is not None else LONG_AUDIO_THRESHOLD_S
+        "long_audio_threshold": l_thresh if l_thresh is not None else LONG_AUDIO_THRESHOLD_S,
+        "strategy": strategy_enum,
+        "early_buffer_target_s": (
+            early_buffer_target_s if early_buffer_target_s is not None else EARLY_BUFFER_TARGET_S
+        ),
+        "live_latency": bool(live_latency) if live_latency is not None else False,
+        "progressive_refinement": (
+            bool(progressive_refinement) if progressive_refinement is not None else True
+        ),
     }
 
     if not (0 < config["chunk_length"] <= 300): # Max 5 minutes chunk
@@ -683,8 +740,43 @@ def parse_request_config(
         raise ValueError("batch_size must be between 1 and 32.")
     if not (0 <= config["long_audio_threshold"] <= 3600): # Max 1 hour threshold
         raise ValueError("long_audio_threshold must be >= 0 and <= 3600 seconds.")
-        
+    if not (0 < config["early_buffer_target_s"] <= 300):
+        raise ValueError("early_buffer_target_s must be > 0 and <= 300 seconds.")
+
     return config
+
+
+def resolve_strategy(
+    audio_duration_s: Optional[float],
+    client_config: dict,
+    is_streaming: bool,
+) -> ProcessingStrategy:
+    """
+    Resolve the processing strategy for a request.
+
+    Explicit non-AUTO strategies from client_config win. Otherwise:
+    - Streaming with unknown or live duration -> PROGRESSIVE.
+    - Known duration <= MAX_FULL_WAVEFORM_S -> FULL (_apply_model_settings_for_session
+      will engage local attention past LONG_AUDIO_THRESHOLD_S as needed).
+    - Otherwise -> CHUNKED.
+    """
+    requested = client_config.get("strategy", ProcessingStrategy.AUTO)
+    if isinstance(requested, str):
+        requested = ProcessingStrategy(requested)
+
+    if requested != ProcessingStrategy.AUTO:
+        return requested
+
+    if is_streaming:
+        return ProcessingStrategy.PROGRESSIVE
+
+    if audio_duration_s is None:
+        return ProcessingStrategy.FULL
+
+    if audio_duration_s <= MAX_FULL_WAVEFORM_S:
+        return ProcessingStrategy.FULL
+
+    return ProcessingStrategy.CHUNKED
 
 
 def parse_websocket_config(client_cfg: dict) -> dict:
@@ -717,12 +809,16 @@ def parse_websocket_config(client_cfg: dict) -> dict:
     # 'pcm' is too generic for ffmpeg's input format detection.
     audio_format = str(client_cfg["format"]).lower()
 
-    # Get common ASR config (chunk_length, overlap, batch_size, long_audio_threshold)
+    # Get common ASR config (chunk_length, overlap, batch_size, long_audio_threshold, strategy)
     asr_config = parse_request_config(
         client_cfg.get("chunk_length"),
         client_cfg.get("chunk_overlap"),
         client_cfg.get("batch_size"),
-        client_cfg.get("long_audio_threshold")
+        client_cfg.get("long_audio_threshold"),
+        strategy=client_cfg.get("strategy"),
+        early_buffer_target_s=client_cfg.get("early_buffer_target_s"),
+        live_latency=client_cfg.get("live_latency"),
+        progressive_refinement=client_cfg.get("progressive_refinement"),
     )
 
     # Combine with WebSocket-specific audio stream parameters
@@ -1350,7 +1446,6 @@ async def transcribe_endpoint_rest(
         logger.warning(f"({request_id}) REST: Invalid request parameters: {e_config}")
         return JSONResponse(status_code=400, content={"error": f"Invalid request parameter: {str(e_config)}"})
 
-    temp_audio_file_path: str = ""
     long_audio_settings_applied_this_session = False
     
     # Determine processing device and data type for this session
@@ -1371,18 +1466,11 @@ async def transcribe_endpoint_rest(
         async with model_access_lock:
             logger.debug(f"({request_id}) REST: Acquired ASR model access lock.")
             try:
-                # Save uploaded file to a temporary location for processing by torchaudio
-                # Using a NamedTemporaryFile ensures it's cleaned up even if errors occur.
-                # delete=False is needed on Windows to allow torchaudio.load to open it by name.
-                with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or ".unknown_audio_ext").suffix, prefix=f"rest_audio_{request_id}_") as tmp_file:
-                    await asyncio.to_thread(shutil.copyfileobj, file.file, tmp_file)
-                    temp_audio_file_path = tmp_file.name
-                
-                logger.info(f"({request_id}) REST: Uploaded file saved temporarily to '{temp_audio_file_path}'.")
+                audio_bytes = await file.read()
+                logger.info(f"({request_id}) REST: Read {len(audio_bytes)} bytes from upload '{file.filename}'.")
 
-                # Load and preprocess the entire audio file
                 waveform_tensor, total_audio_duration_s = await load_and_preprocess_audio(
-                    audio_source=temp_audio_file_path,
+                    audio_source=io.BytesIO(audio_bytes),
                     target_sample_rate=MODEL_SAMPLE_RATE,
                     request_id=request_id
                 )
@@ -1472,14 +1560,6 @@ async def transcribe_endpoint_rest(
         logger.error(f"({request_id}) REST: Unhandled outer error in endpoint: {e_outer_rest_handler}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": "An unexpected server error occurred in the REST endpoint.", "detail": str(e_outer_rest_handler)})
     finally:
-        # Clean up the temporary audio file
-        if temp_audio_file_path and os.path.exists(temp_audio_file_path):
-            try:
-                await asyncio.to_thread(os.remove, temp_audio_file_path)
-                logger.debug(f"({request_id}) REST: Successfully removed temporary file '{temp_audio_file_path}'.")
-            except Exception as e_remove_temp:
-                logger.warning(f"({request_id}) REST: Failed to remove temporary file '{temp_audio_file_path}': {e_remove_temp}")
-        
         # Ensure file object from UploadFile is closed if FastAPI hasn't handled it.
         if hasattr(file, 'file') and file.file and not file.file.closed:
             await asyncio.to_thread(file.file.close)

@@ -1608,7 +1608,13 @@ def _stateful_chunked_sync(
         # transcribe() runs infer_logits() (encoder + decoder forward over all
         # buffered chunks) and emits batch_size string hypotheses with the
         # middle-token TDT merge applied across chunks.
-        with torch.inference_mode():
+        # autocast is required: the model is pinned to bf16 but the audio
+        # samples are float32 (NeMo's preprocessor requirement). Without
+        # autocast the first matmul fails: "Input type (float) and bias
+        # type (c10::BFloat16) should be the same".
+        model_dtype = next(asr_model.parameters()).dtype
+        device_type = asr_model.device.type
+        with torch.inference_mode(), torch.amp.autocast(device_type, dtype=model_dtype):
             outputs = frame_asr.transcribe(tokens_per_chunk=tokens_per_chunk, delay=mid_delay)
         asr_time = time.time() - t0
         text = outputs[0] if outputs else ""

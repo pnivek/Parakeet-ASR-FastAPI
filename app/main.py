@@ -132,6 +132,31 @@ if not os.path.exists(static_dir): # Ensure static directory exists
     logger.info(f"Created static directory at {static_dir}")
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
+@app.get("/v1/debug/state", include_in_schema=False)
+async def debug_state():
+    """Internal debug — current model + decoder state. Temporary; will move under /health later."""
+    info: dict = {"model_loaded": asr_model is not None}
+    if asr_model is None:
+        return info
+    try:
+        info["device"] = str(next(asr_model.parameters()).device)
+        info["dtype"] = str(next(asr_model.parameters()).dtype)
+    except Exception as e:
+        info["param_iter_error"] = str(e)
+    try:
+        inferer = asr_model.decoding.decoding
+        info["inferer_class"] = type(inferer).__name__
+        info["use_cuda_graph_decoder"] = getattr(inferer, "use_cuda_graph_decoder", None)
+        computer = getattr(inferer, "decoding_computer", None)
+        if computer is not None:
+            info["computer_class"] = type(computer).__name__
+            info["cuda_graphs_mode"] = repr(getattr(computer, "cuda_graphs_mode", "<unset>"))
+            info["allow_cuda_graphs"] = getattr(computer, "allow_cuda_graphs", None)
+    except Exception as e:
+        info["decoder_introspect_error"] = str(e)
+    return info
+
+
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def get_index_page():
     """Serves the main HTML page for the UI."""
@@ -176,17 +201,44 @@ try:
         except Exception as e_chunk:
             logger.warning(f"change_subsampling_conv_chunking_factor(1) at load failed: {e_chunk}")
 
-        # Disable CUDA graphs on the RNNT greedy decoder. NeMo 2.7.3 enables them
-        # by default (use_cuda_graph_decoder=True). They capture one call's ops
-        # and replay them on subsequent calls — extremely fragile to anything
-        # changing (tensor shapes, addresses, streams). Empirically: first call
-        # always works, second+ crashes inside batched_hyps.scores.cpu() with
-        # cudaErrorIllegalAddress when the replayed graph hits stale pointers.
-        # The fix is to disable graph capture entirely; we re-run the eager
-        # decoder every time. Slight perf cost vs working at all.
+        # Disable CUDA graphs on the (TDT) decoder. NeMo 2.7.3 enables them by
+        # default (use_cuda_graph_decoder=True). Captured graphs replay with
+        # tensor pointers from the first call; the streaming endpoint hits
+        # cudaErrorIllegalAddress inside batched_hyps.scores.cpu() when the
+        # replay touches stale memory. Walk every plausible path and report
+        # the final cuda_graphs_mode so we can verify it actually stuck.
+        _cg_paths_tried = []
         try:
-            asr_model.decoding.decoding.disable_cuda_graphs()
-            logger.info("RNNT greedy decoder: CUDA graphs disabled at load.")
+            inferer = asr_model.decoding.decoding  # GreedyBatchedTDTInfer
+            try:
+                inferer.disable_cuda_graphs()
+                _cg_paths_tried.append("inferer.disable_cuda_graphs()")
+            except Exception as e:
+                _cg_paths_tried.append(f"inferer.disable_cuda_graphs() FAILED: {e}")
+            computer = getattr(inferer, "decoding_computer", None)
+            if computer is not None:
+                # Force the underlying label-looping computer's mode to None.
+                # disable_cuda_graphs() above should already do this, but it's
+                # cheap and definitive insurance.
+                try:
+                    if hasattr(computer, "force_cuda_graphs_mode"):
+                        computer.force_cuda_graphs_mode(None)
+                        _cg_paths_tried.append("computer.force_cuda_graphs_mode(None)")
+                    elif hasattr(computer, "cuda_graphs_mode"):
+                        computer.cuda_graphs_mode = None
+                        _cg_paths_tried.append("computer.cuda_graphs_mode = None")
+                except Exception as e:
+                    _cg_paths_tried.append(f"computer force failed: {e}")
+                final_mode = getattr(computer, "cuda_graphs_mode", "<unset>")
+                logger.info(
+                    f"CUDA graphs disable: tried {_cg_paths_tried}; "
+                    f"final decoding_computer.cuda_graphs_mode={final_mode!r}"
+                )
+            else:
+                logger.info(
+                    f"CUDA graphs disable: tried {_cg_paths_tried}; "
+                    f"no decoding_computer attribute"
+                )
         except Exception as e_cg:
             logger.warning(f"disable_cuda_graphs at load failed: {e_cg}")
 

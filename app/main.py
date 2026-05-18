@@ -7,7 +7,7 @@ import base64
 import asyncio
 import logging
 from enum import Enum
-from typing import Optional, Tuple, List
+from typing import Awaitable, Callable, Optional, Tuple, List
 import subprocess
 import uvicorn
 
@@ -1454,6 +1454,7 @@ async def _transcribe_chunked_waveform(
     waveform: torch.Tensor,
     client_config: dict,
     request_id: str = "chunked",
+    on_batch_segments: Optional[Callable[[List[dict], int], Awaitable[bool]]] = None,
 ) -> Tuple[List[dict], float]:
     """
     Sliding-window chunked transcription of an in-memory waveform.
@@ -1463,6 +1464,12 @@ async def _transcribe_chunked_waveform(
     convert to segments, dedup. Used by REST when `?strategy=chunked` (or auto
     resolves there for long audio). Phase 6 will swap this for stateful streaming
     via `BatchedFrameASRTDT`.
+
+    Args:
+        on_batch_segments: optional async callback invoked with
+            (batch_segments, batch_num) after each ASR batch produces segments.
+            Return True to continue, False to abort the loop early (used by WS
+            handlers to emit `segments_batch` messages and bail on disconnect).
 
     Returns:
         Tuple of (deduplicated_segments, total_asr_processing_time_seconds).
@@ -1512,6 +1519,14 @@ async def _transcribe_chunked_waveform(
             if batch_segs:
                 batch_segs.sort(key=lambda s: s.get("start", float("inf")))
                 all_raw_segments.extend(batch_segs)
+                if on_batch_segments is not None:
+                    keep_going = await on_batch_segments(batch_segs, batch_num)
+                    if not keep_going:
+                        logger.info(
+                            f"({request_id}) Chunked: callback signaled abort at batch {batch_num + 1}/"
+                            f"{(len(chunks) + batch_size - 1) // batch_size}."
+                        )
+                        break
 
     deduped = _deduplicate_segments(
         all_raw_segments,
@@ -1710,363 +1725,310 @@ async def transcribe_endpoint_rest(
         logger.info(f"({request_id}) REST request for file '{file.filename}' completed with status code {response_status_code if 'response_status_code' in locals() else 'unknown'}.")
 
 
-@app.websocket("/v1/audio/transcriptions/ws_stream")
-async def websocket_transcribe_endpoint_streaming(websocket: WebSocket):
+async def _ws_accumulate_then_process(
+    websocket: WebSocket,
+    session_id: str,
+    client_config: dict,
+    session_processing_device: str,
+    session_target_operational_dtype: torch.dtype,
+    resolved_strategy: ProcessingStrategy,
+    log_prefix: str,
+) -> Optional[dict]:
     """
-    Handles WebSocket connections for live/streaming audio transcription as its received.
+    Accumulate all WS binary frames until "END", then transcribe via the FULL
+    or CHUNKED engine. Sends `segments_batch` per chunked batch (chunked only)
+    and returns the final_transcription payload dict to be sent by the caller
+    after the model lock is released.
 
-    The client first sends a JSON configuration message. Then, it streams
-    audio data in binary chunks. An "END" text message signals the end of the stream.
-    The server uses `ffmpeg` to transcode incoming audio to a standard PCM format,
-    then chunks and transcribes it, sending back `segments_batch` messages with
-    intermediate results and a `final_transcription` message upon completion.
-
-    Protocol:
-    1. Client connects.
-    2. Server accepts.
-    3. Client sends JSON text message with configuration (see `parse_websocket_config`).
-    4. Client sends audio data as binary messages.
-    5. Client sends "END" text message to signal end of audio.
-    6. Server sends `segments_batch` JSON messages with lists of transcribed segments.
-    7. Server sends `final_transcription` JSON message with aggregated results.
-    8. Connection is closed.
-
-    Args:
-        websocket: The WebSocket connection object provided by FastAPI.
+    Returns None on disconnect or empty input; otherwise the payload dict.
     """
-    session_id = base64.urlsafe_b64encode(os.urandom(6)).decode() # Unique ID for this session
+    accumulated = bytearray()
+    logger.info(f"({session_id}) {log_prefix}: Waiting to receive audio data...")
+    while True:
+        if websocket.application_state != WebSocketState.CONNECTED:
+            raise WebSocketDisconnect(code=1001, reason="Client disconnected during file data transfer.")
+        try:
+            message = await asyncio.wait_for(websocket.receive(), timeout=60.0)
+        except asyncio.TimeoutError:
+            logger.warning(f"({session_id}) {log_prefix}: Timeout waiting for audio data chunk from client.")
+            raise WebSocketDisconnect(code=1008, reason="Timeout waiting for file data from client.")
+        if message.get("type") == "websocket.disconnect":
+            raise WebSocketDisconnect(code=message.get('code', 1000))
+        if 'text' in message and message['text']:
+            if message['text'].upper() == "END":
+                logger.info(f"({session_id}) {log_prefix}: 'END' signal received. Bytes received: {len(accumulated)}.")
+                break
+            logger.warning(f"({session_id}) {log_prefix}: Unexpected text during data transfer: {message['text'][:100]}")
+        elif 'bytes' in message and message['bytes']:
+            accumulated.extend(message['bytes'])
+            if len(accumulated) % (1024 * 1024 * 5) < len(message['bytes']):
+                logger.debug(f"({session_id}) {log_prefix}: Received {len(accumulated)} bytes so far...")
+        else:
+            logger.warning(f"({session_id}) {log_prefix}: Unexpected message type: {message.get('type')}")
+
+    if not accumulated:
+        raise ValueError("No audio data received before 'END' signal.")
+
+    logger.info(f"({session_id}) {log_prefix}: Loading {len(accumulated)} accumulated bytes.")
+    waveform, audio_duration_s = await load_and_preprocess_audio(
+        audio_source=io.BytesIO(bytes(accumulated)),
+        target_sample_rate=MODEL_SAMPLE_RATE,
+        request_id=session_id,
+    )
+    accumulated.clear()
+    if waveform is None or audio_duration_s == 0:
+        raise ValueError(f"{log_prefix}: Audio loading or preprocessing resulted in empty audio.")
+    if asr_model is None:
+        raise RuntimeError(f"{log_prefix}: ASR model became None during processing.")
+
+    # Apply model settings against the actual duration now that we know it.
+    long_audio_active = await _apply_model_settings_for_session(
+        decision_duration_s=audio_duration_s,
+        target_processing_device=session_processing_device,
+        target_operational_dtype=session_target_operational_dtype,
+        long_audio_threshold_config=client_config["long_audio_threshold"],
+        request_id=session_id,
+    )
+    logger.info(
+        f"({session_id}) {log_prefix}: Model settings applied. "
+        f"Duration={audio_duration_s:.2f}s, long-audio={long_audio_active}, strategy={resolved_strategy.value}"
+    )
+
+    try:
+        if resolved_strategy == ProcessingStrategy.FULL:
+            hyps, asr_t = await _perform_asr_transcription(
+                asr_model_instance=asr_model,
+                audio_input_list=[waveform],
+                batch_size_for_transcribe_call=client_config["batch_size"],
+                num_asr_workers=NUM_WORKERS,
+                request_id=f"WS-{session_id}",
+            )
+            segments = _process_hypotheses_to_segments(
+                hyps, [0.0] * (len(hyps) if hyps else 0), session_id,
+            )
+        else:  # CHUNKED — emit segments_batch as each batch completes
+            async def _on_batch(batch_segs: List[dict], batch_num: int) -> bool:
+                if websocket.application_state != WebSocketState.CONNECTED:
+                    return False
+                try:
+                    await websocket.send_json({"type": "segments_batch", "segments": batch_segs})
+                except Exception as e_send:
+                    logger.warning(f"({session_id}) {log_prefix}: send segments_batch failed: {e_send}")
+                    return False
+                return True
+            segments, asr_t = await _transcribe_chunked_waveform(
+                waveform=waveform,
+                client_config=client_config,
+                request_id=f"WS-{session_id}",
+                on_batch_segments=_on_batch,
+            )
+    finally:
+        # Revert under the lock owner's lifecycle (we are still inside the lock).
+        await _revert_model_to_global_original_state(
+            long_audio_settings_were_active_for_session=long_audio_active,
+            session_processing_device=session_processing_device,
+            request_id=f"{session_id}-{log_prefix.lower().replace(' ', '_')}_revert",
+        )
+
+    if websocket.application_state != WebSocketState.CONNECTED:
+        logger.info(f"({session_id}) {log_prefix}: client disconnected before final transcription.")
+        return None
+
+    text = " ".join(s.get('text', '') for s in segments).strip()
+    return {
+        "type": "final_transcription",
+        "text": text,
+        "language": "en",
+        "strategy": resolved_strategy.value,
+        "transcription_time_seconds": round(asr_t, 3),
+        "total_segments": len(segments),
+        "final_duration_processed_seconds": round(audio_duration_s, 3),
+        "csv_content": generate_csv_content(segments),
+        "srt_content": generate_srt_content(segments),
+    }
+
+
+async def _ws_handle_unified(
+    websocket: WebSocket,
+    strategy_override: Optional[str] = None,
+    log_prefix: str = "WS",
+) -> None:
+    """
+    Shared body for the unified WS endpoint and the two legacy compat aliases.
+
+    strategy_override: when set (used by `/ws_upload` and `/ws_stream` compat
+        wrappers), forces the resolved strategy regardless of what the client
+        sends. Logs a warning if the client requested something different.
+    """
+    session_id = base64.urlsafe_b64encode(os.urandom(6)).decode()
     await websocket.accept()
-    logger.info(f"({session_id}) WebSocket connection accepted for audio streaming (ffmpeg-based).")
+    logger.info(f"({session_id}) {log_prefix}: WebSocket connection accepted.")
 
     if not asr_model:
-        logger.error(f"({session_id}) WS Stream: ASR model not available.")
-        await websocket.send_json({"type": "error", "error": "ASR model not available. Service is initializing or encountered an error."})
-        await websocket.close(code=1011) # 1011: Server error
+        logger.error(f"({session_id}) {log_prefix}: ASR model not available.")
+        await websocket.send_json({"type": "error", "error": "ASR model not available."})
+        await websocket.close(code=1011)
         return
 
     session_processing_device = "cuda" if torch.cuda.is_available() else "cpu"
-    long_audio_settings_applied_this_session = False
-    
     session_target_operational_dtype = torch.float32
     if session_processing_device == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         session_target_operational_dtype = torch.bfloat16
-    logger.info(f"({session_id}) WS Stream Session: Will use dtype {session_target_operational_dtype} on device {session_processing_device} for ASR computation.")
+    logger.info(
+        f"({session_id}) {log_prefix}: device={session_processing_device}, dtype={session_target_operational_dtype}."
+    )
 
-    client_config: Optional[dict] = None
+    final_payload: Optional[dict] = None
     try:
-        # 1. Receive and parse initial client configuration
-        config_text = await asyncio.wait_for(websocket.receive_text(), timeout=20.0) # Timeout for config
-        client_config = parse_websocket_config(json.loads(config_text))
-        logger.info(f"({session_id}) WS Stream: Received valid client configuration: {client_config}")
+        config_text = await asyncio.wait_for(websocket.receive_text(), timeout=20.0)
+        config_dict = json.loads(config_text)
 
-        # Acquire lock for exclusive ASR model access
-        async with model_access_lock:
-            logger.debug(f"({session_id}) WS Stream: Acquired ASR model access lock.")
-            try:
-                # Apply model settings for this streaming session.
-                # For streaming, decision for long/short audio is based on ASR chunk_length.
-                long_audio_settings_applied_this_session = await _apply_model_settings_for_session(
-                    decision_duration_s=client_config["chunk_length"], 
-                    target_processing_device=session_processing_device,
-                    target_operational_dtype=session_target_operational_dtype,
-                    long_audio_threshold_config=client_config["long_audio_threshold"],
-                    request_id=session_id
+        if strategy_override is not None:
+            client_requested = config_dict.get("strategy")
+            if client_requested is not None and str(client_requested).lower() not in (strategy_override.lower(), "auto"):
+                logger.warning(
+                    f"({session_id}) {log_prefix}: client requested strategy={client_requested!r}, "
+                    f"but this endpoint forces {strategy_override!r}; overriding."
                 )
-                logger.info(f"({session_id}) WS Stream: ASR model settings applied for session. Long audio specific settings active: {long_audio_settings_applied_this_session}.")
+            config_dict["strategy"] = strategy_override
 
-                # Start the streaming PCM handling pipeline (producer/consumer with ffmpeg)
-                await handle_streaming_pcm(websocket, session_id, session_processing_device, client_config)
-            
-            except Exception as e_locked_ws_processing:
-                # Errors within the locked block (e.g., during handle_streaming_pcm or model setup)
-                logger.error(f"({session_id}) WS Stream: Error during locked operation: {e_locked_ws_processing}", exc_info=True)
-                if websocket.application_state == WebSocketState.CONNECTED:
-                    try:
-                        await websocket.send_json({"type": "error", "error": f"Server error during streaming: {str(e_locked_ws_processing)}"})
-                    except Exception as e_send_err_on_locked_err:
-                        logger.warning(f"({session_id}) WS Stream: Could not send error to client after locked operation error: {e_send_err_on_locked_err}")
-            finally:
-                logger.debug(f"({session_id}) WS Stream: Releasing ASR model lock and reverting model state.")
-                # Always revert model state at the end of the locked block
-                await _revert_model_to_global_original_state(
-                    long_audio_settings_were_active_for_session=long_audio_settings_applied_this_session,
-                    session_processing_device=session_processing_device,
-                    request_id=f"{session_id}-stream_model_revert"
-                )
-                logger.info(f"({session_id}) WS Stream: ASR Model state reverted after session.")
-    
-    except WebSocketDisconnect:
-        logger.info(f"({session_id}) WS Stream: WebSocket disconnected by client.")
+        client_config = parse_websocket_config(config_dict)
+        logger.info(f"({session_id}) {log_prefix}: parsed client config: {client_config}")
+
+        resolved = resolve_strategy(
+            audio_duration_s=None,
+            client_config=client_config,
+            is_streaming=True,
+        )
+        logger.info(f"({session_id}) {log_prefix}: resolved strategy = {resolved.value}.")
+
+        if resolved == ProcessingStrategy.PROGRESSIVE:
+            # Streaming pipeline: ffmpeg producer/consumer. handle_streaming_pcm
+            # does its own _apply / _revert via the legacy pattern here, since
+            # for streaming we don't know duration upfront and use chunk_length
+            # as the proxy.
+            long_audio_active = False
+            async with model_access_lock:
+                try:
+                    long_audio_active = await _apply_model_settings_for_session(
+                        decision_duration_s=client_config["chunk_length"],
+                        target_processing_device=session_processing_device,
+                        target_operational_dtype=session_target_operational_dtype,
+                        long_audio_threshold_config=client_config["long_audio_threshold"],
+                        request_id=session_id,
+                    )
+                    await handle_streaming_pcm(
+                        websocket, session_id, session_processing_device, client_config,
+                    )
+                except Exception as e_stream:
+                    logger.error(f"({session_id}) {log_prefix}: streaming error: {e_stream}", exc_info=True)
+                    if websocket.application_state == WebSocketState.CONNECTED:
+                        try:
+                            await websocket.send_json({"type": "error", "error": f"Server error during streaming: {e_stream}"})
+                        except Exception:
+                            pass
+                finally:
+                    await _revert_model_to_global_original_state(
+                        long_audio_settings_were_active_for_session=long_audio_active,
+                        session_processing_device=session_processing_device,
+                        request_id=f"{session_id}-stream_revert",
+                    )
+        else:
+            # FULL or CHUNKED — accumulate first (no lock), then load,
+            # acquire lock, transcribe, revert, release lock, send final.
+            async with model_access_lock:
+                try:
+                    final_payload = await _ws_accumulate_then_process(
+                        websocket=websocket,
+                        session_id=session_id,
+                        client_config=client_config,
+                        session_processing_device=session_processing_device,
+                        session_target_operational_dtype=session_target_operational_dtype,
+                        resolved_strategy=resolved,
+                        log_prefix=log_prefix,
+                    )
+                except Exception as e_proc:
+                    logger.error(f"({session_id}) {log_prefix}: processing error: {e_proc}", exc_info=True)
+                    if websocket.application_state == WebSocketState.CONNECTED:
+                        try:
+                            await websocket.send_json({"type": "error", "error": f"Server error: {e_proc}"})
+                        except Exception:
+                            pass
+
+        if final_payload and websocket.application_state == WebSocketState.CONNECTED:
+            await websocket.send_json(final_payload)
+            logger.info(f"({session_id}) {log_prefix}: final_transcription sent.")
+
     except asyncio.TimeoutError:
-        logger.warning(f"({session_id}) WS Stream: Timeout occurred, likely waiting for initial client config.")
+        logger.warning(f"({session_id}) {log_prefix}: Timeout waiting for initial client config.")
         if websocket.application_state == WebSocketState.CONNECTED:
-            try: await websocket.send_json({"type": "error", "error": "Timeout: No configuration received from client."})
-            except Exception: pass # Ignore if send also fails
-    except json.JSONDecodeError as e_json_decode:
-        logger.warning(f"({session_id}) WS Stream: Failed to decode JSON configuration from client: {e_json_decode}")
-        if websocket.application_state == WebSocketState.CONNECTED:
-            try: await websocket.send_json({"type": "error", "error": f"Invalid JSON configuration received: {str(e_json_decode)}"})
+            try: await websocket.send_json({"type": "error", "error": "Timeout: No configuration received."})
             except Exception: pass
-    except ValueError as e_value_config: # From parse_websocket_config
-        logger.warning(f"({session_id}) WS Stream: Invalid configuration parameters: {e_value_config}")
+    except json.JSONDecodeError as e_json:
+        logger.warning(f"({session_id}) {log_prefix}: Bad JSON config: {e_json}")
         if websocket.application_state == WebSocketState.CONNECTED:
-            try: await websocket.send_json({"type": "error", "error": f"Invalid configuration: {str(e_value_config)}"})
+            try: await websocket.send_json({"type": "error", "error": f"Invalid JSON configuration: {e_json}"})
             except Exception: pass
-    except Exception as e_outer_ws_handler:
-        # Catch-all for other unexpected errors in the WebSocket handler
-        logger.error(f"({session_id}) WS Stream: Unhandled exception in WebSocket endpoint: {e_outer_ws_handler}", exc_info=True)
+    except ValueError as e_val:
+        logger.warning(f"({session_id}) {log_prefix}: Value error: {e_val}")
+        if websocket.application_state == WebSocketState.CONNECTED:
+            try: await websocket.send_json({"type": "error", "error": str(e_val)})
+            except Exception: pass
+    except WebSocketDisconnect as e_disc:
+        logger.info(f"({session_id}) {log_prefix}: WebSocket disconnected. code={e_disc.code} reason={e_disc.reason}")
+    except Exception as e_outer:
+        logger.error(f"({session_id}) {log_prefix}: Unhandled exception: {e_outer}", exc_info=True)
         if websocket.application_state == WebSocketState.CONNECTED:
             try: await websocket.send_json({"type": "error", "error": "An unexpected server error occurred."})
             except Exception: pass
     finally:
         if websocket.application_state == WebSocketState.CONNECTED:
-            logger.info(f"({session_id}) WS Stream: Closing WebSocket connection (endpoint finally block).")
             try:
-                await websocket.close(code=1000) # 1000: Normal Closure
-            except Exception as e_close_ws:
-                logger.warning(f"({session_id}) WS Stream: Error closing WebSocket in finally block: {e_close_ws}")
-        logger.info(f"({session_id}) Streaming WebSocket session via ffmpeg ended.")
+                await websocket.close(code=1000)
+            except Exception as e_close:
+                logger.warning(f"({session_id}) {log_prefix}: close error: {e_close}")
+        logger.info(f"({session_id}) {log_prefix}: WebSocket session ended.")
+
+
+@app.websocket("/v1/audio/transcriptions")
+async def websocket_transcribe_unified(websocket: WebSocket):
+    """
+    Unified WebSocket endpoint. Client sends a JSON config first frame; server
+    resolves the processing strategy and dispatches:
+
+      - strategy=full      → accumulate-then-process, single transcribe call.
+      - strategy=chunked   → accumulate-then-process, sliding-window batched.
+      - strategy=progressive → ffmpeg streaming pipeline with intermediate sends.
+      - strategy=auto (default for WS) → progressive.
+
+    Legacy aliases /ws_upload and /ws_stream forward here with strategy
+    forced to chunked and progressive respectively.
+    """
+    await _ws_handle_unified(websocket, strategy_override=None, log_prefix="WS")
+
+
+@app.websocket("/v1/audio/transcriptions/ws_stream")
+async def websocket_transcribe_endpoint_streaming(websocket: WebSocket):
+    """
+    Legacy compatibility alias for /v1/audio/transcriptions with strategy=progressive.
+
+    Existing clients connecting here get the ffmpeg streaming pipeline regardless
+    of the strategy they send. Logs that the legacy path was taken.
+    """
+    logger.info("WS legacy alias: /ws_stream → forwarding with strategy=progressive.")
+    await _ws_handle_unified(websocket, strategy_override="progressive", log_prefix="WS Stream")
 
 
 @app.websocket("/v1/audio/transcriptions/ws_upload")
 async def websocket_transcribe_endpoint_full_file_upload(websocket: WebSocket):
     """
-    Handles WebSocket connections for transcribing a full audio file uploaded via WebSocket.
+    Legacy compatibility alias for /v1/audio/transcriptions with strategy=chunked.
 
-    The client first sends a JSON configuration message. Then, it streams the
-    entire audio file as binary messages, followed by an "END" text message.
-    The server accumulates the entire file, then processes it by chunking the
-    audio and performing ASR on these chunks. Intermediate `segments_batch`
-    messages are sent, followed by a `final_transcription` message.
-
-    Protocol:
-    1. Client connects.
-    2. Server accepts.
-    3. Client sends JSON text message with configuration (see `parse_websocket_config`).
-    4. Client sends all audio data as binary messages.
-    5. Client sends "END" text message.
-    6. Server sends `segments_batch` JSON messages with lists of transcribed segments from ASR batches.
-    7. Server sends `final_transcription` JSON message with aggregated and deduplicated results.
-    8. Connection is closed.
-
-    Args:
-        websocket: The WebSocket connection object provided by FastAPI.
+    Existing clients connecting here get the accumulate-then-chunked pipeline
+    regardless of the strategy they send. Logs that the legacy path was taken.
     """
-    session_id = base64.urlsafe_b64encode(os.urandom(6)).decode()
-    await websocket.accept()
-    logger.info(f"({session_id}) WebSocket connection accepted for full file upload transcription.")
-
-    if not asr_model:
-        logger.error(f"({session_id}) WS Upload: ASR model not available.")
-        await websocket.send_json({"type": "error", "error": "ASR model not available. Service is initializing or encountered an error."})
-        await websocket.close(code=1011) # Server error
-        return
-
-    session_processing_device = "cuda" if torch.cuda.is_available() else "cpu"
-    long_audio_settings_applied_this_session = False
-    final_response_payload: Optional[dict] = None # To store the final message content
-    
-    session_target_operational_dtype = torch.float32
-    if session_processing_device == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-        session_target_operational_dtype = torch.bfloat16
-    logger.info(f"({session_id}) WS Upload Session: Will use dtype {session_target_operational_dtype} on device {session_processing_device} for ASR computation.")
-
-    client_config: Optional[dict] = None
-    try:
-        # 1. Receive and parse initial client configuration
-        config_text = await asyncio.wait_for(websocket.receive_text(), timeout=20.0)
-        client_config = parse_websocket_config(json.loads(config_text))
-        logger.info(f"({session_id}) WS Upload: Received valid client configuration: {client_config}")
-
-        # Acquire lock for exclusive ASR model access
-        async with model_access_lock:
-            logger.debug(f"({session_id}) WS Upload: Acquired ASR model access lock.")
-            try:
-                # Apply model settings for this session.
-                # For ws_upload, decision for long/short audio is based on ASR chunk_length,
-                # as the full audio duration isn't known until all data is received.
-                long_audio_settings_applied_this_session = await _apply_model_settings_for_session(
-                    decision_duration_s=client_config["chunk_length"],
-                    target_processing_device=session_processing_device,
-                    target_operational_dtype=session_target_operational_dtype,
-                    long_audio_threshold_config=client_config["long_audio_threshold"],
-                    request_id=session_id
-                )
-                logger.debug(f"({session_id}) WS Upload: ASR model settings applied. Long audio specific settings active: {long_audio_settings_applied_this_session}.")
-
-                # 2. Accumulate audio data from client
-                accumulated_raw_audio_bytes = bytearray()
-                logger.info(f"({session_id}) WS Upload: Waiting to receive audio file data...")
-                while True:
-                    if websocket.application_state != WebSocketState.CONNECTED:
-                        # This can happen if client disconnects abruptly during transfer
-                        raise WebSocketDisconnect(code=1001, reason="Client disconnected during file data transfer.")
-                    
-                    try:
-                        # Timeout for each data chunk to detect stalled uploads
-                        message = await asyncio.wait_for(websocket.receive(), timeout=60.0) 
-                    except asyncio.TimeoutError:
-                        logger.warning(f"({session_id}) WS Upload: Timeout waiting for audio data chunk from client.")
-                        raise WebSocketDisconnect(code=1008, reason="Timeout waiting for file data from client.") # Policy Violation
-
-                    if message.get("type") == "websocket.disconnect":
-                        # Explicit disconnect message from FastAPI/Starlette
-                        raise WebSocketDisconnect(code=message.get('code', 1000))
-
-                    if 'text' in message and message['text']:
-                        if message['text'].upper() == "END":
-                            logger.info(f"({session_id}) WS Upload: 'END' signal received. Total bytes received: {len(accumulated_raw_audio_bytes)}.")
-                            break # End of file transfer
-                        else:
-                            logger.warning(f"({session_id}) WS Upload: Received unexpected text message during data transfer: {message['text'][:100]}")
-                    elif 'bytes' in message and message['bytes']:
-                        accumulated_raw_audio_bytes.extend(message['bytes'])
-                        # Log progress sparingly to avoid flooding logs for large files
-                        if len(accumulated_raw_audio_bytes) % (1024 * 1024 * 5) < len(message['bytes']): # Log every ~5MB
-                             logger.debug(f"({session_id}) WS Upload: Received {len(accumulated_raw_audio_bytes)} bytes so far...")
-                    else:
-                        logger.warning(f"({session_id}) WS Upload: Received unexpected message type: {message.get('type')}")
-
-                if not accumulated_raw_audio_bytes:
-                    logger.warning(f"({session_id}) WS Upload: No audio data received before 'END' signal.")
-                    raise ValueError("No audio data was received for full file upload.")
-                
-                # 3. Process accumulated audio data
-                logger.info(f"({session_id}) WS Upload: Processing {len(accumulated_raw_audio_bytes)} bytes of audio data.")
-                waveform_full_upload_tensor, audio_duration_s_full_upload = await load_and_preprocess_audio(
-                    audio_source=io.BytesIO(bytes(accumulated_raw_audio_bytes)), # Process from memory
-                    target_sample_rate=MODEL_SAMPLE_RATE,
-                    request_id=session_id
-                )
-                accumulated_raw_audio_bytes.clear() # Free memory
-
-                if waveform_full_upload_tensor is None or audio_duration_s_full_upload == 0:
-                    logger.error(f"({session_id}) WS Upload: Audio loading/preprocessing failed for uploaded data.")
-                    raise ValueError("Full File Upload: Audio loading or preprocessing resulted in empty audio.")
-                if asr_model is None: # Should be caught by lock, but defensive check
-                    logger.critical(f"({session_id}) WS Upload: ASR Model became None during processing.")
-                    raise RuntimeError("ASR Model is not available during full upload processing.")
-
-                logger.info(f"({session_id}) WS Upload: Audio preprocessed. Duration: {audio_duration_s_full_upload:.2f}s. Creating ASR chunks...")
-                
-                # 4. Manually chunk the full waveform for batched ASR
-                manual_asr_chunks_ws, manual_asr_offsets_ws = create_audio_chunks(
-                    waveform=waveform_full_upload_tensor,
-                    sample_rate=MODEL_SAMPLE_RATE,
-                    chunk_len_s=client_config["chunk_length"],
-                    overlap_s=client_config["chunk_overlap"]
-                )
-                
-                all_raw_segments_from_asr_batches: List[dict] = []
-                total_asr_processing_time_this_session_s: float = 0.0
-                asr_batch_size_for_inference = client_config["batch_size"]
-
-                logger.info(f"({session_id}) WS Upload: Processing {len(manual_asr_chunks_ws)} ASR chunks in batches of {asr_batch_size_for_inference}.")
-                for batch_num, batch_start_idx in enumerate(range(0, len(manual_asr_chunks_ws), asr_batch_size_for_inference)):
-                    if websocket.application_state != WebSocketState.CONNECTED:
-                        logger.warning(f"({session_id}) WS Upload: Client disconnected during ASR batch processing. Aborting.")
-                        break # Stop processing if client disconnected
-
-                    current_batch_audio_tensors = manual_asr_chunks_ws[batch_start_idx : batch_start_idx + asr_batch_size_for_inference]
-                    current_batch_time_offsets = manual_asr_offsets_ws[batch_start_idx : batch_start_idx + asr_batch_size_for_inference]
-                    
-                    if not current_batch_audio_tensors:
-                        continue # Should not happen if range is correct
-
-                    logger.debug(f"({session_id}) WS Upload: Processing ASR batch {batch_num + 1} "
-                                 f"({len(current_batch_audio_tensors)} chunks).")
-                    
-                    hypotheses_for_batch, asr_batch_duration_s = await _perform_asr_transcription(
-                        asr_model_instance=asr_model,
-                        audio_input_list=current_batch_audio_tensors,
-                        batch_size_for_transcribe_call=len(current_batch_audio_tensors),
-                        num_asr_workers=NUM_WORKERS,
-                        request_id=f"WS-FullUpload-{session_id}-b{batch_num}"
-                    )
-                    total_asr_processing_time_this_session_s += asr_batch_duration_s
-                    
-                    if hypotheses_for_batch:
-                        segments_from_this_batch = _process_hypotheses_to_segments(
-                            hypotheses_for_batch, current_batch_time_offsets, f"{session_id}-segproc_b{batch_num}"
-                        )
-                        if websocket.application_state == WebSocketState.CONNECTED and segments_from_this_batch:
-                            # Sort segments within the batch by start time before sending
-                            segments_from_this_batch.sort(key=lambda s: s.get("start", float('inf')))
-                            logger.info(f"({session_id}) WS Upload: Sending {len(segments_from_this_batch)} segments from batch {batch_num + 1} to client.")
-                            await websocket.send_json({"type": "segments_batch", "segments": segments_from_this_batch})
-                        all_raw_segments_from_asr_batches.extend(segments_from_this_batch)
-                    
-                    # Clear CUDA cache periodically
-                    if session_processing_device == "cuda" and torch.cuda.is_available():
-                        await asyncio.to_thread(torch.cuda.empty_cache)
-                
-                # 5. Prepare and send final transcription if still connected
-                if websocket.application_state == WebSocketState.CONNECTED:
-                    logger.info(f"({session_id}) WS Upload: All ASR batches processed. Deduplicating {len(all_raw_segments_from_asr_batches)} raw segments.")
-                    # Deduplicate segments from all batches
-                    final_deduplicated_segments = _deduplicate_segments(
-                        all_raw_segments_from_asr_batches,
-                        client_config["chunk_overlap"] / 2.0 # Use a fraction of overlap as threshold
-                    )
-                    final_transcribed_text = " ".join(s['text'] for s in final_deduplicated_segments).strip()
-                    
-                    final_response_payload = {
-                        "type": "final_transcription",
-                        "text": final_transcribed_text,
-                        "language": "en",
-                        "transcription_time_seconds": round(total_asr_processing_time_this_session_s, 3),
-                        "total_segments": len(final_deduplicated_segments),
-                        "final_duration_processed_seconds": round(audio_duration_s_full_upload, 3),
-                        "csv_content": generate_csv_content(final_deduplicated_segments),
-                        "srt_content": generate_srt_content(final_deduplicated_segments)
-                    }
-                    logger.info(f"({session_id}) WS Upload: Final transcription prepared. Total segments: {len(final_deduplicated_segments)}.")
-                else:
-                    logger.info(f"({session_id}) WS Upload: Client disconnected before final transcription could be prepared.")
-
-            except Exception as e_locked_full_upload_processing:
-                logger.error(f"({session_id}) WS Upload: Error during locked operation: {e_locked_full_upload_processing}", exc_info=True)
-                if websocket.application_state == WebSocketState.CONNECTED:
-                    try:
-                        await websocket.send_json({"type": "error", "error": f"Server error during full file upload processing: {str(e_locked_full_upload_processing)}"})
-                    except Exception: pass # Ignore if send also fails
-            finally:
-                logger.debug(f"({session_id}) WS Upload: Releasing ASR model lock and reverting model state.")
-                await _revert_model_to_global_original_state(
-                    long_audio_settings_were_active_for_session=long_audio_settings_applied_this_session,
-                    session_processing_device=session_processing_device,
-                    request_id=f"{session_id}-full_upload_model_revert"
-                )
-                logger.info(f"({session_id}) WS Upload: ASR Model state reverted after session.")
-        
-        # Send the final response if it was prepared and client is still connected
-        if final_response_payload and websocket.application_state == WebSocketState.CONNECTED:
-            await websocket.send_json(final_response_payload)
-            logger.info(f"({session_id}) WS Upload: Final transcription message sent to client.")
-            
-    except asyncio.TimeoutError: # For initial config wait
-        logger.warning(f"({session_id}) WS Upload: Timeout waiting for initial client configuration.")
-        if websocket.application_state == WebSocketState.CONNECTED:
-            await websocket.send_json({"type": "error", "error": "Timeout: No configuration received."})
-    except json.JSONDecodeError as e_json:
-        logger.warning(f"({session_id}) WS Upload: Failed to decode JSON configuration: {e_json}")
-        if websocket.application_state == WebSocketState.CONNECTED:
-            await websocket.send_json({"type": "error", "error": f"Invalid JSON configuration: {str(e_json)}"})
-    except ValueError as e_val: # From parse_websocket_config or data validation
-        logger.warning(f"({session_id}) WS Upload: Value error (config or data): {e_val}")
-        if websocket.application_state == WebSocketState.CONNECTED:
-            await websocket.send_json({"type": "error", "error": str(e_val)})
-    except WebSocketDisconnect as e_ws_disconnect:
-        logger.info(f"({session_id}) WS Upload: WebSocket disconnected. Reason: {e_ws_disconnect.reason} (Code: {e_ws_disconnect.code})")
-    except Exception as e_outer_full_upload:
-        logger.error(f"({session_id}) WS Upload: Unhandled exception in endpoint: {e_outer_full_upload}", exc_info=True)
-        if websocket.application_state == WebSocketState.CONNECTED:
-            await websocket.send_json({"type": "error", "error": "An unexpected server error occurred."})
-    finally:
-        if websocket.application_state == WebSocketState.CONNECTED:
-            logger.info(f"({session_id}) WS Upload: Closing WebSocket connection (endpoint finally block).")
-            await websocket.close(code=1000) # Normal closure
-        logger.info(f"({session_id}) Full file upload WebSocket session ended.")
+    logger.info("WS legacy alias: /ws_upload → forwarding with strategy=chunked.")
+    await _ws_handle_unified(websocket, strategy_override="chunked", log_prefix="WS Upload")
 
 
 if __name__ == "__main__":

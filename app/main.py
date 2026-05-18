@@ -290,8 +290,12 @@ async def _apply_model_settings_for_session(
         logger.info(f"({request_id}) Session: Decision duration {decision_duration_s:.2f}s <= threshold {long_audio_threshold_config:.2f}s. Ensuring short audio settings.")
         try:
             await asyncio.to_thread(asr_model.change_attention_model, "rel_pos") # Default attention
-            await asyncio.to_thread(asr_model.change_subsampling_conv_chunking_factor, -1) # Default subsampling
-            logger.debug(f"({request_id}) Session: Short audio settings (attention: rel_pos, subsampling_factor: -1) ensured.")
+            # subsampling_conv_chunking_factor=1 (auto) avoids a NeMo 2.7.3 bug where
+            # the value -1 routes into a forward path that calls MaskedConvSequential(x)
+            # without the required `lengths` arg. With 1, the auto path passes `lengths`
+            # correctly and skips actual splitting when the tensor is small enough.
+            await asyncio.to_thread(asr_model.change_subsampling_conv_chunking_factor, 1)
+            logger.debug(f"({request_id}) Session: Short audio settings (attention: rel_pos, subsampling_factor: 1 auto) ensured.")
         except Exception as e_short:
             logger.warning(f"({request_id}) Session: Failed to ensure short audio settings: {e_short}")
             
@@ -337,7 +341,9 @@ async def _revert_model_to_global_original_state(
                     logger.debug(f"({request_id}) End of Session: Model temporarily set to float32 for reverting structural changes.")
 
                 await asyncio.to_thread(asr_model.change_attention_model, "rel_pos")
-                await asyncio.to_thread(asr_model.change_subsampling_conv_chunking_factor, -1)
+                # subsampling_conv_chunking_factor=1 (auto), not -1: see comment in
+                # _apply_model_settings_for_session for the NeMo 2.7.3 bug avoided here.
+                await asyncio.to_thread(asr_model.change_subsampling_conv_chunking_factor, 1)
             
             except Exception as e_rev_long_specific:
                  logger.warning(f"({request_id}) End of Session: Failed to revert long-audio specific settings: {e_rev_long_specific}")

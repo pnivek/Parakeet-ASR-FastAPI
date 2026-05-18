@@ -1450,13 +1450,84 @@ def create_audio_chunks(
     return chunks, offsets_s
 
 
+async def _transcribe_chunked_waveform(
+    waveform: torch.Tensor,
+    client_config: dict,
+    request_id: str = "chunked",
+) -> Tuple[List[dict], float]:
+    """
+    Sliding-window chunked transcription of an in-memory waveform.
+
+    Mirrors the pattern used inside `websocket_transcribe_endpoint_full_file_upload`:
+    chunk via `create_audio_chunks`, batch through `_perform_asr_transcription`,
+    convert to segments, dedup. Used by REST when `?strategy=chunked` (or auto
+    resolves there for long audio). Phase 6 will swap this for stateful streaming
+    via `BatchedFrameASRTDT`.
+
+    Returns:
+        Tuple of (deduplicated_segments, total_asr_processing_time_seconds).
+        Empty list and 0.0 if the waveform produces no chunks.
+    """
+    chunk_len_s = client_config["chunk_length"]
+    chunk_overlap_s = client_config["chunk_overlap"]
+    batch_size = client_config["batch_size"]
+
+    chunks, offsets = create_audio_chunks(
+        waveform=waveform,
+        sample_rate=MODEL_SAMPLE_RATE,
+        chunk_len_s=chunk_len_s,
+        overlap_s=chunk_overlap_s,
+    )
+    if not chunks:
+        logger.warning(f"({request_id}) Chunked: create_audio_chunks returned no chunks.")
+        return [], 0.0
+
+    logger.info(
+        f"({request_id}) Chunked: {len(chunks)} chunks "
+        f"(len={chunk_len_s}s overlap={chunk_overlap_s}s), batching by {batch_size}."
+    )
+
+    all_raw_segments: List[dict] = []
+    total_asr_time = 0.0
+
+    for batch_num, batch_start in enumerate(range(0, len(chunks), batch_size)):
+        batch_chunks = chunks[batch_start:batch_start + batch_size]
+        batch_offsets = offsets[batch_start:batch_start + batch_size]
+        if not batch_chunks:
+            continue
+
+        hyps, asr_dur = await _perform_asr_transcription(
+            asr_model_instance=asr_model,
+            audio_input_list=batch_chunks,
+            batch_size_for_transcribe_call=len(batch_chunks),
+            num_asr_workers=NUM_WORKERS,
+            request_id=f"{request_id}-b{batch_num}",
+        )
+        total_asr_time += asr_dur
+
+        if hyps:
+            batch_segs = _process_hypotheses_to_segments(
+                hyps, batch_offsets, f"{request_id}-segproc_b{batch_num}",
+            )
+            if batch_segs:
+                batch_segs.sort(key=lambda s: s.get("start", float("inf")))
+                all_raw_segments.extend(batch_segs)
+
+    deduped = _deduplicate_segments(
+        all_raw_segments,
+        chunk_overlap_s / 2.0,
+    )
+    return deduped, total_asr_time
+
+
 @app.post("/v1/audio/transcriptions")
 async def transcribe_endpoint_rest(
     file: UploadFile = File(...),
     chunk_length: Optional[float] = Query(None, description="Duration of audio chunks for ASR in seconds. Uses server default if not set."),
     chunk_overlap: Optional[float] = Query(None, description="Overlap between audio chunks in seconds. Uses server default if not set."),
     batch_size: Optional[int] = Query(None, description="Batch size for ASR model processing. Uses server default if not set."),
-    long_audio_threshold: Optional[float] = Query(None, description="Threshold in seconds to apply long audio model settings. Uses server default if not set.")
+    long_audio_threshold: Optional[float] = Query(None, description="Threshold in seconds to apply long audio model settings. Uses server default if not set."),
+    strategy: Optional[str] = Query(None, description="Processing strategy: auto (default), full, chunked. Auto picks based on audio duration vs MAX_FULL_WAVEFORM_S."),
 ):
     """
     Handles REST API requests for audio transcription of a single uploaded file.
@@ -1488,7 +1559,10 @@ async def transcribe_endpoint_rest(
 
     try:
         # Parse and validate common ASR configuration from query parameters
-        client_config_rest = parse_request_config(chunk_length, chunk_overlap, batch_size, long_audio_threshold)
+        client_config_rest = parse_request_config(
+            chunk_length, chunk_overlap, batch_size, long_audio_threshold,
+            strategy=strategy,
+        )
         logger.info(f"({request_id}) REST: Parsed request config: {client_config_rest}")
     except ValueError as e_config:
         logger.warning(f"({request_id}) REST: Invalid request parameters: {e_config}")
@@ -1532,51 +1606,72 @@ async def transcribe_endpoint_rest(
                     response_status_code = 503 # Service Unavailable
                     final_response_content = {"error": "ASR model became unavailable during processing."}
                 else:
-                    # Apply model settings (device, dtype, long/short audio attention) for this session
-                    # For REST, the decision for long/short audio settings is based on the total file duration.
-                    long_audio_settings_applied_this_session = await _apply_model_settings_for_session(
-                        decision_duration_s=total_audio_duration_s,
-                        target_processing_device=session_processing_device,
-                        target_operational_dtype=session_target_operational_dtype,
-                        long_audio_threshold_config=client_config_rest["long_audio_threshold"],
-                        request_id=request_id
+                    resolved_strategy = resolve_strategy(
+                        audio_duration_s=total_audio_duration_s,
+                        client_config=client_config_rest,
+                        is_streaming=False,
                     )
-                    logger.info(f"({request_id}) REST: ASR model settings applied for session. Long audio specific settings active: {long_audio_settings_applied_this_session}.")
+                    logger.info(f"({request_id}) REST: Resolved strategy = '{resolved_strategy.value}' for {total_audio_duration_s:.2f}s of audio.")
 
-                    # Perform transcription on the entire waveform
-                    # NeMo's `transcribe` can handle batching internally if a list of waveforms is provided.
-                    # Here, we provide a list containing a single tensor.
-                    hypotheses_list, asr_processing_time_s = await _perform_asr_transcription(
-                        asr_model_instance=asr_model,
-                        audio_input_list=[waveform_tensor], # List with one item for single file
-                        batch_size_for_transcribe_call=client_config_rest["batch_size"], # Can be 1
-                        num_asr_workers=NUM_WORKERS,
-                        request_id=f"REST-{request_id}"
-                    )
+                    if resolved_strategy == ProcessingStrategy.PROGRESSIVE:
+                        response_status_code = 400
+                        final_response_content = {
+                            "error": "Strategy 'progressive' requires a streaming connection. "
+                                     "Use a WebSocket endpoint, or pick 'full' or 'chunked' for REST."
+                        }
+                    else:
+                        # Apply model settings (long/short audio attention) for this session.
+                        # For REST, the decision for long/short audio settings is based on the total file duration.
+                        long_audio_settings_applied_this_session = await _apply_model_settings_for_session(
+                            decision_duration_s=total_audio_duration_s,
+                            target_processing_device=session_processing_device,
+                            target_operational_dtype=session_target_operational_dtype,
+                            long_audio_threshold_config=client_config_rest["long_audio_threshold"],
+                            request_id=request_id
+                        )
+                        logger.info(f"({request_id}) REST: ASR model settings applied for session. Long audio specific settings active: {long_audio_settings_applied_this_session}.")
 
-                    # Process raw hypotheses into structured segments
-                    # For a single, non-chunked audio file, the offset is 0.0 for all hypotheses.
-                    segments = _process_hypotheses_to_segments(
-                        hypotheses_list, 
-                        [0.0] * (len(hypotheses_list) if hypotheses_list else 0), 
-                        request_id
-                    )
-                    
-                    full_transcribed_text = " ".join(s['text'] for s in segments).strip()
-                    total_server_processing_time_s = round(time.time() - start_time_total_request_processing, 3)
-                    
-                    final_response_content = {
-                        "text": full_transcribed_text,
-                        "segments": segments,
-                        "language": "en", # Assuming English
-                        "transcription_time_seconds": round(asr_processing_time_s, 3),
-                        "total_request_time_server_seconds": total_server_processing_time_s,
-                        "csv_content": generate_csv_content(segments),
-                        "srt_content": generate_srt_content(segments),
-                        "audio_duration_seconds": round(total_audio_duration_s, 3)
-                    }
-                    response_status_code = 200 # OK
-                    logger.info(f"({request_id}) REST: Transcription successful. Duration: {total_audio_duration_s:.2f}s, ASR time: {asr_processing_time_s:.2f}s.")
+                        if resolved_strategy == ProcessingStrategy.CHUNKED:
+                            segments, asr_processing_time_s = await _transcribe_chunked_waveform(
+                                waveform=waveform_tensor,
+                                client_config=client_config_rest,
+                                request_id=f"REST-{request_id}",
+                            )
+                        else:
+                            # FULL: feed the entire waveform to NeMo's transcribe in one call.
+                            hypotheses_list, asr_processing_time_s = await _perform_asr_transcription(
+                                asr_model_instance=asr_model,
+                                audio_input_list=[waveform_tensor],
+                                batch_size_for_transcribe_call=client_config_rest["batch_size"],
+                                num_asr_workers=NUM_WORKERS,
+                                request_id=f"REST-{request_id}"
+                            )
+                            # Single, non-chunked audio file → offset is 0.0 for all hypotheses.
+                            segments = _process_hypotheses_to_segments(
+                                hypotheses_list,
+                                [0.0] * (len(hypotheses_list) if hypotheses_list else 0),
+                                request_id
+                            )
+
+                        full_transcribed_text = " ".join(s['text'] for s in segments).strip()
+                        total_server_processing_time_s = round(time.time() - start_time_total_request_processing, 3)
+
+                        final_response_content = {
+                            "text": full_transcribed_text,
+                            "segments": segments,
+                            "language": "en",
+                            "strategy": resolved_strategy.value,
+                            "transcription_time_seconds": round(asr_processing_time_s, 3),
+                            "total_request_time_server_seconds": total_server_processing_time_s,
+                            "csv_content": generate_csv_content(segments),
+                            "srt_content": generate_srt_content(segments),
+                            "audio_duration_seconds": round(total_audio_duration_s, 3)
+                        }
+                        response_status_code = 200
+                        logger.info(
+                            f"({request_id}) REST: Transcription successful (strategy={resolved_strategy.value}). "
+                            f"Duration: {total_audio_duration_s:.2f}s, ASR time: {asr_processing_time_s:.2f}s, segments: {len(segments)}."
+                        )
 
             except Exception as e_locked_rest_processing:
                 logger.error(f"({request_id}) REST: Error occurred during locked ASR processing: {e_locked_rest_processing}", exc_info=True)

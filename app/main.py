@@ -245,6 +245,16 @@ try:
                 if "greedy" in cfg:
                     with open_dict(cfg.greedy):
                         cfg.greedy.use_cuda_graph_decoder = False
+                # When USE_STATEFUL_CHUNKED is on, BatchedFrameASRTDT.transcribe()
+                # needs hyp.alignments populated for its middle-token merge —
+                # which only happens when preserve_alignments=True. Also force
+                # strategy="greedy" because greedy_batch doesn't produce per-hyp
+                # alignment arrays the merger needs (per NeMo's reference
+                # speech_to_text_buffered_infer_rnnt.py:239).
+                if USE_STATEFUL_CHUNKED:
+                    cfg.strategy = "greedy"
+                    cfg.preserve_alignments = True
+                    cfg.fused_batch_size = -1
             asr_model.change_decoding_strategy(cfg, verbose=False)
             inferer = asr_model.decoding.decoding
             computer = getattr(inferer, "decoding_computer", None)

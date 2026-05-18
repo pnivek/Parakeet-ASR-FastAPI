@@ -201,57 +201,37 @@ try:
         except Exception as e_chunk:
             logger.warning(f"change_subsampling_conv_chunking_factor(1) at load failed: {e_chunk}")
 
-        # Disable CUDA graphs on the (TDT) decoder. NeMo 2.7.3 enables them by
-        # default (use_cuda_graph_decoder=True). Captured graphs replay with
-        # tensor pointers from the first call; the streaming endpoint hits
-        # cudaErrorIllegalAddress inside batched_hyps.scores.cpu() when the
-        # replay touches stale memory. Walk every plausible path and report
-        # the final cuda_graphs_mode so we can verify it actually stuck.
-        _cg_paths_tried = []
+        # Disable CUDA graphs at the CONFIG level. Runtime patches on the
+        # decoding_computer don't survive — NeMo's transcribe(timestamps=True)
+        # internally toggles cfg.decoding.compute_timestamps and re-runs
+        # change_decoding_strategy(), which REBUILDS the decoder from config.
+        # The rebuilt computer gets use_cuda_graph_decoder=True (default) and
+        # the FULL_GRAPH mode comes back on the first transcribe.
+        #
+        # Fix at the durable layer: edit the config + apply now so any future
+        # rebuild keeps cuda graphs off. Also pre-set compute_timestamps=True
+        # so transcribe(timestamps=True) doesn't trigger the internal rebuild
+        # on the first call (would otherwise hit a brief inconsistent state).
         try:
-            inferer = asr_model.decoding.decoding  # GreedyBatchedTDTInfer
-            try:
-                inferer.disable_cuda_graphs()
-                _cg_paths_tried.append("inferer.disable_cuda_graphs()")
-            except Exception as e:
-                _cg_paths_tried.append(f"inferer.disable_cuda_graphs() FAILED: {e}")
+            from omegaconf import open_dict
+            cfg = asr_model.cfg.decoding
+            with open_dict(cfg):
+                cfg.compute_timestamps = True
+                if "greedy" in cfg:
+                    with open_dict(cfg.greedy):
+                        cfg.greedy.use_cuda_graph_decoder = False
+            asr_model.change_decoding_strategy(cfg, verbose=False)
+            inferer = asr_model.decoding.decoding
             computer = getattr(inferer, "decoding_computer", None)
-            if computer is not None:
-                # The critical step: disable_cuda_graphs() only sets mode=None,
-                # but maybe_enable_cuda_graphs() runs inside transcribe() and
-                # re-enables it on next call unless allow_cuda_graphs is False.
-                # Verified by GET /v1/debug/state across transcribes — mode
-                # was getting flipped from None → FULL_GRAPH after the first
-                # transcribe regardless of our disable call.
-                try:
-                    if hasattr(computer, "allow_cuda_graphs"):
-                        computer.allow_cuda_graphs = False
-                        _cg_paths_tried.append("computer.allow_cuda_graphs = False")
-                except Exception as e:
-                    _cg_paths_tried.append(f"allow_cuda_graphs assign failed: {e}")
-                try:
-                    if hasattr(computer, "force_cuda_graphs_mode"):
-                        computer.force_cuda_graphs_mode(None)
-                        _cg_paths_tried.append("computer.force_cuda_graphs_mode(None)")
-                    elif hasattr(computer, "cuda_graphs_mode"):
-                        computer.cuda_graphs_mode = None
-                        _cg_paths_tried.append("computer.cuda_graphs_mode = None")
-                except Exception as e:
-                    _cg_paths_tried.append(f"computer force failed: {e}")
-                final_mode = getattr(computer, "cuda_graphs_mode", "<unset>")
-                final_allow = getattr(computer, "allow_cuda_graphs", "<unset>")
-                logger.info(
-                    f"CUDA graphs disable: tried {_cg_paths_tried}; "
-                    f"final cuda_graphs_mode={final_mode!r}, "
-                    f"allow_cuda_graphs={final_allow!r}"
-                )
-            else:
-                logger.info(
-                    f"CUDA graphs disable: tried {_cg_paths_tried}; "
-                    f"no decoding_computer attribute"
-                )
+            final_mode = getattr(computer, "cuda_graphs_mode", "<no computer>")
+            final_allow = getattr(computer, "allow_cuda_graphs", "<no computer>")
+            logger.info(
+                f"Decoding strategy reapplied with use_cuda_graph_decoder=False, "
+                f"compute_timestamps=True. cuda_graphs_mode={final_mode!r}, "
+                f"allow_cuda_graphs={final_allow!r}"
+            )
         except Exception as e_cg:
-            logger.warning(f"disable_cuda_graphs at load failed: {e_cg}")
+            logger.warning(f"config-level cuda-graph disable failed: {e_cg}", exc_info=True)
 
         # Globals now reflect the pinned resting state, not where NeMo first put it.
         global_original_model_device_str = str(next(asr_model.parameters()).device)

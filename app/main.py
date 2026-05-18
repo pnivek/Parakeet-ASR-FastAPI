@@ -277,10 +277,18 @@ async def _apply_model_settings_for_session(
         logger.debug(f"({request_id}) Session: Model temporarily set to float32 before structural changes.")
 
     # 3. Apply/Ensure attention and subsampling settings based on decision_duration_s (model is currently float32)
+    # change_attention_model in NeMo creates new attention / positional encoding
+    # modules with their parameters on CPU by default. Pass device= so they land
+    # on the session device — otherwise forward mixes CPU and CUDA tensors and
+    # the next CUDA op fails with `cudaErrorIllegalAddress`.
+    session_device_torch = torch.device(target_processing_device)
     if decision_duration_s > long_audio_threshold_config:
         logger.info(f"({request_id}) Session: Decision duration {decision_duration_s:.2f}s > threshold {long_audio_threshold_config:.2f}s. Applying long audio settings.")
         try:
-            await asyncio.to_thread(asr_model.change_attention_model, "rel_pos_local_attn", [256, 256])
+            await asyncio.to_thread(
+                asr_model.change_attention_model,
+                "rel_pos_local_attn", [256, 256], True, session_device_torch,
+            )
             await asyncio.to_thread(asr_model.change_subsampling_conv_chunking_factor, 1)
             long_audio_settings_activated_for_session = True
             logger.debug(f"({request_id}) Session: Long audio settings (attention: rel_pos_local_attn, subsampling_factor: 1) applied.")
@@ -289,7 +297,10 @@ async def _apply_model_settings_for_session(
     else:
         logger.info(f"({request_id}) Session: Decision duration {decision_duration_s:.2f}s <= threshold {long_audio_threshold_config:.2f}s. Ensuring short audio settings.")
         try:
-            await asyncio.to_thread(asr_model.change_attention_model, "rel_pos") # Default attention
+            await asyncio.to_thread(
+                asr_model.change_attention_model,
+                "rel_pos", None, True, session_device_torch,
+            )
             # subsampling_conv_chunking_factor=1 (auto) avoids a NeMo 2.7.3 bug where
             # the value -1 routes into a forward path that calls MaskedConvSequential(x)
             # without the required `lengths` arg. With 1, the auto path passes `lengths`
@@ -340,7 +351,12 @@ async def _revert_model_to_global_original_state(
                     await asyncio.to_thread(asr_model.to, dtype=torch.float32)
                     logger.debug(f"({request_id}) End of Session: Model temporarily set to float32 for reverting structural changes.")
 
-                await asyncio.to_thread(asr_model.change_attention_model, "rel_pos")
+                # Pass device= so new attention modules land on the session device,
+                # not CPU. See _apply_model_settings_for_session for the full rationale.
+                await asyncio.to_thread(
+                    asr_model.change_attention_model,
+                    "rel_pos", None, True, torch.device(session_processing_device),
+                )
                 # subsampling_conv_chunking_factor=1 (auto), not -1: see comment in
                 # _apply_model_settings_for_session for the NeMo 2.7.3 bug avoided here.
                 await asyncio.to_thread(asr_model.change_subsampling_conv_chunking_factor, 1)

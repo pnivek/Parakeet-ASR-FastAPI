@@ -217,9 +217,18 @@ try:
                 _cg_paths_tried.append(f"inferer.disable_cuda_graphs() FAILED: {e}")
             computer = getattr(inferer, "decoding_computer", None)
             if computer is not None:
-                # Force the underlying label-looping computer's mode to None.
-                # disable_cuda_graphs() above should already do this, but it's
-                # cheap and definitive insurance.
+                # The critical step: disable_cuda_graphs() only sets mode=None,
+                # but maybe_enable_cuda_graphs() runs inside transcribe() and
+                # re-enables it on next call unless allow_cuda_graphs is False.
+                # Verified by GET /v1/debug/state across transcribes — mode
+                # was getting flipped from None → FULL_GRAPH after the first
+                # transcribe regardless of our disable call.
+                try:
+                    if hasattr(computer, "allow_cuda_graphs"):
+                        computer.allow_cuda_graphs = False
+                        _cg_paths_tried.append("computer.allow_cuda_graphs = False")
+                except Exception as e:
+                    _cg_paths_tried.append(f"allow_cuda_graphs assign failed: {e}")
                 try:
                     if hasattr(computer, "force_cuda_graphs_mode"):
                         computer.force_cuda_graphs_mode(None)
@@ -230,9 +239,11 @@ try:
                 except Exception as e:
                     _cg_paths_tried.append(f"computer force failed: {e}")
                 final_mode = getattr(computer, "cuda_graphs_mode", "<unset>")
+                final_allow = getattr(computer, "allow_cuda_graphs", "<unset>")
                 logger.info(
                     f"CUDA graphs disable: tried {_cg_paths_tried}; "
-                    f"final decoding_computer.cuda_graphs_mode={final_mode!r}"
+                    f"final cuda_graphs_mode={final_mode!r}, "
+                    f"allow_cuda_graphs={final_allow!r}"
                 )
             else:
                 logger.info(

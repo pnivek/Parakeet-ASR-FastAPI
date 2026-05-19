@@ -1,115 +1,155 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { TranscriptionResponse } from './lib/api'
+import { Atmosphere } from './components/Atmosphere'
+import { Header } from './components/Header'
+import { ModeSegmented, type InputMode } from './components/ModeSegmented'
 import { FileUploadPanel } from './components/FileUploadPanel'
 import { LiveCapturePanel } from './components/LiveCapturePanel'
+import { UrlInputPanel } from './components/UrlInputPanel'
 import { SettingsPanel } from './components/SettingsPanel'
+import { NowPlayingCard } from './components/NowPlayingCard'
 import { OutputView } from './components/OutputView'
-import { ThemeToggle } from './components/ThemeToggle'
-import { setAudioFile, seek, useAudioContainer, useCurrentTime } from './lib/playback'
+import { setAudioFile, useAudioContainer, useCurrentTime } from './lib/playback'
+import { computePeaks } from './lib/peaks'
+import type { StreamState } from './components/StatusDot'
+import { formatBytes } from './lib/format'
 import './App.css'
 
-type Mode = 'file' | 'live'
-
 export default function App() {
-  const [mode, setMode] = useState<Mode>('file')
+  const [mode, setMode] = useState<InputMode>('file')
   const [result, setResult] = useState<TranscriptionResponse | null>(null)
-  const [filename, setFilename] = useState<string | null>(null)
+  const [filename, setFilename] = useState<string>('')
+  const [fileMeta, setFileMeta] = useState<string>('')
+  const [peaks, setPeaks] = useState<number[] | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
 
-  const playerRef = useRef<HTMLDivElement>(null)
-  useAudioContainer(playerRef)
+  // Singleton <audio> mount point — `display: none`, the visual transport
+  // lives in NowPlayingCard.
+  const audioMountRef = useRef<HTMLDivElement>(null)
+  useAudioContainer(audioMountRef)
   const currentTime = useCurrentTime()
+
+  // After a new audio source is set, compute waveform peaks in the background.
+  const computeFor = async (file: Blob) => {
+    setPeaks(null)
+    try {
+      const p = await computePeaks(file, 220)
+      setPeaks(p)
+    } catch (e) {
+      // Audio formats that the browser can't decode (e.g. some webm/opus
+      // edge cases) still play fine via <audio>, just no waveform.
+      console.warn('Peak compute failed:', e)
+      setPeaks(null)
+    }
+  }
+
+  // Derive state for status pill from busy + result.
+  const state: StreamState = error
+    ? 'error'
+    : busy
+      ? 'streaming'
+      : result
+        ? 'done'
+        : 'idle'
+
+  const handleFileResult = (file: File, r: TranscriptionResponse) => {
+    setFilename(file.name)
+    setFileMeta(`${formatBytes(file.size)} · ${file.type || 'audio'}`)
+    setResult(r)
+    setError(null)
+    setAudioFile(file)
+    computeFor(file)
+  }
+
+  const handleUrlResult = (name: string, r: TranscriptionResponse) => {
+    // URL mode: the audio plays from the original URL (no client file). We
+    // still skip peaks since we don't have the bytes locally without re-fetch.
+    setFilename(name)
+    setFileMeta('via URL')
+    setResult(r)
+    setError(null)
+    setAudioFile(null)
+    setPeaks(null)
+  }
+
+  // Result words drive the floating word pill above the waveform.
+  const words = result && result.format === 'verbose_json' ? result.body.words : undefined
+
+  // Title for the Now Playing card: the filename, with a sensible default
+  // before the first transcription completes.
+  const npTitle = filename || 'Drop audio or hit record'
+
+  // Clear the busy flag when error appears.
+  useEffect(() => {
+    if (error) setBusy(false)
+  }, [error])
 
   return (
     <div className="app">
-      <header className="app__header">
-        <div className="app__title">
-          <h1>Parakeet ASR</h1>
-          <p className="app__tagline">
-            OpenAI Whisper-compatible API · <code>nvidia/parakeet-tdt-0.6b-v2</code>
-          </p>
-        </div>
-        <ThemeToggle />
-      </header>
+      <Atmosphere />
+      <Header state={state} />
 
-      <main className="app__main">
-        <div className="app__left">
-          <div className="modeswitch" role="tablist" aria-label="Input source">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={mode === 'file'}
-              className={mode === 'file' ? 'modeswitch__btn modeswitch__btn--active' : 'modeswitch__btn'}
-              onClick={() => setMode('file')}
-            >
-              File
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={mode === 'live'}
-              className={mode === 'live' ? 'modeswitch__btn modeswitch__btn--active' : 'modeswitch__btn'}
-              onClick={() => setMode('live')}
-            >
-              Live mic
-            </button>
-          </div>
-          {mode === 'file' ? (
+      <main className="shell">
+        <div className="shell__main">
+          <NowPlayingCard
+            title={npTitle}
+            meta={fileMeta}
+            words={words}
+            peaks={peaks}
+            state={state}
+          />
+
+          {error && <div className="error">{error}</div>}
+
+          {result && !error && (
+            <OutputView result={result} filename={filename || 'transcript'} currentTime={currentTime} />
+          )}
+
+          {!result && !error && (
+            <section className="glass output">
+              <div className="empty">
+                <p>Pick a file, paste a URL, or record live — the transcription appears here.</p>
+              </div>
+            </section>
+          )}
+        </div>
+
+        <aside className="shell__inspector">
+          <ModeSegmented mode={mode} onChange={setMode} />
+
+          {mode === 'file' && (
             <FileUploadPanel
-              onResult={(file, r) => {
-                setFilename(file.name)
-                setResult(r)
-                setError(null)
-                setAudioFile(file)
-              }}
-              onError={(msg) => {
-                setError(msg)
-              }}
+              onResult={handleFileResult}
+              onError={(msg) => setError(msg)}
+              onBusyChange={setBusy}
             />
-          ) : (
+          )}
+          {mode === 'mic' && (
             <LiveCapturePanel
               onPartial={(r) => {
                 setResult(r)
                 setError(null)
               }}
-              onResult={(file, r) => {
-                setFilename(file.name)
-                setResult(r)
-                setError(null)
-                setAudioFile(file)
-              }}
-              onError={(msg) => {
-                setError(msg)
-              }}
+              onResult={(file, r) => handleFileResult(file, r)}
+              onError={(msg) => setError(msg)}
+              onBusyChange={setBusy}
             />
           )}
-          <SettingsPanel />
-        </div>
+          {mode === 'url' && (
+            <UrlInputPanel
+              onResult={handleUrlResult}
+              onError={(msg) => setError(msg)}
+              onBusyChange={setBusy}
+            />
+          )}
 
-        <div className="app__right">
-          {error && (
-            <div className="error">
-              <strong>Error:</strong> {error}
-            </div>
-          )}
-          {!result && !error && (
-            <div className="empty">
-              <p>Drop a file on the left, choose a response format, hit Transcribe.</p>
-            </div>
-          )}
-          {result && (
-            <>
-              {filename && (
-                <div className="result-filename">
-                  <span>{filename}</span>
-                </div>
-              )}
-              <div ref={playerRef} className="player" />
-              <OutputView result={result} currentTime={currentTime} onSeek={seek} />
-            </>
-          )}
-        </div>
+          <SettingsPanel />
+        </aside>
       </main>
+
+      {/* Hidden audio host — singleton survives parent re-renders. */}
+      <div ref={audioMountRef} style={{ position: 'absolute', width: 0, height: 0, overflow: 'hidden' }} />
     </div>
   )
 }

@@ -1,41 +1,45 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { connectLiveWS, type LiveWSHandle, type TranscriptionResponse } from '../lib/api'
 import { MIC_FORMAT_HINT, MIC_SAMPLE_RATE, MIC_MIME_TYPE, useMic } from '../lib/mic'
 import { useSettings } from '../lib/settings'
 import type { WhisperSegment, WSMessage } from '../lib/types'
+import { formatTime } from '../lib/format'
 
 interface Props {
-  /** Called when a final transcription arrives (or stream is stopped). */
   onResult: (audio: File, result: TranscriptionResponse) => void
-  /** Called on each segments_batch — drives the live-incremental view. */
   onPartial: (result: TranscriptionResponse) => void
-  /** Called on any unrecoverable error. */
   onError: (message: string) => void
+  onBusyChange?: (busy: boolean) => void
 }
 
-/**
- * Microphone capture + live WS transcription.
- *
- * Browser captures audio via MediaRecorder(webm/opus). Each timeslice blob
- * is forwarded to the WS as a binary frame. Server responds with
- * `segments_batch` mid-stream and `final_transcription` at EOF.
- *
- * We also accumulate the chunks locally so that after recording stops we
- * hand the parent a File for the audio player — letting the user replay
- * what they just spoke and click segments to seek, same UX as file upload.
- */
-export function LiveCapturePanel({ onResult, onPartial, onError }: Props) {
+const MicIcon = ({ size = 28 }: { size?: number }) => (
+  <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+    <rect x="9" y="3" width="6" height="12" rx="3" />
+    <path d="M5 11a7 7 0 0 0 14 0" />
+    <path d="M12 18v3" />
+  </svg>
+)
+const BoltIcon = () => (
+  <svg viewBox="0 0 24 24" width={12} height={12} fill="currentColor" aria-hidden>
+    <path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z" />
+  </svg>
+)
+
+const LEVEL_BARS = 28
+
+export function LiveCapturePanel({ onResult, onPartial, onError, onBusyChange }: Props) {
   const settings = useSettings()
   const wsRef = useRef<LiveWSHandle | null>(null)
   const segmentsRef = useRef<WhisperSegment[]>([])
   const chunksRef = useRef<Blob[]>([])
   const recordStartRef = useRef<number>(0)
   const [segmentCount, setSegmentCount] = useState(0)
+  const [elapsed, setElapsed] = useState(0)
 
   const buildPartialResult = useCallback((): TranscriptionResponse => {
     const segs = segmentsRef.current
     const lastEnd = segs.length > 0 ? segs[segs.length - 1].end : 0
-    const elapsed = (Date.now() - recordStartRef.current) / 1000
+    const wall = (Date.now() - recordStartRef.current) / 1000
     return {
       format: 'verbose_json',
       body: {
@@ -45,7 +49,7 @@ export function LiveCapturePanel({ onResult, onPartial, onError }: Props) {
         text: segs.map((s) => s.text).join(' ').trim(),
         segments: segs,
         strategy: 'progressive',
-        transcription_time_seconds: elapsed,
+        transcription_time_seconds: wall,
       },
     }
   }, [])
@@ -59,7 +63,6 @@ export function LiveCapturePanel({ onResult, onPartial, onError }: Props) {
           onPartial(buildPartialResult())
           break
         case 'refined_transcription':
-          // EOF full pass — replace segments with the higher-quality refinement.
           segmentsRef.current = msg.segments
           setSegmentCount(msg.segments.length)
           onPartial({
@@ -78,7 +81,7 @@ export function LiveCapturePanel({ onResult, onPartial, onError }: Props) {
         case 'final_transcription': {
           const blob = new Blob(chunksRef.current, { type: MIC_MIME_TYPE })
           const file = new File([blob], `mic-${Date.now()}.webm`, { type: MIC_MIME_TYPE })
-          const result: TranscriptionResponse = {
+          onResult(file, {
             format: 'verbose_json',
             body: {
               task: 'transcribe',
@@ -91,8 +94,7 @@ export function LiveCapturePanel({ onResult, onPartial, onError }: Props) {
               csv_content: msg.csv_content,
               srt_content: msg.srt_content,
             },
-          }
-          onResult(file, result)
+          })
           break
         }
         case 'error':
@@ -118,10 +120,25 @@ export function LiveCapturePanel({ onResult, onPartial, onError }: Props) {
     },
   })
 
+  const recording = mic.state === 'recording'
+  const busy = mic.state === 'starting' || mic.state === 'stopping'
+
+  useEffect(() => {
+    onBusyChange?.(recording || busy)
+  }, [recording, busy, onBusyChange])
+
+  useEffect(() => {
+    if (!recording) return
+    const t0 = recordStartRef.current
+    const i = setInterval(() => setElapsed((Date.now() - t0) / 1000), 100)
+    return () => clearInterval(i)
+  }, [recording])
+
   const start = useCallback(async () => {
     segmentsRef.current = []
     chunksRef.current = []
     setSegmentCount(0)
+    setElapsed(0)
     recordStartRef.current = Date.now()
 
     const ws = connectLiveWS(
@@ -157,41 +174,107 @@ export function LiveCapturePanel({ onResult, onPartial, onError }: Props) {
     mic.stop()
   }, [mic])
 
-  const recording = mic.state === 'recording'
-  const busy = mic.state === 'starting' || mic.state === 'stopping'
+  // Stable per-mount jitter for the level bars so they don't look like a
+  // uniform sine wave on quiet input.
+  const jitterRef = useRef<number[]>([])
+  if (jitterRef.current.length !== LEVEL_BARS) {
+    jitterRef.current = Array.from({ length: LEVEL_BARS }, () => Math.random() * 0.5 + 0.5)
+  }
+  const lvl = mic.level
 
   return (
-    <section className="drop">
-      <div className="drop__file">
-        <div className="drop__filename">Live microphone</div>
-        <div className="drop__filemeta">
-          {mic.state === 'idle' && 'Click record to start capturing.'}
-          {mic.state === 'starting' && 'Requesting microphone access…'}
-          {mic.state === 'recording' && `Recording · ${segmentCount} segment${segmentCount === 1 ? '' : 's'} so far`}
-          {mic.state === 'stopping' && 'Finalizing transcription…'}
-          {mic.state === 'error' && mic.error}
-        </div>
-        <div className="drop__actions">
-          {!recording && (
-            <button type="button" onClick={start} disabled={busy} className="primary">
-              {busy ? 'Working…' : 'Record'}
-            </button>
-          )}
-          {recording && (
-            <button type="button" onClick={stop} disabled={busy}>
-              Stop
-            </button>
-          )}
-        </div>
-        {(recording || busy) && (
-          <div className="mic-meter" aria-label="microphone level">
-            <div
-              className="mic-meter__bar"
-              style={{ width: `${Math.min(100, Math.round(mic.level * 140))}%` }}
-            />
+    <section className="glass input-card" style={{ padding: '20px 18px 18px' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14, padding: '8px 0 4px' }}>
+        <button
+          type="button"
+          className={recording ? 'mic-button mic-button--recording pk-glow-btn' : 'mic-button pk-glow-btn'}
+          onClick={() => (recording ? stop() : start())}
+          disabled={busy}
+          aria-label={recording ? 'Stop recording' : 'Start recording'}
+          style={
+            {
+              ['--btn-accent' as never]: 'var(--accent)',
+              ['--top-hl' as never]: recording ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.2)',
+              ['--stroke-pct' as never]: recording ? '55%' : '50%',
+              ['--bottom-pct' as never]: recording ? '0%' : '22%',
+              ['--glow-r' as never]: '24px',
+              ['--glow-pct' as never]: recording ? '55%' : '10%',
+            } as React.CSSProperties
+          }
+        >
+          {recording ? <span className="mic-button__square" /> : <MicIcon />}
+          {recording && <span className="mic-button__halo" aria-hidden />}
+        </button>
+        <div style={{ textAlign: 'center' }}>
+          <div className="mic-status">
+            {mic.state === 'idle' && 'READY'}
+            {mic.state === 'starting' && 'CONNECTING'}
+            {mic.state === 'recording' && 'RECORDING'}
+            {mic.state === 'stopping' && 'FINALIZING'}
+            {mic.state === 'error' && 'ERROR'}
           </div>
-        )}
+          <div className="mic-timer" style={{ color: recording ? 'var(--accent)' : 'var(--fg-dim)' }}>
+            {formatTime(elapsed)}
+          </div>
+        </div>
       </div>
+
+      <div style={{ marginTop: 14 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+          <span className="mono" style={{ fontSize: 9.5, color: 'var(--muted-deep)', letterSpacing: 0.6 }}>
+            INPUT LEVEL
+          </span>
+          <span className="mono" style={{ fontSize: 9.5, color: 'var(--muted)', letterSpacing: 0.3 }}>
+            {recording ? `${Math.round(lvl * 100)}%` : 'idle'}
+          </span>
+        </div>
+        <div className="mic-meter">
+          {jitterRef.current.map((jit, i) => {
+            const k = i / (LEVEL_BARS - 1)
+            // Bars from left to right grow with the level; jitter prevents a perfect ramp.
+            const h = recording ? Math.max(8, Math.min(100, lvl * 100 * jit * (k * 0.6 + 0.7))) : 18
+            const hot = recording && lvl * jit > 0.7
+            const cls = !recording
+              ? 'mic-meter__bar'
+              : hot
+                ? 'mic-meter__bar mic-meter__bar--hot'
+                : 'mic-meter__bar mic-meter__bar--on'
+            return <div key={i} className={cls} style={{ height: `${h}%` }} />
+          })}
+        </div>
+      </div>
+
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          marginTop: 14,
+          padding: '8px 10px',
+          borderRadius: 8,
+          background: 'rgba(255,255,255,0.022)',
+          border: '1px solid var(--border-soft)',
+        }}
+      >
+        <BoltIcon />
+        <span style={{ fontSize: 11.5, color: 'var(--fg-dim)' }}>Segments captured</span>
+        <span
+          className="mono"
+          style={{
+            marginLeft: 'auto',
+            fontSize: 12,
+            fontWeight: 500,
+            color: recording ? 'var(--accent)' : 'var(--muted)',
+          }}
+        >
+          {segmentCount}
+        </span>
+      </div>
+      {mic.state === 'error' && mic.error && (
+        <div className="error" style={{ marginTop: 12 }}>
+          {mic.error}
+        </div>
+      )}
     </section>
   )
 }

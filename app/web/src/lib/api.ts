@@ -128,6 +128,79 @@ export function postTranscription(
   })
 }
 
+/**
+ * POST /v1/audio/transcriptions with a `url` form field instead of a file.
+ * The server fetches the audio from the URL and runs it through the same
+ * pipeline. Same response semantics as `postTranscription`.
+ */
+export function postTranscriptionUrl(
+  url: string,
+  params: PostParams = {},
+  options: Omit<PostOptions, 'onProgress'> = {},
+): Promise<TranscriptionResponse> {
+  const responseFormat: ResponseFormat = params.response_format ?? 'json'
+
+  return new Promise((resolve, reject) => {
+    const queryParts: string[] = []
+    if (params.strategy) queryParts.push(`strategy=${encodeURIComponent(params.strategy)}`)
+    if (params.chunk_length !== undefined) queryParts.push(`chunk_length=${params.chunk_length}`)
+    if (params.chunk_overlap !== undefined) queryParts.push(`chunk_overlap=${params.chunk_overlap}`)
+    if (params.batch_size !== undefined) queryParts.push(`batch_size=${params.batch_size}`)
+    if (params.long_audio_threshold !== undefined)
+      queryParts.push(`long_audio_threshold=${params.long_audio_threshold}`)
+    const query = queryParts.length ? `?${queryParts.join('&')}` : ''
+
+    const formData = new FormData()
+    formData.append('url', url)
+    if (params.model) formData.append('model', params.model)
+    if (params.language) formData.append('language', params.language)
+    if (params.prompt) formData.append('prompt', params.prompt)
+    formData.append('response_format', responseFormat)
+    if (params.temperature !== undefined) formData.append('temperature', String(params.temperature))
+    if (params.timestamp_granularities) {
+      for (const g of params.timestamp_granularities) {
+        formData.append('timestamp_granularities[]', g)
+      }
+    }
+
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `/v1/audio/transcriptions${query}`)
+    xhr.responseType = 'text'
+    if (options.signal) {
+      if (options.signal.aborted) {
+        xhr.abort()
+        reject(new DOMException('aborted', 'AbortError'))
+        return
+      }
+      options.signal.addEventListener('abort', () => xhr.abort(), { once: true })
+    }
+    xhr.onerror = () => reject(new Error('Network error contacting /v1/audio/transcriptions'))
+    xhr.onabort = () => reject(new DOMException('aborted', 'AbortError'))
+    xhr.onload = () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        reject(new Error(`POST returned ${xhr.status}: ${xhr.responseText.slice(0, 400)}`))
+        return
+      }
+      const isJsonFormat = responseFormat === 'json' || responseFormat === 'verbose_json'
+      if (isJsonFormat) {
+        try {
+          const body = JSON.parse(xhr.responseText)
+          if (responseFormat === 'verbose_json') {
+            resolve({ format: 'verbose_json', body: body as VerboseJsonResponse })
+          } else {
+            resolve({ format: 'json', body: body as CompactJsonResponse })
+          }
+        } catch (e) {
+          reject(new Error(`Failed to parse JSON response: ${e}`))
+        }
+      } else {
+        resolve({ format: responseFormat, body: xhr.responseText })
+      }
+    }
+    xhr.send(formData)
+  })
+}
+
 /** WS callbacks. `onMessage` runs on every JSON-typed frame; binary frames are ignored. */
 export interface WSCallbacks {
   onOpen?: () => void

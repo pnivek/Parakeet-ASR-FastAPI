@@ -529,7 +529,21 @@ async def _revert_model_to_global_original_state(
             except Exception as e_rev_long_specific:
                 logger.warning(f"({request_id}) End of Session: Failed to revert long-audio attention: {e_rev_long_specific}")
 
-        if session_processing_device == "cuda" and torch.cuda.is_available():
+        # Historical cargo-cult call — torch.cuda.empty_cache() between
+        # transcribes is fatal when NeMo's CUDA-graph decoder is on. The
+        # captured graph holds raw pointers into LabelLoopingState's static
+        # buffers; empty_cache releases the underlying caching-allocator
+        # blocks, so the next graph replay reads freed/reused memory and
+        # the kernel hits cudaErrorIllegalAddress (NeMo issue #14727).
+        # PyTorch's caching allocator already releases unreferenced
+        # blocks under pressure, so we only gc/empty_cache when graphs
+        # are off AND we're on CUDA. Even then it's optional — kept here
+        # so the legacy path stays bit-identical to its previous behavior.
+        if (
+            not USE_CUDA_GRAPHS
+            and session_processing_device == "cuda"
+            and torch.cuda.is_available()
+        ):
             await _run_on_asr_executor(gc.collect)
             await _run_on_asr_executor(torch.cuda.empty_cache)
     except Exception as e_restore_globally:
@@ -1501,9 +1515,16 @@ async def handle_streaming_pcm(
             )
             accumulated_asr_processing_time_s += asr_call_duration_s
             
-            # Clear CUDA cache periodically if using CUDA to manage memory
-            if processing_device == "cuda" and torch.cuda.is_available():
-                await asyncio.to_thread(torch.cuda.empty_cache)
+            # Clear CUDA cache periodically if using CUDA to manage memory.
+            # Skip when CUDA graphs are on — see _revert_model_to_global_original_state
+            # for the full explanation. Calling empty_cache between batches
+            # would tear down the static buffers the graph captured.
+            if (
+                not USE_CUDA_GRAPHS
+                and processing_device == "cuda"
+                and torch.cuda.is_available()
+            ):
+                await _run_on_asr_executor(torch.cuda.empty_cache)
 
             if hypotheses_list:
                 segments_from_batch = _process_hypotheses_to_segments(

@@ -1639,14 +1639,15 @@ async def handle_streaming_pcm(
                     f"Total segments generated and queued/sent: {len(sent_segments_pcm)}.")
 
     # Main execution block for handle_streaming_pcm
-    # The stateful engine needs (greedy, preserve_alignments=True) — swap the
-    # decoder before launching producer/consumer, revert in finally. This is
-    # a no-op for the legacy path.
+    # The LEGACY stateful engine (StreamingTdtEngine) needs the swapped decoder
+    # (greedy + preserve_alignments=True) to drive BatchedFrameASRTDT. The v2
+    # engine uses the DEFAULT greedy_batch decoder (which has decoding_computer
+    # for prev_batched_state). Skip the swap when v2 is active.
     saved_decoder_state: Optional[dict] = None
     try:
-        if use_stateful_progressive and asr_model is not None:
+        if use_stateful_progressive and not use_v2_engine and asr_model is not None:
             saved_decoder_state = await _swap_decoder_to_stateful_tdt()
-            logger.info(f"({session_id}) Stream: decoder swapped to (greedy, preserve_alignments=True) for stateful engine.")
+            logger.info(f"({session_id}) Stream: decoder swapped to (greedy, preserve_alignments=True) for legacy stateful engine.")
         logger.info(f"({session_id}) Streaming Pipeline (ffmpeg-based): Starting producer and consumer tasks.")
         # Run producer and consumer concurrently
         await asyncio.gather(producer(), consumer())
@@ -2647,27 +2648,27 @@ async def _transcribe_chunked_v2(
         else waveform.to(dtype=torch.float32).contiguous().cpu().numpy()
     )
 
-    saved = await _swap_decoder_to_stateful_tdt()
-    try:
-        def _run() -> Tuple[List[dict], float]:
-            engine = StreamingPrevBatchedEngine(
-                asr_model_instance=asr_model,
-                chunk_secs=chunk_secs,
-                left_context_secs=left_secs,
-                right_context_secs=right_secs,
-                request_id=request_id,
-            )
-            try:
-                engine.feed_float32(waveform_np)
-                engine.flush()
-                segs = engine.pop_final_segments()
-                return segs, engine.asr_time_s
-            finally:
-                engine.reset()
+    # v2 uses the DEFAULT greedy_batch decoder (which is what has
+    # decoding_computer with the captured CUDA graph). It does NOT need
+    # preserve_alignments=True — the v2 engine reads per-token timestamps
+    # directly off chunk_hyps.timestamps. So no decoder swap here.
+    def _run() -> Tuple[List[dict], float]:
+        engine = StreamingPrevBatchedEngine(
+            asr_model_instance=asr_model,
+            chunk_secs=chunk_secs,
+            left_context_secs=left_secs,
+            right_context_secs=right_secs,
+            request_id=request_id,
+        )
+        try:
+            engine.feed_float32(waveform_np)
+            engine.flush()
+            segs = engine.pop_final_segments()
+            return segs, engine.asr_time_s
+        finally:
+            engine.reset()
 
-        segments, asr_time = await _run_on_asr_executor(_run)
-    finally:
-        await _restore_decoder(saved)
+    segments, asr_time = await _run_on_asr_executor(_run)
 
     logger.info(
         f"({request_id}) chunked_v2: dur={audio_duration_s:.2f}s "

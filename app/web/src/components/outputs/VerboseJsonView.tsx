@@ -1,9 +1,10 @@
 import type { VerboseJsonResponse } from '../../lib/types'
 import { SegmentList } from '../SegmentList'
+import { WordTimeline } from '../WordTimeline'
 
 interface Props {
   body: VerboseJsonResponse
-  /** Current audio time, drives row highlighting + word timeline (Phase 4). */
+  /** Current audio time, drives row highlighting + word timeline. */
   currentTime?: number
   onSeek?: (t: number) => void
 }
@@ -33,6 +34,13 @@ export function VerboseJsonView({ body, currentTime, onSeek }: Props) {
           <summary>Plain text</summary>
           <p>{body.text}</p>
         </details>
+      )}
+
+      {body.words && body.words.length > 0 && (
+        <section>
+          <h4 className="output__subhead">Words ({body.words.length})</h4>
+          <WordTimeline words={body.words} currentTime={currentTime} />
+        </section>
       )}
 
       <SegmentList segments={body.segments} currentTime={currentTime} onSeek={onSeek} />

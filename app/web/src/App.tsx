@@ -1,14 +1,19 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import type { TranscriptionResponse } from './lib/api'
 import { FileUploadPanel } from './components/FileUploadPanel'
 import { SettingsPanel } from './components/SettingsPanel'
 import { OutputView } from './components/OutputView'
+import { setAudioFile, seek, useAudioContainer, useCurrentTime } from './lib/playback'
 import './App.css'
 
 export default function App() {
   const [result, setResult] = useState<TranscriptionResponse | null>(null)
   const [filename, setFilename] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+
+  const playerRef = useRef<HTMLDivElement>(null)
+  useAudioContainer(playerRef)
+  const currentTime = useCurrentTime()
 
   return (
     <div className="app">
@@ -26,8 +31,11 @@ export default function App() {
               setFilename(file.name)
               setResult(r)
               setError(null)
+              setAudioFile(file)
             }}
-            onError={(msg) => setError(msg)}
+            onError={(msg) => {
+              setError(msg)
+            }}
           />
           <SettingsPanel />
         </div>
@@ -44,10 +52,15 @@ export default function App() {
             </div>
           )}
           {result && (
-            <div>
-              {filename && <div className="result-filename">{filename}</div>}
-              <OutputView result={result} />
-            </div>
+            <>
+              {filename && (
+                <div className="result-filename">
+                  <span>{filename}</span>
+                </div>
+              )}
+              <div ref={playerRef} className="player" />
+              <OutputView result={result} currentTime={currentTime} onSeek={seek} />
+            </>
           )}
         </div>
       </main>

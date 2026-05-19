@@ -167,29 +167,52 @@ def tokens_to_words(
     return words
 
 
+def _avg_logprob(token_logprobs: List[Optional[float]]) -> Optional[float]:
+    """Mean of per-token log probabilities; None if any are missing (mixed
+    confidence vs no-confidence runs would otherwise produce misleading averages)."""
+    if not token_logprobs:
+        return None
+    valid = [lp for lp in token_logprobs if lp is not None]
+    if len(valid) != len(token_logprobs):
+        return None
+    return round(sum(valid) / len(valid), 4)
+
+
 def tokens_to_sentence_segments(
     token_ids: List[int],
     token_times_s: List[float],
     tokenizer,
     start_seg_id: int = 0,
+    token_logprobs: Optional[List[Optional[float]]] = None,
 ) -> List[dict]:
     """Group `(token_id, audio_time_s)` pairs into Whisper-shaped segments.
 
     Used by both the streaming engine and the single-pass `full` path so they
     produce identical segment formats. Sentences terminate on '.', '!', '?';
     a trailing partial sentence (no terminal punctuation) is flushed as the
-    last segment. Output matches OpenAI Whisper's `verbose_json` shape so
-    clients drop in.
+    last segment.
+
+    When `token_logprobs` is provided (a parallel list of per-token log
+    probabilities), each segment's `avg_logprob` is populated from the mean
+    of the tokens that make up that segment. If the decoder doesn't expose
+    per-token confidence (typical with FULL_GRAPH-mode CUDA graphs), pass
+    None — segments will have `avg_logprob: null`.
     """
     segments: List[dict] = []
     buf_ids: List[int] = []
+    buf_logprobs: List[Optional[float]] = []
     buf_start: Optional[float] = None
     buf_last_t: float = 0.0
     seg_id = start_seg_id
-    for tid, t_s in zip(token_ids, token_times_s):
+    n = len(token_ids)
+    for i in range(n):
+        tid = token_ids[i]
+        t_s = token_times_s[i]
+        lp = token_logprobs[i] if token_logprobs is not None else None
         if buf_start is None:
             buf_start = t_s
         buf_ids.append(tid)
+        buf_logprobs.append(lp)
         buf_last_t = t_s
         try:
             tok = tokenizer.ids_to_tokens([tid])[0]
@@ -198,16 +221,21 @@ def tokens_to_sentence_segments(
         if tok and tok[-1] in ".!?":
             text = tokenizer.ids_to_text(buf_ids).strip()
             if text:
-                segments.append(_whisper_segment(seg_id, buf_start, t_s, text, buf_ids))
+                segments.append(_whisper_segment(
+                    seg_id, buf_start, t_s, text, buf_ids,
+                    avg_logprob=_avg_logprob(buf_logprobs) if token_logprobs is not None else None,
+                ))
                 seg_id += 1
             buf_ids = []
+            buf_logprobs = []
             buf_start = None
     if buf_ids:
         text = tokenizer.ids_to_text(buf_ids).strip()
         if text:
-            segments.append(
-                _whisper_segment(seg_id, buf_start or 0.0, buf_last_t, text, buf_ids)
-            )
+            segments.append(_whisper_segment(
+                seg_id, buf_start or 0.0, buf_last_t, text, buf_ids,
+                avg_logprob=_avg_logprob(buf_logprobs) if token_logprobs is not None else None,
+            ))
     return segments
 
 
@@ -293,10 +321,11 @@ class StreamingPrevBatchedEngine:
         # Sentence-emission state — same policy as the legacy engine for UX continuity
         self._next_seg_id: int = 0
         self._sentence_buffer_ids: List[int] = []
+        self._sentence_buffer_logprobs: List[Optional[float]] = []
         self._sentence_buffer_start: Optional[float] = None
         self._sentence_buffer_last_t: float = 0.0
 
-        # Index into `_committed_token_times` of tokens already emitted
+        # Index into `_committed_tokens` of tokens already emitted
         self._tokens_emitted_through: int = 0
 
     def _reset_streaming_state(self) -> None:
@@ -312,10 +341,12 @@ class StreamingPrevBatchedEngine:
         self.current_batched_hyps: Optional[BatchedHyps] = None
         # Buffered float32 PCM not yet committed to a chunk step
         self._pcm_buffer = torch.zeros(0, dtype=torch.float32, device=self._device)
-        # Audio-time stream of (token_id, seconds) — only the NEW part each
-        # pop call uses, so this can be appended to incrementally without
-        # re-walking history.
-        self._committed_token_times: List[Tuple[int, float]] = []
+        # Audio-time stream of (token_id, seconds, logprob_or_None) — only the
+        # NEW part each pop call uses, so this can be appended incrementally
+        # without re-walking history. `logprob` is populated when the decoder
+        # exposes per-token confidence via `chunk_hyps.confidence`; otherwise
+        # None (the captured CUDA graph may not surface confidence values).
+        self._committed_tokens: List[Tuple[int, float, Optional[float]]] = []
         self._chunk_index: int = 0
         self._asr_time_s: float = 0.0
         self._eof_flushed: bool = False
@@ -360,8 +391,8 @@ class StreamingPrevBatchedEngine:
 
     def pop_committed_segments(self) -> List[dict]:
         """Return segments (sentence-bounded) for tokens committed since last pop."""
-        new_tokens = self._committed_token_times[self._tokens_emitted_through:]
-        self._tokens_emitted_through = len(self._committed_token_times)
+        new_tokens = self._committed_tokens[self._tokens_emitted_through:]
+        self._tokens_emitted_through = len(self._committed_tokens)
         return self._consume_tokens_into_segments(new_tokens, flush_partial=False)
 
     def pop_final_segments(self) -> List[dict]:
@@ -370,15 +401,18 @@ class StreamingPrevBatchedEngine:
         if self._sentence_buffer_ids:
             text = self.tokenizer.ids_to_text(self._sentence_buffer_ids).strip()
             if text:
+                has_lps = any(x is not None for x in self._sentence_buffer_logprobs)
                 committed.append(_whisper_segment(
                     self._next_seg_id,
                     self._sentence_buffer_start or 0.0,
                     self._sentence_buffer_last_t,
                     text,
                     self._sentence_buffer_ids,
+                    avg_logprob=_avg_logprob(self._sentence_buffer_logprobs) if has_lps else None,
                 ))
                 self._next_seg_id += 1
             self._sentence_buffer_ids = []
+            self._sentence_buffer_logprobs = []
             self._sentence_buffer_start = None
         return committed
 
@@ -391,6 +425,7 @@ class StreamingPrevBatchedEngine:
         self._reset_streaming_state()
         self._next_seg_id = 0
         self._sentence_buffer_ids = []
+        self._sentence_buffer_logprobs = []
         self._sentence_buffer_start = None
         self._sentence_buffer_last_t = 0.0
         self._tokens_emitted_through = 0
@@ -476,29 +511,46 @@ class StreamingPrevBatchedEngine:
                 new_ids = chunk_hyps.transcript[0, :n_new].detach().cpu().tolist()
                 new_frame_idx = chunk_hyps.timestamps[0, :n_new].detach().cpu().tolist()
                 stride_s = self.encoder_stride_s
-                for tid, f in zip(new_ids, new_frame_idx):
+                # NeMo populates chunk_hyps.token_confidence when the decoding
+                # config has confidence_cfg.preserve_token_confidence=True.
+                # Defensive: the captured CUDA graph might silently drop the
+                # side output — read with hasattr/None fallback. Values are
+                # in [0, 1]; convert to log to match Whisper's avg_logprob.
+                conf_tensor = getattr(chunk_hyps, "token_confidence", None) or getattr(chunk_hyps, "confidence", None)
+                new_logprobs: List[Optional[float]] = [None] * n_new
+                if conf_tensor is not None:
+                    try:
+                        conf_vals = conf_tensor[0, :n_new].detach().cpu().tolist()
+                        new_logprobs = [
+                            (math.log(max(float(c), 1e-10)) if c is not None else None)
+                            for c in conf_vals
+                        ]
+                    except Exception:
+                        pass
+                for tid, f, lp in zip(new_ids, new_frame_idx, new_logprobs):
                     t_s = float(f) * stride_s
                     if t_s < 0.0:
                         t_s = 0.0
-                    self._committed_token_times.append((int(tid), t_s))
+                    self._committed_tokens.append((int(tid), t_s, lp))
 
         self._chunk_index += 1
         self._asr_time_s += time.time() - t0
 
     def _consume_tokens_into_segments(
         self,
-        new_tokens: List[Tuple[int, float]],
+        new_tokens: List[Tuple[int, float, Optional[float]]],
         flush_partial: bool,
     ) -> List[dict]:
-        """Group new (id, time) pairs into sentence-bounded segment dicts.
+        """Group new `(id, time, logprob)` triples into sentence-bounded segment dicts.
         Carries running sentence state across pop calls so a sentence spanning
         many chunks emits exactly once when its terminal '.!?' lands."""
         segments: List[dict] = []
         tokenizer = self.tokenizer
-        for tid, t in new_tokens:
+        for tid, t, lp in new_tokens:
             if self._sentence_buffer_start is None:
                 self._sentence_buffer_start = t
             self._sentence_buffer_ids.append(tid)
+            self._sentence_buffer_logprobs.append(lp)
             self._sentence_buffer_last_t = t
             try:
                 tok = tokenizer.ids_to_tokens([tid])[0]
@@ -507,27 +559,33 @@ class StreamingPrevBatchedEngine:
             if tok and tok[-1] in ".!?":
                 text = tokenizer.ids_to_text(self._sentence_buffer_ids).strip()
                 if text:
+                    has_lps = any(x is not None for x in self._sentence_buffer_logprobs)
                     segments.append(_whisper_segment(
                         self._next_seg_id,
                         self._sentence_buffer_start or 0.0,
                         t,
                         text,
                         self._sentence_buffer_ids,
+                        avg_logprob=_avg_logprob(self._sentence_buffer_logprobs) if has_lps else None,
                     ))
                     self._next_seg_id += 1
                 self._sentence_buffer_ids = []
+                self._sentence_buffer_logprobs = []
                 self._sentence_buffer_start = None
         if flush_partial and self._sentence_buffer_ids:
             text = tokenizer.ids_to_text(self._sentence_buffer_ids).strip()
             if text:
+                has_lps = any(x is not None for x in self._sentence_buffer_logprobs)
                 segments.append(_whisper_segment(
                     self._next_seg_id,
                     self._sentence_buffer_start or 0.0,
                     self._sentence_buffer_last_t,
                     text,
                     self._sentence_buffer_ids,
+                    avg_logprob=_avg_logprob(self._sentence_buffer_logprobs) if has_lps else None,
                 ))
                 self._next_seg_id += 1
             self._sentence_buffer_ids = []
+            self._sentence_buffer_logprobs = []
             self._sentence_buffer_start = None
         return segments

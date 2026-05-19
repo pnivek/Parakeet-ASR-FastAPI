@@ -301,11 +301,30 @@ try:
                 if "greedy" in cfg:
                     with open_dict(cfg.greedy):
                         cfg.greedy.use_cuda_graph_decoder = USE_CUDA_GRAPHS
+                # Token-level confidence: tells the TDT label-loop computer
+                # to record per-token confidence values onto chunk_hyps so we
+                # can populate `avg_logprob` in the Whisper-shaped response.
+                # If the captured CUDA graph rejects this side output the
+                # field stays None — we read it defensively at the engine
+                # layer and gracefully fall back.
+                if "confidence_cfg" in cfg:
+                    with open_dict(cfg.confidence_cfg):
+                        cfg.confidence_cfg.preserve_token_confidence = True
+                        cfg.confidence_cfg.exclude_blank = True
+                else:
+                    cfg.confidence_cfg = {
+                        "preserve_token_confidence": True,
+                        "preserve_frame_confidence": False,
+                        "preserve_word_confidence": False,
+                        "exclude_blank": True,
+                        "aggregation": "mean",
+                    }
             asr_model.change_decoding_strategy(cfg, verbose=False)
             computer = getattr(asr_model.decoding.decoding, "decoding_computer", None)
             logger.info(
                 f"Decoding strategy pinned: greedy_batch, "
                 f"use_cuda_graph_decoder={USE_CUDA_GRAPHS}, compute_timestamps=True, "
+                f"preserve_token_confidence=True, "
                 f"cuda_graphs_mode={getattr(computer, 'cuda_graphs_mode', '<no computer>')!r}"
             )
         except Exception as e_cg:
@@ -1313,8 +1332,24 @@ async def _transcribe_full(
             token_ids = chunk_hyps.transcript[0, :n_tokens].detach().cpu().tolist()
             frame_idx = chunk_hyps.timestamps[0, :n_tokens].detach().cpu().tolist()
             token_times = [max(0.0, float(f) * encoder_stride_s) for f in frame_idx]
+            # If the decoder was configured with preserve_token_confidence
+            # (and the captured graph honored it), read per-token confidence
+            # and convert to log probabilities for avg_logprob.
+            conf_tensor = getattr(chunk_hyps, "token_confidence", None) or getattr(chunk_hyps, "confidence", None)
+            token_logprobs: Optional[List[Optional[float]]] = None
+            if conf_tensor is not None:
+                try:
+                    conf_vals = conf_tensor[0, :n_tokens].detach().cpu().tolist()
+                    token_logprobs = [
+                        (math.log(max(float(c), 1e-10)) if c is not None else None)
+                        for c in conf_vals
+                    ]
+                except Exception:
+                    token_logprobs = None
 
-        segments = tokens_to_sentence_segments(token_ids, token_times, tokenizer)
+        segments = tokens_to_sentence_segments(
+            token_ids, token_times, tokenizer, token_logprobs=token_logprobs,
+        )
         return segments, time.time() - t0
 
     segments, asr_time = await _run_on_asr_executor(_run)

@@ -247,80 +247,84 @@ class StreamingPrevBatchedEngine:
     # --------- Internals ----------
 
     def _step_one_chunk(self, chunk_samples: torch.Tensor, is_last_chunk: bool) -> None:
-        """One iteration of the NeMo reference loop, specialised for batch_size=1."""
+        """One iteration of the NeMo reference loop, specialised for batch_size=1.
+
+        Wrapping the whole body in `torch.inference_mode()` matters: chunk_hyps
+        returned from `decoding_computer` is an inference tensor; merge_'s
+        in-place scatter on `current_batched_hyps.transcript` only works if
+        we're still inside the same inference-mode context."""
         t0 = time.time()
         chunk_len = chunk_samples.shape[0]
         device = self._device
 
-        audio_batch = chunk_samples.unsqueeze(0)  # [1, T]
-        chunk_lengths_batch = torch.tensor([chunk_len], dtype=torch.long, device=device)
-        is_last_chunk_batch = torch.tensor([is_last_chunk], dtype=torch.bool, device=device)
+        with torch.inference_mode():
+            audio_batch = chunk_samples.unsqueeze(0)  # [1, T]
+            chunk_lengths_batch = torch.tensor([chunk_len], dtype=torch.long, device=device)
+            is_last_chunk_batch = torch.tensor([is_last_chunk], dtype=torch.bool, device=device)
 
-        self.buffer.add_audio_batch_(
-            audio_batch,
-            audio_lengths=chunk_lengths_batch,
-            is_last_chunk=is_last_chunk,
-            is_last_chunk_batch=is_last_chunk_batch,
-        )
-
-        # Encode the whole buffer (eager — graphs capture decoder only).
-        with torch.inference_mode(), torch.amp.autocast(device.type, dtype=self._dtype):
-            encoder_output, encoder_output_len = self.asr_model(
-                input_signal=self.buffer.samples,
-                input_signal_length=self.buffer.context_size_batch.total(),
-            )
-        encoder_output = encoder_output.transpose(1, 2)  # [B, T, C]
-        # The captured CUDA graph (decoding_computer) was warmed up during the
-        # FULL transcribe path under NeMo's own autocast and baked in bf16
-        # inputs. Our direct asr_model(input_signal=...) call returns fp32
-        # outputs on this code path (likely because the encoder's final op
-        # falls outside autocast's coverage). Force the dtype to the model's
-        # pinned bf16 so the captured Linear weights see matching input.
-        encoder_output = encoder_output.to(dtype=self._dtype)
-
-        # Slice off the left context — we don't want to redecode tokens already
-        # emitted in earlier chunks.
-        encoder_context = self.buffer.context_size.subsample(factor=self.encoder_frame2audio_samples)
-        encoder_context_batch = self.buffer.context_size_batch.subsample(factor=self.encoder_frame2audio_samples)
-        encoder_output = encoder_output[:, encoder_context.left:]
-
-        # Decode just the chunk frames (right context is lookahead the decoder
-        # uses but does NOT emit tokens for, unless it's the very last chunk
-        # where we want to drain everything).
-        if is_last_chunk:
-            out_len = encoder_output_len - encoder_context_batch.left
-        else:
-            out_len = encoder_context_batch.chunk
-
-        with torch.inference_mode(), torch.amp.autocast(device.type, dtype=self._dtype):
-            chunk_hyps, _, self.state = self.decoding_computer(
-                x=encoder_output,
-                out_len=out_len,
-                prev_batched_state=self.state,
+            self.buffer.add_audio_batch_(
+                audio_batch,
+                audio_lengths=chunk_lengths_batch,
+                is_last_chunk=is_last_chunk,
+                is_last_chunk_batch=is_last_chunk_batch,
             )
 
-        # Merge into running hypothesis (for end-of-stream final transcript).
-        if self.current_batched_hyps is None:
-            self.current_batched_hyps = chunk_hyps
-        else:
-            self.current_batched_hyps.merge_(chunk_hyps)
+            # Encode the whole buffer (eager — graphs capture decoder only).
+            with torch.amp.autocast(device.type, dtype=self._dtype):
+                encoder_output, encoder_output_len = self.asr_model(
+                    input_signal=self.buffer.samples,
+                    input_signal_length=self.buffer.context_size_batch.total(),
+                )
+            encoder_output = encoder_output.transpose(1, 2)  # [B, T, C]
+            # The captured CUDA graph was warmed up during FULL transcribes
+            # under NeMo's own autocast and baked in bf16 inputs for the
+            # joint's project_encoder Linear. Force the model's pinned dtype
+            # so the captured weights see matching inputs.
+            encoder_output = encoder_output.to(dtype=self._dtype)
 
-        # Map per-chunk token timestamps → global audio seconds.
-        n_new = int(chunk_hyps.current_lengths[0].item())
-        if n_new > 0:
-            # transcript[0, :n_new] are token ids; timestamps[0, :n_new] are
-            # encoder-frame indices RELATIVE to the chunk's encoder output
-            # (i.e., starting at 0 for the chunk's first frame after the
-            # left-context strip).
-            new_ids = chunk_hyps.transcript[0, :n_new].detach().cpu().tolist()
-            new_frame_idx = chunk_hyps.timestamps[0, :n_new].detach().cpu().tolist()
-            chunk_audio_start_s = self._chunk_index * self.chunk_secs
-            stride_s = self.encoder_stride_s
-            for tid, f in zip(new_ids, new_frame_idx):
-                t_s = chunk_audio_start_s + float(f) * stride_s
-                if t_s < 0.0:
-                    t_s = 0.0
-                self._committed_token_times.append((int(tid), t_s))
+            # Slice off the left context — we don't want to redecode tokens already
+            # emitted in earlier chunks.
+            encoder_context = self.buffer.context_size.subsample(factor=self.encoder_frame2audio_samples)
+            encoder_context_batch = self.buffer.context_size_batch.subsample(factor=self.encoder_frame2audio_samples)
+            encoder_output = encoder_output[:, encoder_context.left:]
+
+            # Decode just the chunk frames (right context is lookahead the decoder
+            # uses but does NOT emit tokens for, unless it's the very last chunk
+            # where we want to drain everything).
+            if is_last_chunk:
+                out_len = encoder_output_len - encoder_context_batch.left
+            else:
+                out_len = encoder_context_batch.chunk
+
+            with torch.amp.autocast(device.type, dtype=self._dtype):
+                chunk_hyps, _, self.state = self.decoding_computer(
+                    x=encoder_output,
+                    out_len=out_len,
+                    prev_batched_state=self.state,
+                )
+
+            # Merge into running hypothesis (for end-of-stream final transcript).
+            if self.current_batched_hyps is None:
+                self.current_batched_hyps = chunk_hyps
+            else:
+                self.current_batched_hyps.merge_(chunk_hyps)
+
+            # Map per-chunk token timestamps → global audio seconds.
+            n_new = int(chunk_hyps.current_lengths[0].item())
+            if n_new > 0:
+                # transcript[0, :n_new] are token ids; timestamps[0, :n_new] are
+                # encoder-frame indices RELATIVE to the chunk's encoder output
+                # (i.e., starting at 0 for the chunk's first frame after the
+                # left-context strip).
+                new_ids = chunk_hyps.transcript[0, :n_new].detach().cpu().tolist()
+                new_frame_idx = chunk_hyps.timestamps[0, :n_new].detach().cpu().tolist()
+                chunk_audio_start_s = self._chunk_index * self.chunk_secs
+                stride_s = self.encoder_stride_s
+                for tid, f in zip(new_ids, new_frame_idx):
+                    t_s = chunk_audio_start_s + float(f) * stride_s
+                    if t_s < 0.0:
+                        t_s = 0.0
+                    self._committed_token_times.append((int(tid), t_s))
 
         self._chunk_index += 1
         self._asr_time_s += time.time() - t0

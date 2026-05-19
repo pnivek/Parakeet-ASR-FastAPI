@@ -89,17 +89,25 @@ def _whisper_segment(
 
     Populated (meaningful values):
       id, seek, start, end, text, tokens, temperature, compression_ratio
-    Conditionally populated:
-      avg_logprob — only when the decoder is configured to preserve token
-                    confidences (off by default — incurs a perf hit and
-                    invalidates the captured CUDA graph). null otherwise.
-    Honestly null (no Parakeet equivalent):
-      no_speech_prob — Whisper's encoder has a `<|nospeech|>` token; the
-                       Parakeet TDT decoder does not. Returning a fabricated
-                       value here would be misleading.
 
-    The shape matches OpenAI's verbose_json so clients drop in cleanly; the
-    nulls are deliberate honest gaps rather than missing keys.
+    Honestly null:
+      avg_logprob       — NeMo 2.7.3's TDT label-loop CUDA graph
+                          (FULL_GRAPH mode) does NOT surface per-token
+                          confidence even when
+                          confidence_cfg.preserve_token_confidence=True is
+                          set on the decoding config. Verified empirically
+                          via the test harness: enabling the flag is a no-op
+                          on the captured graph. The only way to populate
+                          this is to run with USE_CUDA_GRAPHS=false (~2×
+                          slower) — we kept the flag set so if a deployment
+                          opts out of graphs, this field starts populating
+                          automatically.
+      no_speech_prob    — Parakeet TDT has no `<|nospeech|>` token; Whisper
+                          computes this from its encoder's dedicated VAD
+                          output. A fabricated value would mislead.
+
+    Shape matches OpenAI's verbose_json so clients drop in cleanly; the
+    nulls are deliberate, documented gaps rather than missing keys.
     """
     return {
         "id": seg_id,

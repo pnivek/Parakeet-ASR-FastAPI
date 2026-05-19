@@ -301,12 +301,12 @@ try:
                 if "greedy" in cfg:
                     with open_dict(cfg.greedy):
                         cfg.greedy.use_cuda_graph_decoder = USE_CUDA_GRAPHS
-                # Token-level confidence: tells the TDT label-loop computer
-                # to record per-token confidence values onto chunk_hyps so we
-                # can populate `avg_logprob` in the Whisper-shaped response.
-                # If the captured CUDA graph rejects this side output the
-                # field stays None — we read it defensively at the engine
-                # layer and gracefully fall back.
+                # Token-level confidence — would populate `avg_logprob` on
+                # Whisper-shaped segments. Empirical finding (NeMo 2.7.3):
+                # the captured FULL_GRAPH CUDA graph silently drops the side
+                # output even when this flag is set, so `avg_logprob` stays
+                # None until USE_CUDA_GRAPHS=false (~2× decode slowdown).
+                # Kept enabled so non-graph deployments populate it for free.
                 if "confidence_cfg" in cfg:
                     with open_dict(cfg.confidence_cfg):
                         cfg.confidence_cfg.preserve_token_confidence = True

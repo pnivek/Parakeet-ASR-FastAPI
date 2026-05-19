@@ -1621,6 +1621,7 @@ def _extract_tdt_token_times(
     delay: int,
     tokens_per_chunk: int,
     chunk_len_s: float,
+    total_buffer_s: float,
     model_stride_s: float,
 ) -> List[Tuple[int, float]]:
     """
@@ -1629,9 +1630,17 @@ def _extract_tdt_token_times(
 
     The class's own transcribe() discards alignment frame indices via
     _alignment_decoder. We walk the same per-chunk slicing rules but keep
-    `(frame_idx_in_alignment, token_id)` tuples, then convert the slice-local
-    frame index to global audio time via `chunk_idx * chunk_len_s + (frame_idx
-    - base_start) * model_stride_s`.
+    `(frame_idx_in_alignment, token_id)` tuples and convert the alignment
+    frame to global audio time via the buffer geometry:
+
+        After chunk `a_idx` is fed, the FIFO buffer ends at audio time
+        `(a_idx + 1) * chunk_len_s` and is `total_buffer_s` wide. Encoder
+        frame `f` of that chunk's alignment therefore corresponds to
+        audio time `(a_idx + 1) * chunk_len_s - total_buffer_s + f * stride`.
+
+    The "middle token" slice picks frames in the centre of the buffer, so
+    using the absolute frame index naturally produces the right time even
+    though the slice does not start at the chunk's nominal beginning.
     """
     all_alignments = frame_asr.all_alignments[0]
     signal_end_idx = frame_asr.frame_bufferer.signal_end_index[0]
@@ -1683,12 +1692,11 @@ def _extract_tdt_token_times(
         else:
             use_with_t = base_with_t
 
-        chunk_audio_start_s = a_idx * chunk_len_s
+        buffer_end_audio_s = (a_idx + 1) * chunk_len_s
         for frame_idx_in_align, tid in use_with_t:
-            t_within_chunk = frame_idx_in_align - base_start
-            time_s = chunk_audio_start_s + t_within_chunk * model_stride_s
+            time_s = buffer_end_audio_s - total_buffer_s + frame_idx_in_align * model_stride_s
             if time_s < 0.0:
-                time_s = chunk_audio_start_s  # clamp the small (<=tdt_search_boundary*stride) backshift
+                time_s = 0.0  # clamp pre-roll pad
             out.append((tid, float(time_s)))
             unmerged_ids.append(tid)
 
@@ -1819,6 +1827,7 @@ def _stateful_chunked_sync(
                 delay=mid_delay,
                 tokens_per_chunk=tokens_per_chunk,
                 chunk_len_s=chunk_len_s,
+                total_buffer_s=total_buffer_s,
                 model_stride_s=model_stride_s,
             )
         except Exception as e_tt:

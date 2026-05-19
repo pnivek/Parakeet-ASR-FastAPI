@@ -61,6 +61,57 @@ def _make_divisible_by(value: int, factor: int) -> int:
     return (value // factor) * factor
 
 
+def tokens_to_sentence_segments(
+    token_ids: List[int],
+    token_times_s: List[float],
+    tokenizer,
+    start_seg_id: int = 0,
+) -> List[dict]:
+    """Group `(token_id, audio_time_s)` pairs into sentence-bounded segment dicts.
+
+    Used by both the streaming engine and the single-pass `full_v2` path so they
+    produce identical segment formats. Sentences terminate on '.', '!', '?'; a
+    trailing partial sentence (no terminal punctuation) is flushed as the final
+    segment.
+    """
+    segments: List[dict] = []
+    buf_ids: List[int] = []
+    buf_start: Optional[float] = None
+    buf_last_t: float = 0.0
+    seg_id = start_seg_id
+    for tid, t_s in zip(token_ids, token_times_s):
+        if buf_start is None:
+            buf_start = t_s
+        buf_ids.append(tid)
+        buf_last_t = t_s
+        try:
+            tok = tokenizer.ids_to_tokens([tid])[0]
+        except Exception:
+            tok = ""
+        if tok and tok[-1] in ".!?":
+            text = tokenizer.ids_to_text(buf_ids).strip()
+            if text:
+                segments.append({
+                    "start": round(max(0.0, buf_start), 3),
+                    "end": round(t_s, 3),
+                    "text": text,
+                    "id": seg_id,
+                })
+                seg_id += 1
+            buf_ids = []
+            buf_start = None
+    if buf_ids:
+        text = tokenizer.ids_to_text(buf_ids).strip()
+        if text:
+            segments.append({
+                "start": round(max(0.0, buf_start or 0.0), 3),
+                "end": round(buf_last_t, 3),
+                "text": text,
+                "id": seg_id,
+            })
+    return segments
+
+
 class StreamingPrevBatchedEngine:
     """
     Drives `decoding_computer(prev_batched_state=...)` chunk-by-chunk over

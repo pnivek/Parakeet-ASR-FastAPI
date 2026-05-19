@@ -37,7 +37,7 @@ from nemo.collections.asr.parts.utils.streaming_utils import (
 
 # StreamingPrevBatchedEngine — Option C, NVIDIA's blessed streaming pattern.
 # Lives in its own module to keep main.py from growing further.
-from streaming_v2 import StreamingPrevBatchedEngine
+from streaming_v2 import StreamingPrevBatchedEngine, tokens_to_sentence_segments
 
 from dotenv import load_dotenv
 
@@ -1679,17 +1679,10 @@ async def handle_streaming_pcm(
                 try:
                     full_pcm_bytes = bytes(refinement_pcm_accumulator)
                     full_tensor = await asyncio.to_thread(_create_asr_tensor_from_bytes, full_pcm_bytes)
-                    hypotheses_refined, refinement_asr_t = await _perform_asr_transcription(
-                        asr_model_instance=asr_model,
-                        audio_input_list=[full_tensor],
-                        batch_size_for_transcribe_call=1,
-                        num_asr_workers=NUM_WORKERS,
+                    refined_segments, refinement_asr_t = await _transcribe_full_v2(
+                        waveform=full_tensor,
+                        audio_duration_s=full_audio_duration_s,
                         request_id=f"WS-Stream-{session_id}-refine",
-                    )
-                    refined_segments = _process_hypotheses_to_segments(
-                        hypotheses_refined,
-                        [0.0] * (len(hypotheses_refined) if hypotheses_refined else 0),
-                        f"{session_id}-refine",
                     )
                     refined_text = " ".join(s["text"] for s in refined_segments).strip()
                     logger.info(
@@ -2681,6 +2674,84 @@ async def _transcribe_chunked_v2(
     return segments, asr_time
 
 
+async def _transcribe_full_v2(
+    waveform: torch.Tensor,
+    audio_duration_s: float,
+    request_id: str = "full-v2",
+) -> Tuple[List[dict], float]:
+    """Single-pass offline transcription via encoder + `decoding_computer`.
+
+    Bypasses NeMo 2.7.3's `asr_model.transcribe()` wrapper entirely. That
+    wrapper interacts badly with FULL_GRAPH-mode CUDA graphs on short audio
+    (the captured decoder graph reads stale data from the encoder-output
+    static buffer when audio is shorter than the captured shape, producing
+    23 % empty / 33 % catastrophic outputs on the LibriSpeech test-clean
+    short tail — see the regression harness in `tests/`).
+
+    Same code pattern as `chunked_v2`'s `StreamingPrevBatchedEngine`, but
+    single-shot: encoder runs once on the full waveform, decoder runs once
+    with `prev_batched_state=None`, tokens are mapped to sentence-bounded
+    segments via the shared helper.
+
+    Caller MUST hold `model_access_lock`. `_apply_model_settings_for_session`
+    must have run first so local-attention mode is engaged for long audio.
+    """
+    if asr_model is None:
+        logger.error(f"({request_id}) full-v2: asr_model is None.")
+        return [], 0.0
+
+    device = next(asr_model.parameters()).device
+    dtype = next(asr_model.parameters()).dtype
+
+    waveform_1d = waveform.squeeze().to(device=device, dtype=torch.float32).contiguous()
+    audio_batch = waveform_1d.unsqueeze(0)
+    audio_lengths = torch.tensor([waveform_1d.shape[0]], dtype=torch.long, device=device)
+
+    decoding_computer = asr_model.decoding.decoding.decoding_computer
+    tokenizer = asr_model.tokenizer
+
+    model_cfg = asr_model._cfg
+    feature_stride_sec = float(model_cfg.preprocessor["window_stride"])
+    encoder_subsampling_factor = int(asr_model.encoder.subsampling_factor)
+    encoder_stride_s = feature_stride_sec * encoder_subsampling_factor
+
+    def _run() -> Tuple[List[dict], float]:
+        t0 = time.time()
+        with torch.inference_mode():
+            with torch.amp.autocast(device.type, dtype=dtype):
+                encoder_output, encoder_output_len = asr_model(
+                    input_signal=audio_batch,
+                    input_signal_length=audio_lengths,
+                )
+            # The captured joint graph was warmed in bf16 — force matching dtype
+            # on the inputs we hand back to it (same pattern chunked_v2 uses).
+            encoder_output = encoder_output.transpose(1, 2).to(dtype=dtype)  # [B, T, C]
+
+            with torch.amp.autocast(device.type, dtype=dtype):
+                chunk_hyps, _, _ = decoding_computer(
+                    x=encoder_output,
+                    out_len=encoder_output_len,
+                    prev_batched_state=None,
+                )
+
+            n_tokens = int(chunk_hyps.current_lengths[0].item())
+            if n_tokens == 0:
+                return [], time.time() - t0
+            token_ids = chunk_hyps.transcript[0, :n_tokens].detach().cpu().tolist()
+            frame_idx = chunk_hyps.timestamps[0, :n_tokens].detach().cpu().tolist()
+            token_times = [max(0.0, float(f) * encoder_stride_s) for f in frame_idx]
+
+        segments = tokens_to_sentence_segments(token_ids, token_times, tokenizer)
+        return segments, time.time() - t0
+
+    segments, asr_time = await _run_on_asr_executor(_run)
+    logger.info(
+        f"({request_id}) full-v2: dur={audio_duration_s:.2f}s "
+        f"asr_t={asr_time:.2f}s segs={len(segments)}"
+    )
+    return segments, asr_time
+
+
 async def _transcribe_chunked_stateful(
     waveform: torch.Tensor,
     audio_duration_s: float,
@@ -2954,19 +3025,13 @@ async def transcribe_endpoint_rest(
                                     request_id=f"REST-{request_id}",
                                 )
                         else:
-                            # FULL: feed the entire waveform to NeMo's transcribe in one call.
-                            hypotheses_list, asr_processing_time_s = await _perform_asr_transcription(
-                                asr_model_instance=asr_model,
-                                audio_input_list=[waveform_tensor],
-                                batch_size_for_transcribe_call=client_config_rest["batch_size"],
-                                num_asr_workers=NUM_WORKERS,
-                                request_id=f"REST-{request_id}"
-                            )
-                            # Single, non-chunked audio file → offset is 0.0 for all hypotheses.
-                            segments = _process_hypotheses_to_segments(
-                                hypotheses_list,
-                                [0.0] * (len(hypotheses_list) if hypotheses_list else 0),
-                                request_id
+                            # FULL: single-pass through encoder + decoding_computer.
+                            # Bypasses NeMo's transcribe() wrapper to dodge the
+                            # short-audio CUDA-graph bug (see _transcribe_full_v2).
+                            segments, asr_processing_time_s = await _transcribe_full_v2(
+                                waveform=waveform_tensor,
+                                audio_duration_s=total_audio_duration_s,
+                                request_id=f"REST-{request_id}",
                             )
 
                         full_transcribed_text = " ".join(s['text'] for s in segments).strip()
@@ -3103,15 +3168,10 @@ async def _ws_accumulate_then_process(
 
     try:
         if resolved_strategy == ProcessingStrategy.FULL:
-            hyps, asr_t = await _perform_asr_transcription(
-                asr_model_instance=asr_model,
-                audio_input_list=[waveform],
-                batch_size_for_transcribe_call=client_config["batch_size"],
-                num_asr_workers=NUM_WORKERS,
+            segments, asr_t = await _transcribe_full_v2(
+                waveform=waveform,
+                audio_duration_s=audio_duration_s,
                 request_id=f"WS-{session_id}",
-            )
-            segments = _process_hypotheses_to_segments(
-                hyps, [0.0] * (len(hyps) if hyps else 0), session_id,
             )
         elif resolved_strategy == ProcessingStrategy.CHUNKED_V2:
             segments, asr_t = await _transcribe_chunked_v2(

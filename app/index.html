@@ -338,7 +338,9 @@
               <option value="auto" selected>auto (server picks based on duration / stream state)</option>
               <option value="full">full (single transcribe pass, best quality, &le; MAX_FULL_WAVEFORM_S)</option>
               <option value="chunked">chunked (BatchedFrameASRTDT stateful; legacy fallback above STATEFUL_MAX_DURATION_S)</option>
+              <option value="chunked_v2">chunked_v2 (NVIDIA blessed: prev_batched_state; experimental)</option>
               <option value="progressive">progressive (buffered streaming via WS; partials emit with right-context lag)</option>
+              <option value="progressive_v2">progressive_v2 (NVIDIA blessed: prev_batched_state; experimental)</option>
             </select>
             <span class="description">Server-side dispatch. "auto" honors DEFAULT_STRATEGY from .env. Note: progressive is <em>buffered</em> streaming — this model isn't cache-aware, so partials emit ~6–7.5 s behind real time.</span>
           </div>

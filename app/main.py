@@ -35,6 +35,10 @@ from nemo.collections.asr.parts.utils.streaming_utils import (
     AudioFeatureIterator,
 )
 
+# StreamingPrevBatchedEngine — Option C, NVIDIA's blessed streaming pattern.
+# Lives in its own module to keep main.py from growing further.
+from streaming_v2 import StreamingPrevBatchedEngine
+
 from dotenv import load_dotenv
 
 from utils import (
@@ -94,6 +98,12 @@ class ProcessingStrategy(str, Enum):
     FULL = "full"
     CHUNKED = "chunked"
     PROGRESSIVE = "progressive"
+    # NVIDIA's blessed streaming pattern (NeMo PR #9106), via StreamingPrevBatchedEngine.
+    # Same UX as `progressive` but uses public API (decoding_computer + prev_batched_state).
+    # Will replace `progressive` and `chunked` once parity is verified. See
+    # .claude/plans/option-c-prev-batched-state.md.
+    CHUNKED_V2 = "chunked_v2"
+    PROGRESSIVE_V2 = "progressive_v2"
 
 
 # Strategy configuration.
@@ -1105,11 +1115,15 @@ async def handle_streaming_pcm(
     sent_segments_pcm: List[dict] = [] # Stores all segments sent to client for final aggregation
 
     live_latency = bool(client_config.get("live_latency", False))
+    resolved_strategy_str = client_config.get("_resolved_strategy", "progressive")
+    use_v2_engine = resolved_strategy_str == ProcessingStrategy.PROGRESSIVE_V2.value
     # USE_STATEFUL_CHUNKED also gates progressive: when enabled the live partial
     # pipeline runs `StreamingTdtEngine` (BatchedFrameASRTDT chunk-by-chunk)
     # instead of the legacy independent-chunk consumer. Same flag means callers
     # get coherent decoder-state continuity in BOTH offline and live mode.
-    use_stateful_progressive = USE_STATEFUL_CHUNKED
+    # When strategy=progressive_v2 the new `StreamingPrevBatchedEngine` is used
+    # instead (NVIDIA's blessed `prev_batched_state` API).
+    use_stateful_progressive = USE_STATEFUL_CHUNKED or use_v2_engine
 
     if use_stateful_progressive:
         # Engine chunk + buffer follow the live or offline-like preset.
@@ -1417,16 +1431,37 @@ async def handle_streaming_pcm(
         nonlocal accumulated_asr_processing_time_s, sent_segments_pcm
 
         if use_stateful_progressive and asr_model is not None:
-            feature_stride = asr_model._cfg.preprocessor["window_stride"]
-            model_stride_s = feature_stride * asr_model.encoder.subsampling_factor
-            engine = StreamingTdtEngine(
-                asr_model_instance=asr_model,
-                chunk_len_s=engine_chunk_len_s,
-                total_buffer_s=engine_total_buffer_s,
-                model_stride_s=model_stride_s,
-                sample_rate=target_pcm_sample_rate,
-                request_id=f"WS-Stream-{session_id}-eng",
-            )
+            if use_v2_engine:
+                # Option C engine — NVIDIA's blessed pattern. Reads its own
+                # config off the model (sample_rate, feature_stride, subsampling).
+                left_context_secs = (
+                    STREAMING_LEFT_CONTEXT_S
+                )
+                right_context_secs = (
+                    STREAMING_LIVE_RIGHT_CONTEXT_S if live_latency else STREAMING_RIGHT_CONTEXT_S
+                )
+                engine = StreamingPrevBatchedEngine(
+                    asr_model_instance=asr_model,
+                    chunk_secs=engine_chunk_len_s,
+                    left_context_secs=left_context_secs,
+                    right_context_secs=right_context_secs,
+                    request_id=f"WS-Stream-{session_id}-engV2",
+                )
+                logger.info(
+                    f"({session_id}) Stream(v2): emission_lag={engine.emission_lag_secs:.2f}s "
+                    f"(chunk={engine.chunk_secs}s + right={right_context_secs}s)"
+                )
+            else:
+                feature_stride = asr_model._cfg.preprocessor["window_stride"]
+                model_stride_s = feature_stride * asr_model.encoder.subsampling_factor
+                engine = StreamingTdtEngine(
+                    asr_model_instance=asr_model,
+                    chunk_len_s=engine_chunk_len_s,
+                    total_buffer_s=engine_total_buffer_s,
+                    model_stride_s=model_stride_s,
+                    sample_rate=target_pcm_sample_rate,
+                    request_id=f"WS-Stream-{session_id}-eng",
+                )
             total_engine_chunks = 0
             try:
                 while True:
@@ -2581,6 +2616,67 @@ async def _restore_decoder(saved: dict) -> None:
     await _run_on_asr_executor(asr_model.change_decoding_strategy, decoding_cfg, verbose=False)
 
 
+async def _transcribe_chunked_v2(
+    waveform: torch.Tensor,
+    audio_duration_s: float,
+    client_config: dict,
+    request_id: str = "chunked-v2",
+) -> Tuple[List[dict], float]:
+    """
+    Offline buffered chunked transcription using `StreamingPrevBatchedEngine` —
+    the Option C engine. Feeds the entire waveform through the same engine
+    the live `progressive_v2` path uses, just back-to-back as fast as the
+    GPU will accept. No middle-token merge, no private-API reach.
+
+    Caller MUST be holding `model_access_lock`. The dual decoder swap
+    (`_swap_decoder_to_stateful_tdt`) is required so the engine sees the
+    `greedy + preserve_alignments=True` decoder.
+    """
+    if asr_model is None:
+        logger.error(f"({request_id}) chunked_v2: asr_model is None.")
+        return [], 0.0
+
+    live_latency = bool(client_config.get("live_latency", False))
+    chunk_secs = STREAMING_LIVE_CHUNK_S if live_latency else STREAMING_CHUNK_S
+    right_secs = STREAMING_LIVE_RIGHT_CONTEXT_S if live_latency else STREAMING_RIGHT_CONTEXT_S
+    left_secs = STREAMING_LEFT_CONTEXT_S
+
+    waveform_np = (
+        waveform.squeeze().to(dtype=torch.float32).contiguous().cpu().numpy()
+        if waveform.dim() > 1
+        else waveform.to(dtype=torch.float32).contiguous().cpu().numpy()
+    )
+
+    saved = await _swap_decoder_to_stateful_tdt()
+    try:
+        def _run() -> Tuple[List[dict], float]:
+            engine = StreamingPrevBatchedEngine(
+                asr_model_instance=asr_model,
+                chunk_secs=chunk_secs,
+                left_context_secs=left_secs,
+                right_context_secs=right_secs,
+                request_id=request_id,
+            )
+            try:
+                engine.feed_float32(waveform_np)
+                engine.flush()
+                segs = engine.pop_final_segments()
+                return segs, engine.asr_time_s
+            finally:
+                engine.reset()
+
+        segments, asr_time = await _run_on_asr_executor(_run)
+    finally:
+        await _restore_decoder(saved)
+
+    logger.info(
+        f"({request_id}) chunked_v2: dur={audio_duration_s:.2f}s "
+        f"asr_t={asr_time:.2f}s segs={len(segments)} "
+        f"chunk={chunk_secs}s right={right_secs}s"
+    )
+    return segments, asr_time
+
+
 async def _transcribe_chunked_stateful(
     waveform: torch.Tensor,
     audio_duration_s: float,
@@ -2832,7 +2928,14 @@ async def transcribe_endpoint_rest(
                         )
                         logger.info(f"({request_id}) REST: ASR model settings applied for session. Long audio specific settings active: {long_audio_settings_applied_this_session}.")
 
-                        if resolved_strategy == ProcessingStrategy.CHUNKED:
+                        if resolved_strategy == ProcessingStrategy.CHUNKED_V2:
+                            segments, asr_processing_time_s = await _transcribe_chunked_v2(
+                                waveform=waveform_tensor,
+                                audio_duration_s=total_audio_duration_s,
+                                client_config=client_config_rest,
+                                request_id=f"REST-{request_id}",
+                            )
+                        elif resolved_strategy == ProcessingStrategy.CHUNKED:
                             if _should_use_stateful_engine(total_audio_duration_s, request_id):
                                 segments, asr_processing_time_s = await _transcribe_chunked_stateful(
                                     waveform=waveform_tensor,
@@ -3000,6 +3103,13 @@ async def _ws_accumulate_then_process(
             segments = _process_hypotheses_to_segments(
                 hyps, [0.0] * (len(hyps) if hyps else 0), session_id,
             )
+        elif resolved_strategy == ProcessingStrategy.CHUNKED_V2:
+            segments, asr_t = await _transcribe_chunked_v2(
+                waveform=waveform,
+                audio_duration_s=audio_duration_s,
+                client_config=client_config,
+                request_id=f"WS-{session_id}",
+            )
         else:  # CHUNKED
             if _should_use_stateful_engine(audio_duration_s, session_id):
                 # Stateful engine has no per-batch hook: it computes the whole
@@ -3107,11 +3217,15 @@ async def _ws_handle_unified(
         )
         logger.info(f"({session_id}) {log_prefix}: resolved strategy = {resolved.value}.")
 
-        if resolved == ProcessingStrategy.PROGRESSIVE:
+        if resolved in (ProcessingStrategy.PROGRESSIVE, ProcessingStrategy.PROGRESSIVE_V2):
             # Streaming pipeline: ffmpeg producer/consumer. handle_streaming_pcm
             # does its own _apply / _revert via the legacy pattern here, since
             # for streaming we don't know duration upfront and use chunk_length
             # as the proxy.
+            # Stash the resolved strategy into client_config so the consumer
+            # can pick the right engine (legacy StreamingTdtEngine vs new
+            # StreamingPrevBatchedEngine).
+            client_config = {**client_config, "_resolved_strategy": resolved.value}
             long_audio_active = False
             async with model_access_lock:
                 try:

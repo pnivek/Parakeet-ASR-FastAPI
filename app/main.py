@@ -2113,7 +2113,17 @@ class StreamingTdtEngine:
         self._sentence_buffer_start: Optional[float] = None
         self._sentence_buffer_last_t: float = 0.0
         self._next_seg_id: int = 0
-        self._tokens_emitted_through: int = 0
+
+        # Incremental merge state. The middle-token merge walks each chunk's
+        # alignment exactly ONCE. `_merge_unmerged_ids` is the accumulated
+        # merged token id sequence (the same role NeMo's `unmerged[idx]` plays
+        # in BatchedFrameASRTDT.transcribe). `_next_chunk_to_merge` advances
+        # one step per pop. After a chunk is merged, its entry in
+        # frame_asr.all_alignments[0] is set to None to free memory — we no
+        # longer need it (the boundary search is intra-chunk, not cross-chunk).
+        self._next_chunk_to_merge: int = 0
+        self._merge_unmerged_ids: List[int] = []
+        self._tdt_search_boundary: int = getattr(self.frame_asr, "tdt_search_boundary", 4)
 
         # Cached for autocast around inference calls
         self._model_dtype = next(asr_model_instance.parameters()).dtype
@@ -2213,33 +2223,124 @@ class StreamingTdtEngine:
 
     def pop_committed_segments(self) -> List[dict]:
         """
-        Walk `frame_asr.all_alignments[0]` through the middle-token merge,
-        emit any newly committed sentences (those whose terminal '.!?' just
-        landed). In-progress sentences stay in the buffer for the next call.
+        Apply the middle-token merge to every chunk that's arrived since the
+        last call. Walks each chunk's alignment exactly once across the
+        engine's lifetime (vs. the old O(N²) global re-walk, which blocked
+        the event loop progressively longer until the WS keepalive dropped
+        the connection around chunk 700 — see commit message for details).
+
+        After a chunk is merged, its entry in `frame_asr.all_alignments[0]`
+        is replaced with `None` so the underlying tensors can be GC'd. The
+        merge is intra-chunk (`tdt_search_boundary` looks within the current
+        alignment, not into the previous one), so prior alignments are no
+        longer load-bearing once their tokens are committed.
+
+        Returns sentence-bounded segments — same emission policy as before.
         """
         if self._chunks_processed == 0:
             return []
 
+        new_tokens: List[Tuple[int, float]] = []
         try:
-            all_tokens = _extract_tdt_token_times(
-                frame_asr=self.frame_asr,
-                delay=self.mid_delay,
-                tokens_per_chunk=self.tokens_per_chunk,
-                chunk_len_s=self.chunk_len_s,
-                total_buffer_s=self.total_buffer_s,
-                model_stride_s=self.model_stride_s,
-            )
+            new_tokens = self._merge_new_chunks_incremental()
         except Exception as e:
             logger.warning(
-                f"({self.request_id}) StreamingTdtEngine: token extraction failed ({e!r}).",
+                f"({self.request_id}) StreamingTdtEngine: incremental merge failed ({e!r}).",
                 exc_info=True,
             )
-            return []
-
-        new_tokens = all_tokens[self._tokens_emitted_through:]
-        self._tokens_emitted_through = len(all_tokens)
 
         return self._consume_tokens_into_segments(new_tokens, flush_partial=False)
+
+    def _merge_new_chunks_incremental(self) -> List[Tuple[int, float]]:
+        """Mirror `BatchedFrameASRTDT.transcribe`'s middle-token merge, but
+        only over chunks `[self._next_chunk_to_merge, chunks_processed)`."""
+        all_alignments = self.frame_asr.all_alignments[0]
+        signal_end_idx = self.frame_asr.frame_bufferer.signal_end_index[0]
+        blank_id = self.frame_asr.blank_id
+        tdt_search_boundary = self._tdt_search_boundary
+        chunk_len_s = self.chunk_len_s
+        total_buffer_s = self.total_buffer_s
+        model_stride_s = self.model_stride_s
+        mid_delay = self.mid_delay
+        tokens_per_chunk = self.tokens_per_chunk
+
+        out: List[Tuple[int, float]] = []
+
+        def _walk_with_times(slice_align, slice_start_idx):
+            toks: List[Tuple[int, int]] = []
+            for fi, frame in enumerate(slice_align):
+                global_fi = slice_start_idx + fi
+                for u in range(len(frame)):
+                    _, tid = frame[u]
+                    tid = int(tid)
+                    if tid != blank_id:
+                        toks.append((global_fi, tid))
+            return toks
+
+        end_a_idx = len(all_alignments)
+        for a_idx in range(self._next_chunk_to_merge, end_a_idx):
+            alignment = all_alignments[a_idx]
+            if alignment is None:
+                # Already freed by a previous pop — shouldn't happen if
+                # _next_chunk_to_merge is maintained correctly, but guard anyway.
+                continue
+
+            if mid_delay == len(alignment):
+                offset = 0
+            else:
+                offset = 1
+            base_start = len(alignment) - offset - mid_delay
+            base_end = base_start + tokens_per_chunk
+            long_start = base_start - tdt_search_boundary
+            long_end = base_end
+
+            longer_with_t = _walk_with_times(alignment[long_start:long_end], long_start)
+            base_with_t = _walk_with_times(alignment[base_start:base_end], base_start)
+
+            ended = (signal_end_idx is not None and a_idx >= signal_end_idx)
+            if longer_with_t and not ended:
+                if a_idx == 0 or not self._merge_unmerged_ids:
+                    use_with_t = base_with_t
+                elif self._merge_unmerged_ids and len(longer_with_t) > 1:
+                    id_to_match = self._merge_unmerged_ids[-1]
+                    longer_ids_only = [t[1] for t in longer_with_t]
+                    start_idx = min(
+                        len(longer_ids_only) - len(base_with_t),
+                        len(longer_ids_only) - 1,
+                    )
+                    use_with_t = base_with_t  # fallback when no match
+                    for i in range(start_idx, -1, -1):
+                        if longer_ids_only[i] == id_to_match:
+                            use_with_t = longer_with_t[i + 1:]
+                            break
+                else:
+                    use_with_t = base_with_t
+
+                buffer_end_audio_s = (a_idx + 1) * chunk_len_s
+                for frame_idx_in_align, tid in use_with_t:
+                    time_s = buffer_end_audio_s - total_buffer_s + frame_idx_in_align * model_stride_s
+                    if time_s < 0.0:
+                        time_s = 0.0
+                    out.append((tid, float(time_s)))
+                    self._merge_unmerged_ids.append(tid)
+
+            # Free the alignment we just consumed. The merge for the next
+            # chunk only needs the current chunk's alignment + the running
+            # `_merge_unmerged_ids` tail — never an older alignment.
+            all_alignments[a_idx] = None
+            # Same logic for the parallel lists NeMo grows in lock-step;
+            # we never look at them, but they hold encoder-output references
+            # and would otherwise pin GPU/CPU memory for the whole stream.
+            try:
+                if a_idx < len(self.frame_asr.all_preds[0]):
+                    self.frame_asr.all_preds[0][a_idx] = None
+                if a_idx < len(self.frame_asr.all_timestamps[0]):
+                    self.frame_asr.all_timestamps[0][a_idx] = None
+            except Exception:
+                pass
+
+        self._next_chunk_to_merge = end_a_idx
+        return out
 
     def pop_final_segments(self) -> List[dict]:
         """Flush trailing in-progress sentence after EOF."""

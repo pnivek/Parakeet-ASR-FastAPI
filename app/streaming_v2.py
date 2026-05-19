@@ -42,6 +42,7 @@ Design notes vs the old StreamingTdtEngine:
 
 from __future__ import annotations
 
+import gzip
 import math
 import time
 from typing import List, Optional, Tuple
@@ -61,21 +62,44 @@ def _make_divisible_by(value: int, factor: int) -> int:
     return (value // factor) * factor
 
 
+def _compression_ratio(text: str) -> float:
+    """gzip compression ratio of the segment text — Whisper's hallucination heuristic.
+
+    High values (> 2.4 in Whisper's threshold) indicate highly repetitive text,
+    a common failure mode. Computed as len(raw bytes) / len(gzip-compressed bytes).
+    """
+    if not text:
+        return 0.0
+    raw = text.encode("utf-8")
+    compressed = gzip.compress(raw)
+    if len(compressed) == 0:
+        return 0.0
+    return round(len(raw) / len(compressed), 4)
+
+
 def _whisper_segment(
     seg_id: int,
     start: float,
     end: float,
     text: str,
     token_ids: List[int],
+    avg_logprob: Optional[float] = None,
 ) -> dict:
     """One segment in OpenAI Whisper's verbose_json shape.
 
-    We populate `id`, `start`, `end`, `text`, `tokens`, and `seek`; the
-    confidence/probability fields (`avg_logprob`, `compression_ratio`,
-    `no_speech_prob`) are left None because we don't compute them — but
-    they're present so clients can introspect the response shape without
-    hitting KeyError. `temperature` is fixed at 0.0 since we use greedy
-    decoding.
+    Populated (meaningful values):
+      id, seek, start, end, text, tokens, temperature, compression_ratio
+    Conditionally populated:
+      avg_logprob — only when the decoder is configured to preserve token
+                    confidences (off by default — incurs a perf hit and
+                    invalidates the captured CUDA graph). null otherwise.
+    Honestly null (no Parakeet equivalent):
+      no_speech_prob — Whisper's encoder has a `<|nospeech|>` token; the
+                       Parakeet TDT decoder does not. Returning a fabricated
+                       value here would be misleading.
+
+    The shape matches OpenAI's verbose_json so clients drop in cleanly; the
+    nulls are deliberate honest gaps rather than missing keys.
     """
     return {
         "id": seg_id,
@@ -85,10 +109,62 @@ def _whisper_segment(
         "text": text,
         "tokens": list(token_ids),
         "temperature": 0.0,
-        "avg_logprob": None,
-        "compression_ratio": None,
+        "avg_logprob": avg_logprob,
+        "compression_ratio": _compression_ratio(text),
         "no_speech_prob": None,
     }
+
+
+def tokens_to_words(
+    token_ids: List[int],
+    token_times_s: List[float],
+    tokenizer,
+) -> List[dict]:
+    """Group token IDs into word-level entries with start/end times.
+
+    Parakeet uses SentencePiece BPE; word boundaries are marked by the
+    U+2581 ▁ prefix on the first piece of each word (`▁hello`, `wo`, `rld`).
+    A token *without* that prefix continues the previous word. We aggregate
+    the token start times per word (min) and ends (max) so each word gets
+    real timestamps from the decoder, not interpolated values.
+
+    Output matches OpenAI's `words` array shape:
+        [{"word": "Hello", "start": 0.0, "end": 0.5}, ...]
+    """
+    words: List[dict] = []
+    buf_text = ""
+    buf_start: Optional[float] = None
+    buf_end: float = 0.0
+
+    for tid, t_s in zip(token_ids, token_times_s):
+        try:
+            piece = tokenizer.ids_to_tokens([tid])[0]
+        except Exception:
+            piece = ""
+        starts_new_word = piece.startswith("▁") or piece.startswith(" ")
+        clean = piece.lstrip("▁").lstrip()
+
+        if starts_new_word and buf_text.strip():
+            words.append({
+                "word": buf_text.strip(),
+                "start": round(max(0.0, buf_start or 0.0), 3),
+                "end": round(buf_end, 3),
+            })
+            buf_text = ""
+            buf_start = None
+
+        if buf_start is None:
+            buf_start = t_s
+        buf_text += clean
+        buf_end = t_s
+
+    if buf_text.strip():
+        words.append({
+            "word": buf_text.strip(),
+            "start": round(max(0.0, buf_start or 0.0), 3),
+            "end": round(buf_end, 3),
+        })
+    return words
 
 
 def tokens_to_sentence_segments(

@@ -18,9 +18,9 @@ import uvicorn
 
 import numpy as np
 
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect, Query
 from fastapi.websockets import WebSocketState
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -32,7 +32,7 @@ from nemo.collections.asr.models.asr_model import ASRModel as NeMoASRModelType
 
 # Streaming engine — NVIDIA's blessed pattern (NeMo PR #9106).
 # Lives in its own module to keep main.py from growing further.
-from streaming_v2 import StreamingPrevBatchedEngine, tokens_to_sentence_segments
+from streaming_v2 import StreamingPrevBatchedEngine, tokens_to_sentence_segments, tokens_to_words
 
 from dotenv import load_dotenv
 
@@ -90,7 +90,7 @@ FFMPEG_PCM_CHUNK_SIZE_BYTES = int(os.getenv("FFMPEG_PCM_CHUNK_SIZE_BYTES", 16384
 class ProcessingStrategy(str, Enum):
     """Transcription dispatch modes. See README and resolve_strategy() for selection rules.
 
-    All three offline/streaming strategies share one decoding pipeline
+    All three strategies share one decoding pipeline
     (encoder + `decoding_computer` with optional `prev_batched_state` threading):
 
       - FULL          single-pass encode → decode of the whole waveform
@@ -98,23 +98,13 @@ class ProcessingStrategy(str, Enum):
       - PROGRESSIVE   same engine driven chunk-by-chunk over an ffmpeg PCM stream
 
     The legacy `BatchedFrameASRTDT`-based chunked + progressive engines were
-    retired in C6 once v2 parity was verified end-to-end on the LibriSpeech
-    test-clean + TED-LIUM 3 harness. String aliases `chunked_v2` /
-    `progressive_v2` map to CHUNKED / PROGRESSIVE for client-side backward
-    compatibility — see `parse_request_config`.
+    retired once v2 parity was verified end-to-end on the LibriSpeech
+    test-clean + TED-LIUM 3 harness.
     """
     AUTO = "auto"
     FULL = "full"
     CHUNKED = "chunked"
     PROGRESSIVE = "progressive"
-
-
-# Backward-compat aliases. Old clients sending `?strategy=chunked_v2` or
-# `progressive_v2` still work — they just route to the (now-default) v2 engine.
-_STRATEGY_ALIASES = {
-    "chunked_v2": "chunked",
-    "progressive_v2": "progressive",
-}
 
 
 # Strategy configuration.
@@ -584,11 +574,10 @@ def parse_request_config(
         ValueError: If any parameter value is outside its allowed range.
     """
     requested_strategy = (strategy or DEFAULT_STRATEGY).lower()
-    requested_strategy = _STRATEGY_ALIASES.get(requested_strategy, requested_strategy)
     try:
         strategy_enum = ProcessingStrategy(requested_strategy)
     except ValueError:
-        valid = [s.value for s in ProcessingStrategy] + sorted(_STRATEGY_ALIASES.keys())
+        valid = [s.value for s in ProcessingStrategy]
         raise ValueError(f"Invalid strategy '{requested_strategy}'. Must be one of: {valid}.")
 
     config = {
@@ -640,7 +629,7 @@ def resolve_strategy(
     """
     requested = client_config.get("strategy", ProcessingStrategy.AUTO)
     if isinstance(requested, str):
-        requested = ProcessingStrategy(_STRATEGY_ALIASES.get(requested, requested))
+        requested = ProcessingStrategy(requested)
 
     if requested != ProcessingStrategy.AUTO:
         return requested
@@ -1156,7 +1145,7 @@ async def handle_streaming_pcm(
                 "type": "final_transcription",
                 # Whisper-compatible fields
                 "task": "transcribe",
-                "language": "en",
+                "language": "english",
                 "duration": round(total_duration_processed_seconds_for_asr, 3),
                 "text": final_text_for_payload,
                 "segments": final_segments_for_payload,
@@ -1336,35 +1325,121 @@ async def _transcribe_full(
     return segments, asr_time
 
 
+_VALID_RESPONSE_FORMATS = {"json", "text", "srt", "verbose_json", "vtt"}
+
+
+def _build_openai_response(
+    *,
+    response_format: str,
+    segments: List[dict],
+    words: Optional[List[dict]],
+    full_text: str,
+    duration_s: float,
+    asr_time_s: float,
+    total_server_time_s: float,
+    resolved_strategy: ProcessingStrategy,
+) -> Response:
+    """Render a transcription result into the OpenAI-compatible shape the client
+    asked for via `response_format`. Falls back to JSON shape on unknown values.
+
+    Formats:
+      - `json` (default): {"text": ...} only — matches OpenAI exactly.
+      - `text`           : raw transcript text, content-type text/plain
+      - `srt`            : SubRip subtitle file, content-type text/plain
+      - `vtt`            : WebVTT subtitle file, content-type text/plain
+      - `verbose_json`   : full Whisper verbose_json shape (segments, tokens,
+                          timestamps, etc.) plus our server-side extensions
+                          (strategy, *_seconds, csv_content, srt_content).
+    """
+    if response_format == "text":
+        return PlainTextResponse(full_text)
+
+    if response_format == "srt":
+        return PlainTextResponse(generate_srt_content(segments), media_type="text/plain")
+
+    if response_format == "vtt":
+        return PlainTextResponse(_segments_to_vtt(segments), media_type="text/vtt")
+
+    if response_format == "verbose_json":
+        body = {
+            # OpenAI verbose_json shape
+            "task": "transcribe",
+            "language": "english",
+            "duration": round(duration_s, 3),
+            "text": full_text,
+            "segments": segments,
+            # Server extensions (not in OpenAI spec):
+            "strategy": resolved_strategy.value,
+            "transcription_time_seconds": round(asr_time_s, 3),
+            "total_request_time_server_seconds": total_server_time_s,
+            "audio_duration_seconds": round(duration_s, 3),
+            "csv_content": generate_csv_content(segments),
+            "srt_content": generate_srt_content(segments),
+        }
+        if words is not None:
+            body["words"] = words
+        return JSONResponse(content=body)
+
+    # Default / "json": minimal, just text — matches OpenAI's compact response.
+    return JSONResponse(content={"text": full_text})
+
+
+def _segments_to_vtt(segments: List[dict]) -> str:
+    """WebVTT serialization of segments. Simple and stdlib-only."""
+    def _fmt(t: float) -> str:
+        h = int(t // 3600)
+        m = int((t % 3600) // 60)
+        s = t % 60
+        return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+    lines = ["WEBVTT", ""]
+    for s in segments:
+        lines.append(f"{_fmt(s.get('start', 0.0))} --> {_fmt(s.get('end', 0.0))}")
+        lines.append((s.get("text") or "").strip())
+        lines.append("")
+    return "\n".join(lines)
+
+
 @app.post("/v1/audio/transcriptions")
 async def transcribe_endpoint_rest(
+    request: Request,
     file: UploadFile = File(...),
-    chunk_length: Optional[float] = Query(None, description="Duration of audio chunks for ASR in seconds. Uses server default if not set."),
-    chunk_overlap: Optional[float] = Query(None, description="Overlap between audio chunks in seconds. Uses server default if not set."),
-    batch_size: Optional[int] = Query(None, description="Batch size for ASR model processing. Uses server default if not set."),
-    long_audio_threshold: Optional[float] = Query(None, description="Threshold in seconds to apply long audio model settings. Uses server default if not set."),
-    strategy: Optional[str] = Query(None, description="Processing strategy: auto (default) → chunked. Explicit: full | chunked | progressive. Legacy aliases chunked_v2 / progressive_v2 still accepted."),
+    # OpenAI Whisper API-compatible form fields (multipart). All optional —
+    # only `file` is required. We accept-and-ignore the parameters Parakeet
+    # can't honor (model is fixed; greedy decoding means temperature is 0;
+    # we don't bias on `prompt`); they're listed here so OpenAI-SDK clients
+    # don't 422 when sending the standard payload.
+    model: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    response_format: str = Form("json"),
+    temperature: Optional[float] = Form(0.0),
+    # Server-specific extensions (query string — keep them out of the
+    # multipart form so OpenAI clients don't have to know about them).
+    chunk_length: Optional[float] = Query(None),
+    chunk_overlap: Optional[float] = Query(None),
+    batch_size: Optional[int] = Query(None),
+    long_audio_threshold: Optional[float] = Query(None),
+    strategy: Optional[str] = Query(None, description="auto (default) → chunked. Explicit: full | chunked | progressive."),
 ):
     """
-    Handles REST API requests for audio transcription of a single uploaded file.
+    POST /v1/audio/transcriptions — OpenAI Whisper API drop-in.
 
-    The endpoint expects a file upload. It processes the entire audio file,
-    performs transcription, and returns the results as JSON.
+    Parameters follow the OpenAI spec (multipart form):
+      - file (required) — audio file (wav, mp3, ogg, flac, m4a, etc.)
+      - response_format ∈ {json, text, srt, vtt, verbose_json}, default `json`
+      - model, language, prompt, temperature — accepted, with caveats:
+          model     : ignored (server is fixed to parakeet-tdt-0.6b-v2)
+          language  : ignored (Parakeet 0.6b is English-only)
+          prompt    : ignored (no prompt biasing in this model)
+          temperature: ignored (we use greedy decoding, effectively 0.0)
+      - timestamp_granularities[] ∈ {segment, word}, default ["segment"]
+          adding "word" populates a top-level `words` array (only on
+          response_format=verbose_json).
 
-    Query Parameters (Optional):
-        chunk_length: Overrides server default for ASR internal chunking (if model uses it).
-                      Note: For Parakeet TDT, the model might process the whole audio,
-                      but this can influence settings if `_apply_model_settings_for_session`
-                      uses it for decision duration. For this REST endpoint, total audio
-                      duration is used for `_apply_model_settings_for_session`.
-        chunk_overlap: Overrides server default for ASR internal chunking overlap.
-        batch_size: Overrides server default for batch size during NeMo's `transcribe` call.
-        long_audio_threshold: Overrides server default for the threshold that determines
-                              if long-audio specific model settings are applied.
-
-    Returns:
-        JSONResponse: Contains transcription text, segments, language, timing information,
-                      and SRT/CSV content. Returns an error response on failure.
+    Server extensions (query string):
+      - chunk_length, chunk_overlap, batch_size, long_audio_threshold
+      - strategy ∈ {auto, full, chunked, progressive}
     """
     if not asr_model:
         logger.error("REST Request: ASR model is not available.")
@@ -1372,6 +1447,43 @@ async def transcribe_endpoint_rest(
 
     request_id = base64.urlsafe_b64encode(os.urandom(6)).decode() # Short unique ID for logging
     logger.info(f"({request_id}) REST request received for file: '{file.filename}'. Content-type: {file.content_type}")
+
+    # Validate response_format up front so we fail fast on bad client input.
+    if response_format not in _VALID_RESPONSE_FORMATS:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Invalid response_format '{response_format}'. Must be one of: {sorted(_VALID_RESPONSE_FORMATS)}"},
+        )
+
+    # OpenAI's timestamp_granularities[] uses bracket-suffixed multipart keys,
+    # which FastAPI's `Form()` doesn't bind cleanly. Read the raw form to pick
+    # them up from either spelling, then normalize. Default to ["segment"]
+    # per OpenAI's spec.
+    requested_granularities: List[str] = ["segment"]
+    try:
+        raw_form = await request.form()
+        granularities = raw_form.getlist("timestamp_granularities[]") or raw_form.getlist("timestamp_granularities")
+        if granularities:
+            requested_granularities = [g for g in granularities if g in {"segment", "word"}]
+            if not requested_granularities:
+                requested_granularities = ["segment"]
+    except Exception:
+        pass  # If form re-read fails, fall back to default.
+    want_word_timestamps = "word" in requested_granularities
+
+    # Log (but ignore) OpenAI params we can't honor on Parakeet so callers can
+    # see them being accepted rather than 422'd.
+    ignored = []
+    if model is not None:
+        ignored.append(f"model={model!r} (server is fixed to {ASR_MODEL_NAME})")
+    if language is not None and language.lower() not in {"en", "english"}:
+        ignored.append(f"language={language!r} (model is English-only)")
+    if prompt:
+        ignored.append("prompt=<provided> (Parakeet has no prompt biasing)")
+    if temperature and temperature != 0.0:
+        ignored.append(f"temperature={temperature} (greedy decoding only)")
+    if ignored:
+        logger.info(f"({request_id}) REST: accepted-but-ignored OpenAI params: {'; '.join(ignored)}")
 
     try:
         # Parse and validate common ASR configuration from query parameters
@@ -1396,8 +1508,9 @@ async def transcribe_endpoint_rest(
         logger.info(f"({request_id}) REST Session: Will use float32 on {session_processing_device} for ASR computation.")
 
     start_time_total_request_processing = time.time()
-    final_response_content: Optional[dict] = None
-    response_status_code: int = 200 # Default to 200 OK
+    final_response_content: Optional[dict] = None  # error-path JSON body
+    success_response: Optional[Response] = None    # set on the happy path
+    response_status_code: int = 200
 
     try:
         # Acquire lock for exclusive ASR model access
@@ -1467,25 +1580,46 @@ async def transcribe_endpoint_rest(
                         full_transcribed_text = " ".join(s['text'] for s in segments).strip()
                         total_server_processing_time_s = round(time.time() - start_time_total_request_processing, 3)
 
-                        # OpenAI Whisper `verbose_json` compatible shape, plus
-                        # our own extension fields (strategy, *_seconds, csv/srt).
-                        final_response_content = {
-                            "task": "transcribe",
-                            "language": "en",
-                            "duration": round(total_audio_duration_s, 3),
-                            "text": full_transcribed_text,
-                            "segments": segments,
-                            # Extensions (non-Whisper):
-                            "strategy": resolved_strategy.value,
-                            "transcription_time_seconds": round(asr_processing_time_s, 3),
-                            "total_request_time_server_seconds": total_server_processing_time_s,
-                            "audio_duration_seconds": round(total_audio_duration_s, 3),
-                            "csv_content": generate_csv_content(segments),
-                            "srt_content": generate_srt_content(segments),
-                        }
+                        # Build word-level timestamps if the client requested them
+                        # (timestamp_granularities=["word"]). Aggregates each segment's
+                        # token IDs + the per-segment start/end to give real per-word
+                        # timestamps via the SentencePiece word-boundary marker.
+                        words_for_response: Optional[List[dict]] = None
+                        if want_word_timestamps and asr_model is not None:
+                            words_for_response = []
+                            for seg in segments:
+                                seg_tokens = seg.get("tokens") or []
+                                seg_start = seg.get("start", 0.0)
+                                seg_end = seg.get("end", seg_start)
+                                if not seg_tokens:
+                                    continue
+                                # Interpolate per-token times uniformly within the segment —
+                                # decoder per-token timestamps already landed in the segment
+                                # start/end, but we don't carry the per-token vector through
+                                # the helper. Even spacing across the segment span is a tight
+                                # approximation; the boundary tokens hit start and end exactly.
+                                n = len(seg_tokens)
+                                if n == 1:
+                                    times = [seg_start]
+                                else:
+                                    span = max(seg_end - seg_start, 0.0)
+                                    times = [seg_start + (i / (n - 1)) * span for i in range(n)]
+                                seg_words = tokens_to_words(seg_tokens, times, asr_model.tokenizer)
+                                words_for_response.extend(seg_words)
+
+                        success_response = _build_openai_response(
+                            response_format=response_format,
+                            segments=segments,
+                            words=words_for_response,
+                            full_text=full_transcribed_text,
+                            duration_s=total_audio_duration_s,
+                            asr_time_s=asr_processing_time_s,
+                            total_server_time_s=total_server_processing_time_s,
+                            resolved_strategy=resolved_strategy,
+                        )
                         response_status_code = 200
                         logger.info(
-                            f"({request_id}) REST: Transcription successful (strategy={resolved_strategy.value}). "
+                            f"({request_id}) REST: Transcription successful (strategy={resolved_strategy.value}, format={response_format}). "
                             f"Duration: {total_audio_duration_s:.2f}s, ASR time: {asr_processing_time_s:.2f}s, segments: {len(segments)}."
                         )
 
@@ -1511,12 +1645,15 @@ async def transcribe_endpoint_rest(
                 )
                 logger.info(f"({request_id}) REST: ASR Model state reverted after session.")
         
-        # If, after releasing the lock, no specific response was prepared (should be rare)
+        # Success path: return the rendered OpenAI-shaped response.
+        if success_response is not None:
+            return success_response
+
+        # Error path: build a JSON error response from final_response_content.
         if final_response_content is None:
-            logger.error(f"({request_id}) REST: final_response_content is None after model lock release. Setting generic error.")
+            logger.error(f"({request_id}) REST: No response prepared after model lock release. Setting generic error.")
             response_status_code = 500
             final_response_content = {"error": "An unknown error occurred while processing the REST request."}
-            
         return JSONResponse(status_code=response_status_code, content=final_response_content)
 
     except Exception as e_outer_rest_handler:
@@ -1632,7 +1769,7 @@ async def _ws_accumulate_then_process(
         "type": "final_transcription",
         # Whisper-compatible fields
         "task": "transcribe",
-        "language": "en",
+        "language": "english",
         "duration": round(audio_duration_s, 3),
         "text": text,
         "segments": segments,

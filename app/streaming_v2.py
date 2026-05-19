@@ -270,6 +270,13 @@ class StreamingPrevBatchedEngine:
                 input_signal_length=self.buffer.context_size_batch.total(),
             )
         encoder_output = encoder_output.transpose(1, 2)  # [B, T, C]
+        # The captured CUDA graph (decoding_computer) was warmed up during the
+        # FULL transcribe path under NeMo's own autocast and baked in bf16
+        # inputs. Our direct asr_model(input_signal=...) call returns fp32
+        # outputs on this code path (likely because the encoder's final op
+        # falls outside autocast's coverage). Force the dtype to the model's
+        # pinned bf16 so the captured Linear weights see matching input.
+        encoder_output = encoder_output.to(dtype=self._dtype)
 
         # Slice off the left context — we don't want to redecode tokens already
         # emitted in earlier chunks.

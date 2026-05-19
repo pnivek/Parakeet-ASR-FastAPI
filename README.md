@@ -224,23 +224,36 @@ If you need sub-second emission, you need a cache-aware streaming checkpoint (se
 
 ## Web Interface
 
-Open `http://localhost:8777/` in a browser. Features:
+Open `http://localhost:8777/` in a browser. The bundled SPA (React + Vite + TypeScript, sources in `app/web/`) covers:
 
-- Upload an audio file.
-- Pick REST, WebSocket Full Upload, or WebSocket Live Stream.
-- Choose a strategy (`auto` / `full` / `chunked` / `progressive`).
-- Toggle `progressive_refinement` and `live_latency`.
-- Inspect the resolved strategy, transcription time, and segment table (click a row to scrub).
-- Download CSV / SRT.
-- Optional debug log panel.
+- **File upload** — drag-drop or click-pick, multipart `POST /v1/audio/transcriptions` with live progress bar.
+- **Live mic capture** — `MediaRecorder(audio/webm;codecs=opus)` over `WS /v1/audio/transcriptions`. Audio is preserved client-side so segments stay seekable after recording stops.
+- **Format-driven output** — `response_format` selector (`json` / `verbose_json` / `text` / `srt` / `vtt`) swaps the result view. `verbose_json` shows the full Whisper segment table, per-segment metadata expansion (tokens, temperature, compression_ratio, avg_logprob, no_speech_prob — honest tooltips on the fields that are unavailable or non-applicable for Parakeet TDT), and a clickable word timeline when `timestamp_granularities[]=word`.
+- **Audio playback + segment seek** — one shared `<audio>` element. Clicking a segment row or a word seeks the audio. The playing segment and word get a live highlight.
+- **Persisted settings** — strategy, response format, granularities, `live_latency`, `progressive_refinement`, batch_size, etc., all kept in `localStorage` (Zustand `persist` middleware).
+- **Theme switch** — System / Light / Dark in the header.
 
 ## Development
+
+### Backend
 
 ```bash
 python -m venv venv && source venv/bin/activate
 pip install -r app/requirements.txt
 cd app && LOG_LEVEL=DEBUG python main.py
 ```
+
+### Frontend (live-reload against the backend)
+
+```bash
+cd app/web
+npm install
+npm run dev        # Vite at http://localhost:5173, proxies /v1, /health, /readyz to :8777
+```
+
+Override the backend target with `PARAKEET_URL=http://host:port npm run dev` (e.g., when developing the SPA against a remote GPU box). For a production build, `npm run build` emits to `app/static/`, which the FastAPI server already mounts.
+
+See `app/web/README.md` for the client architecture overview.
 
 ## Troubleshooting
 

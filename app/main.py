@@ -2067,6 +2067,18 @@ class StreamingTdtEngine:
             features, _ = self.frame_asr.raw_preprocessor(input_signal=audio, length=length)
         features = features.squeeze(0).detach().cpu().numpy()
 
+        # Per-chunk preprocessing produces one extra time frame compared to
+        # `_feature_frame_len` because of the windowing edge — AudioFeatureIterator
+        # avoids this by preprocessing the full waveform once and slicing.
+        # Trim/pad to the bufferer's expected `n_frame_len` so the FIFO insert
+        # broadcasts cleanly into the [batch, n_feat, total_buffer_len] buffer.
+        n_frame_len = self.frame_asr.frame_bufferer.n_frame_len
+        if features.shape[1] > n_frame_len:
+            features = features[:, :n_frame_len]
+        elif features.shape[1] < n_frame_len:
+            pad = np.zeros((features.shape[0], n_frame_len - features.shape[1]), dtype=features.dtype)
+            features = np.concatenate([features, pad], axis=1)
+
         # FIFO slide + insert at the right end; returns a list-of-list-of-buffers
         # because BatchedFrameASR expects the data_layer interface to consume it.
         frame_buffers = self.frame_asr.frame_bufferer.get_frame_buffers([features])

@@ -255,6 +255,15 @@ asr_model: Optional[NeMoASRModelType] = None
 global_original_model_device_str: str = "cpu"  # Default, will be updated after model load
 global_original_model_dtype_torch: torch.dtype = torch.float32 # Default
 
+# Dual-decoder pinning — both RNNTDecoding instances built once at startup.
+# `decoding_greedy_batch` is the active default (used by FULL and the legacy
+# chunked fallback). `decoding_stateful_tdt` is used by BatchedFrameASRTDT
+# (CHUNKED stateful + PROGRESSIVE streaming). Swapping by reference instead
+# of via change_decoding_strategy() preserves the captured CUDA graph in
+# each decoder's decoding_computer across requests.
+decoding_greedy_batch = None
+decoding_stateful_tdt = None
+
 try:
     logger.info(f"Loading ASR model: {ASR_MODEL_NAME}...")
     # Load the pre-trained NeMo ASR model
@@ -296,7 +305,7 @@ try:
         # so transcribe(timestamps=True) doesn't trigger the internal rebuild
         # on the first call (would otherwise hit a brief inconsistent state).
         try:
-            from omegaconf import open_dict
+            from omegaconf import open_dict, OmegaConf
             cfg = asr_model.cfg.decoding
             with open_dict(cfg):
                 cfg.compute_timestamps = True
@@ -324,8 +333,42 @@ try:
                 f"compute_timestamps=True. cuda_graphs_mode={final_mode!r}, "
                 f"allow_cuda_graphs={final_allow!r}"
             )
+
+            # Pre-build the second decoder needed by BatchedFrameASRTDT
+            # (greedy + preserve_alignments=True + fused_batch_size=-1). The
+            # streaming/chunked paths swap between the two by reference
+            # instead of calling change_decoding_strategy(), so each decoder
+            # KEEPS its captured CUDA graph across requests. Without this,
+            # every stateful request rebuilt the computer and re-captured.
+            decoding_greedy_batch = asr_model.decoding
+            cfg_greedy_batch = OmegaConf.create(OmegaConf.to_container(asr_model.cfg.decoding, resolve=True))
+
+            stateful_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+            with open_dict(stateful_cfg):
+                stateful_cfg.strategy = "greedy"
+                stateful_cfg.preserve_alignments = True
+                stateful_cfg.fused_batch_size = -1
+                stateful_cfg.compute_timestamps = True
+                if "greedy" in stateful_cfg:
+                    with open_dict(stateful_cfg.greedy):
+                        stateful_cfg.greedy.use_cuda_graph_decoder = USE_CUDA_GRAPHS
+            asr_model.change_decoding_strategy(stateful_cfg, verbose=False)
+            decoding_stateful_tdt = asr_model.decoding
+
+            # Reinstate the greedy_batch decoding as the active default.
+            # asr_model.cfg.decoding currently points at stateful_cfg; restore
+            # it to cfg_greedy_batch so transcribe()'s compute_timestamps
+            # check (rnnt_models.py:301-315) sees the correct config.
+            asr_model.decoding = decoding_greedy_batch
+            asr_model.cfg.decoding = cfg_greedy_batch
+            logger.info(
+                "Dual decoder ready: greedy_batch (active) + greedy/preserve_alignments "
+                "(for BatchedFrameASRTDT). Both keep independent captured CUDA graphs."
+            )
         except Exception as e_cg:
             logger.warning(f"config-level cuda-graph disable failed: {e_cg}", exc_info=True)
+            decoding_greedy_batch = None
+            decoding_stateful_tdt = None
 
         # Globals now reflect the pinned resting state, not where NeMo first put it.
         global_original_model_device_str = str(next(asr_model.parameters()).device)
@@ -2361,29 +2404,49 @@ def _stateful_chunked_sync(
 
 async def _swap_decoder_to_stateful_tdt() -> dict:
     """
-    Transiently switch the global decoder to (greedy, preserve_alignments=True,
-    fused_batch_size=-1) — the configuration BatchedFrameASRTDT needs. Returns
-    a `saved` dict that `_restore_decoder` consumes to put things back.
+    Switch the active decoder reference to the pre-built greedy +
+    preserve_alignments=True instance (`decoding_stateful_tdt`) used by
+    BatchedFrameASRTDT. Returns the previous decoder ref so `_restore_decoder`
+    can put it back.
+
+    Both decoders are constructed once at model load and live in module-level
+    globals (`decoding_greedy_batch`, `decoding_stateful_tdt`). Reference swap
+    is O(1) and — crucially — preserves the CUDA graph captured inside each
+    decoder's `decoding_computer` across requests. The previous implementation
+    called `change_decoding_strategy()` per request, which rebuilt the
+    computer and threw away the captured graph each time.
 
     Caller MUST be holding `model_access_lock`.
     """
-    from omegaconf import open_dict
-    decoding_cfg = asr_model.cfg.decoding
-    saved = {
-        "strategy": decoding_cfg.strategy,
-        "preserve_alignments": decoding_cfg.get("preserve_alignments", False),
-        "fused_batch_size": decoding_cfg.get("fused_batch_size", -1),
-    }
-    with open_dict(decoding_cfg):
-        decoding_cfg.strategy = "greedy"
-        decoding_cfg.preserve_alignments = True
-        decoding_cfg.fused_batch_size = -1
-    await _run_on_asr_executor(asr_model.change_decoding_strategy, decoding_cfg, verbose=False)
+    if decoding_stateful_tdt is None:
+        # Init never finished building the second decoder — fall back to the
+        # slow path so chunked/streaming still works.
+        from omegaconf import open_dict
+        decoding_cfg = asr_model.cfg.decoding
+        fallback_saved = {
+            "kind": "config_rebuild",
+            "strategy": decoding_cfg.strategy,
+            "preserve_alignments": decoding_cfg.get("preserve_alignments", False),
+            "fused_batch_size": decoding_cfg.get("fused_batch_size", -1),
+        }
+        with open_dict(decoding_cfg):
+            decoding_cfg.strategy = "greedy"
+            decoding_cfg.preserve_alignments = True
+            decoding_cfg.fused_batch_size = -1
+        await _run_on_asr_executor(asr_model.change_decoding_strategy, decoding_cfg, verbose=False)
+        return fallback_saved
+
+    saved = {"kind": "ref_swap", "prev_decoding": asr_model.decoding}
+    asr_model.decoding = decoding_stateful_tdt
     return saved
 
 
 async def _restore_decoder(saved: dict) -> None:
-    """Put the decoder strategy back to what `_swap_decoder_to_stateful_tdt` captured."""
+    """Reverse of `_swap_decoder_to_stateful_tdt`."""
+    if saved.get("kind") == "ref_swap":
+        asr_model.decoding = saved["prev_decoding"]
+        return
+    # Config-rebuild fallback path
     from omegaconf import open_dict
     decoding_cfg = asr_model.cfg.decoding
     with open_dict(decoding_cfg):

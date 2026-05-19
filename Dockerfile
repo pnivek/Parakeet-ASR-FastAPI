@@ -1,3 +1,15 @@
+# --- Stage 1: build the React/Vite client. -----------------------------
+# Output lands in /static (vite.config.ts sets build.outDir='../static',
+# relative to WORKDIR=/web). Stage 2 copies it into /app/static.
+# Done first because there are no GPU/torch deps and rebuilds take ~5s.
+FROM node:20-alpine AS webbuild
+WORKDIR /web
+COPY app/web/package.json app/web/package-lock.json* ./
+RUN npm ci --no-audit --no-fund
+COPY app/web/ ./
+RUN npm run build
+
+# --- Stage 2: the actual ASR runtime. ----------------------------------
 FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
 
 # Swap the arm64 Ubuntu mirror. The default ports.ubuntu.com (Canonical's
@@ -46,8 +58,12 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir nemo_toolkit[asr]==2.7.3
 
 COPY app/ /app/
-RUN mkdir -p /app/static
-RUN if [ -f /app/index.html ]; then cp /app/index.html /app/static/; fi
+# Strip the client source tree from the runtime image — it was already
+# compiled in the webbuild stage; we only need the bundled output.
+RUN rm -rf /app/web
+# vite.config.ts writes to '../static' relative to /web, so the build
+# output lands in /static inside the webbuild stage.
+COPY --from=webbuild /static /app/static
 
 EXPOSE 8777
 

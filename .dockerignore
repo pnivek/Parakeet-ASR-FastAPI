@@ -32,6 +32,14 @@ ENV/
 # Test harness — fixtures (~850 MB) and results not needed in image
 tests/
 
+# Web client — only the source is needed in the webbuild stage; node_modules
+# and the local Vite-built dist must NOT be copied into the image.
+app/web/node_modules/
+app/web/dist/
+# The Vite build target. The image rebuilds the client from source in the
+# webbuild stage and copies the result in, so don't ship any local copy.
+app/static/
+
 # Claude runtime state
 .claude/
 

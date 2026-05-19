@@ -1,224 +1,241 @@
 # Parakeet ASR
 
-A high-performance Automatic Speech Recognition (ASR) server built with NVIDIA's NeMo Parakeet model. This application provides both REST API and WebSocket interfaces for transcribing audio files to text, with an interactive web UI for easy use.
+High-performance Automatic Speech Recognition (ASR) server built on NVIDIA's NeMo Parakeet-TDT-0.6B-v2. REST and WebSocket APIs, an interactive web UI, and a stateful streaming pipeline that carries decoder state across chunk boundaries.
 
-## 🚀 Features
+## Features
 
-- **State-of-the-art ASR**: Powered by NVIDIA's parakeet-tdt-0.6b-v2 model.
-- **Multiple APIs**:
-  - REST API for robust file transcriptions, including improved handling for long audio files up to 3 hours.
-  - WebSocket API for chunk-based, live transcription of audio files with no file limits.
-- **Versatile Output**: Transcriptions available as plain text, segment lists, CSV, and SRT formats.
-- **Interactive Web UI**: Built-in browser interface for easy testing, segment playback, and result downloads.
-- **Docker Ready**: Easy deployment using Docker containers.
-- **Configurable**: Multiple environment variables to tune performance.
+- **State-of-the-art ASR** — `nvidia/parakeet-tdt-0.6b-v2` (Token-and-Duration Transducer).
+- **Three processing strategies** behind one dispatcher:
+  - `full` — single transcribe pass, best quality, up to `MAX_FULL_WAVEFORM_S` (default 24 min).
+  - `chunked` — stateful sliding-window via `BatchedFrameASRTDT`. Decoder state carries across chunks, eliminating boundary duplication/drop artifacts. Falls back to a legacy independent-chunk path above `STATEFUL_MAX_DURATION_S` (~4× faster for very long files).
+  - `progressive` — live WebSocket streaming. Drives the same `BatchedFrameASRTDT` engine chunk-by-chunk over an ffmpeg PCM stream, emitting sentence-bounded partials as the middle-token merge commits them.
+- **Per-token timestamps** recovered from the stateful TDT merge — segment starts/ends align with the `full` strategy within ~40ms.
+- **Optional end-of-stream refinement** — `progressive_refinement` runs a single FULL pass over the accumulated PCM at EOF and replaces the streamed segments with offline-quality output.
+- **Versatile output** — plain text, segment list (with start/end), CSV, SRT.
+- **Interactive Web UI** — file upload, strategy selector, segment playback, downloads.
+- **Health probes** — `/health` for liveness + introspection, `/readyz` for readiness gating.
+- **Docker-ready** — single image, configurable via `.env` or environment variables.
 
-## 📋 Requirements
+## Requirements
 
 - Python 3.10+
-- NVIDIA GPU with CUDA support (recommended for optimal performance)
-- Docker (optional, but recommended for deployment)
-- Dependencies listed in `app/requirements.txt`
+- NeMo Toolkit 2.7.3 (the stateful TDT streaming utilities require ≥ 2.4.0)
+- NVIDIA GPU + CUDA 12.x recommended; the server runs on CPU but transcription will be much slower
+- Docker (optional but recommended)
+- Dependencies in `app/requirements.txt`
 
-## 🛠️ Installation
+## Installation
 
-### Using Docker (Recommended) (Mac/Linux/Windows)
-
-The easiest way to run Parakeet ASR is using Docker:
+### Docker (recommended)
 
 ```bash
-# Clone the repository
 git clone https://github.com/pnivek/Parakeet-ASR-FastAPI.git
 cd Parakeet-ASR-FastAPI
-
-# Build the Docker image
 docker build -t parakeet-asr .
-
-# Run the container
-# Ensure your Docker setup allows GPU access if you have an NVIDIA GPU
 docker run --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -p 8777:8777 parakeet-asr
 ```
 
-### Manual Installation (Mac/Linux)
-
-If you prefer to run without Docker:
+### Manual
 
 ```bash
-# Clone the repository
 git clone https://github.com/pnivek/Parakeet-ASR-FastAPI.git
 cd Parakeet-ASR-FastAPI
-
-# Install dependencies (ensure you have build tools for packages that need compilation)
-# It's recommended to use a virtual environment
-# python -m venv venv
-# source venv/bin/activate
+python -m venv venv && source venv/bin/activate
 pip install -r app/requirements.txt
-
-# Run the application
-cd app
-python main.py
+cd app && python main.py
 ```
 
-## ⚙️ Configuration
+## Configuration
 
-The application can be configured using environment variables or a `.env` file in the `app` directory:
+Configure via environment variables or `app/.env`.
+
+### Core
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `BATCH_SIZE` | ASR batch size during inference (primarily for REST endpoint with long audio) | 1 |
-| `NUM_WORKERS` | Number of workers for NeMo's `transcribe` method | 0 |
-| `TRANSCRIBE_CHUNK_LEN` | Audio chunk length in seconds (Websocket chunked inference) | 30 |
-| `TRANSCRIBE_OVERLAP` | Overlap between chunks in seconds (Websocket chunked inference) | 5 |
-| `LONG_AUDIO_THRESHOLD` | length threshold before using long audio strategy | 480 |
-| `PORT` | Server port | 8777 |
-| `LOG_LEVEL` | Logging level (e.g., INFO, DEBUG) | INFO |
+| `BATCH_SIZE` | ASR batch size during chunked inference | 4 |
+| `NUM_WORKERS` | DataLoader workers for `transcribe()` | 0 |
+| `TRANSCRIBE_CHUNK_LEN` | Legacy chunk length (s) | 30 |
+| `TRANSCRIBE_OVERLAP` | Legacy chunk overlap (s) | 5 |
+| `LONG_AUDIO_THRESHOLD` | Switch to `rel_pos_local_attn` for audio longer than this (s) | 480 |
+| `PORT` | HTTP/WS port | 8777 |
+| `LOG_LEVEL` | Python logging level | INFO |
 
-## 🔌 API Documentation
+### Strategy dispatch
 
-> **Note:** Both the REST and WebSocket APIs require the entire audio file to be uploaded to the server. The WebSocket API streams back transcription segments as they are processed, but does not support true partial audio upload or real-time audio streaming from the client. The difference is in how results are returned: REST returns all results at once after processing, while WebSocket returns segments as they are transcribed.
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DEFAULT_STRATEGY` | `auto` \| `full` \| `chunked` \| `progressive`. `auto` picks based on duration and stream state. | auto |
+| `MAX_FULL_WAVEFORM_S` | Hard cap for `full`; longer audio routes to `chunked`. Default matches NeMo's full-attention ceiling. | 1440 |
+| `EARLY_BUFFER_TARGET_S` | Progressive mode — PCM seconds buffered before the first partial. | 15 |
 
-### REST API
+### Stateful streaming engine
 
-The REST API uses a similar inference strategy implemented here: https://huggingface.co/spaces/nvidia/parakeet-tdt-0.6b-v2
+`BatchedFrameASRTDT` powers both `chunked` and `progressive`. Buffer geometry follows NVIDIA's `<left>-<chunk>-<right>` presets in seconds.
 
-#### Transcribe Audio
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `USE_STATEFUL_CHUNKED` | Enable the stateful engine for `chunked` and `progressive`. When false, both fall back to the legacy independent-chunk consumer. | true |
+| `STATEFUL_MAX_DURATION_S` | Above this duration, `chunked` falls back to the legacy path (~4× faster on long audio, slightly lower boundary quality). `0` disables the cap. | 1800 |
+| `STREAMING_LEFT_CONTEXT_S` | Left context for the offline-like 10-10-5 preset | 10 |
+| `STREAMING_CHUNK_S` | Chunk length for the offline-like preset | 10 |
+| `STREAMING_RIGHT_CONTEXT_S` | Right context for the offline-like preset | 5 |
+| `STREAMING_LIVE_CHUNK_S` | Chunk length when client opts into `live_latency` (10-2-2 preset, ~4s latency) | 2 |
+| `STREAMING_LIVE_RIGHT_CONTEXT_S` | Right context for the live preset | 2 |
+
+Measured wall-clock on a DGX Spark (single-stream):
+
+| Path | RTF | 30 min file | 3 h file |
+|------|-----|-------------|----------|
+| Stateful (10-10-5) | ~0.022 | ~40 s | ~4 min |
+| Legacy fallback | ~0.005 | ~9 s | ~1 min |
+
+### Experimental — CUDA graph decoder
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `USE_CUDA_GRAPHS` | Enable NeMo's CUDA-graph RNNT/TDT decoder. Currently default off — H1 (single-thread executor) was tested and doesn't unblock; investigation parked at `.claude/plans/cuda-graph-investigation.md`. | false |
+
+## API
+
+### REST
 
 ```
 POST /v1/audio/transcriptions
 ```
 
-**Request:**
-- Content-Type: `multipart/form-data`
-- Body: Form with an audio file attached as `file` (e.g., WAV, MP3, FLAC, OGG).
+Form upload (`file=@…`), optional query parameters:
 
-**Response (Example):**
+| Query param | Description |
+|-------------|-------------|
+| `strategy` | `auto` \| `full` \| `chunked`. `auto` honors `DEFAULT_STRATEGY`. |
+| `chunk_length`, `chunk_overlap`, `batch_size`, `long_audio_threshold` | Override server defaults. |
+
+Example:
+
+```bash
+curl -X POST -F "file=@audio.mp3" \
+  "http://localhost:8777/v1/audio/transcriptions?strategy=chunked"
+```
+
+Response:
+
 ```json
 {
-  "text": "The complete transcribed text. This is the first segment. This is the second segment.",
-  "segments": [
-    {
-      "id": 0,
-      "start": 0.0,
-      "end": 2.55,
-      "text": "This is the first segment.",
-      "seek": 0,
-      "tokens": [],
-      "temperature": 0.0,
-      "avg_logprob": null,
-      "compression_ratio": null,
-      "no_speech_prob": null
-    },
-    {
-      "id": 1,
-      "start": 2.56,
-      "end": 5.2,
-      "text": "This is the second segment.",
-      "seek": 0,
-      "tokens": [],
-      "temperature": 0.0,
-      "avg_logprob": null,
-      "compression_ratio": null,
-      "no_speech_prob": null
-    }
-  ],
+  "text": "...",
+  "segments": [{ "id": 0, "start": 0.0, "end": 11.32, "text": "...sentence..." }, ...],
   "language": "en",
-  "transcription_time": 1.234,
-  "csv_content": "Start (s),End (s),Segment\\n0.000,2.550,This is the first segment.\\n2.560,5.200,This is the second segment.\\n",
-  "srt_content": "1\\n00:00:00,000 --> 00:00:02,550\\nThis is the first segment.\\n\\n2\\n00:00:02,560 --> 00:00:05,200\\nThis is the second segment.\\n\\n"
+  "strategy": "chunked",
+  "transcription_time_seconds": 1.13,
+  "total_request_time_server_seconds": 1.45,
+  "audio_duration_seconds": 21.55,
+  "csv_content": "...",
+  "srt_content": "..."
 }
 ```
 
-### WebSocket API
+### WebSocket — unified
 
-The WebSocket API processes audio in chunks, allowing for real-time streaming of large audio files and receiving transcribed segments as they become available.
-
-> **Important:** The WebSocket API requires the full audio file to be uploaded (in chunks or as a stream), just like the REST API. It does not support continuous, live audio streaming from the client.
-Connect to `/v1/audio/transcriptions/ws` endpoint:
-
-1.  **Connection**: Establish a WebSocket connection.
-2.  **Configuration (Optional but Recommended)**: Send a JSON message with audio configuration details:
-    ```json
-    {
-      "sample_rate": 16000, // Client's audio sample rate
-      "channels": 1,        // Client's audio channels
-      "format": "binary"    // "binary" for raw bytes, "base64" for base64 encoded strings
-    }
-    ```
-    If not sent, the server may assume defaults or try to infer from the data, but providing it is more robust.
-3.  **Audio Data**: Send audio data in binary chunks (if `format: "binary"`) or as base64 encoded text messages (if `format: "base64"`).
-4.  **End Signal**: After sending all audio data, send a text message "END" to signal the end of the audio stream.
-5.  **Receiving Results (Segments)**: As audio chunks are processed, the server sends back JSON messages for each transcribed segment. These messages typically look like:
-    ```json
-    {
-      "id": 0,                   // Segment sequence ID
-      "start": 0.0,              // Start time of the segment in seconds
-      "end": 2.55,               // End time of the segment in seconds
-      "text": "Segment text",    // Transcribed text for this segment
-      "type": "segment"          // Indicates this is an intermediate segment message
-                                 // (Actual key might be 'type': 'segment_transcription' or similar based on server implementation)
-    }
-    ```
-6.  **Final Result**: After all audio is processed and the "END" signal is received, the server sends a final summary message. This message includes the full aggregated text, total processing time, and the complete transcription in CSV and SRT formats:
-    ```json
-    {
-      "type": "final_transcription",
-      "text": "The complete transcribed text...",
-      "language": "en",
-      "transcription_time": 10.567,
-      "total_segments": 50,
-      "final_duration_processed_seconds": 120.5,
-      "csv_content": "Start (s),End (s),Segment\\n...",
-      "srt_content": "1\\n00:00:00,000 --> ...\\n..."
-    }
-    ```
-
-## 🖥️ Web Interface
-
-A user-friendly web interface is available at the root URL (`/`) when the server is running. This interface allows for easy interaction and testing of the ASR service:
-
--   Upload audio files for transcription.
--   Choose between REST API (full file upload) and WebSocket API (chunked processing for streaming simulation).
--   View transcription results, including the full text and timing information.
--   **Displays transcription segments in an interactive table.**
--   **Allows playback of individual audio segments by clicking on rows in the table.**
--   **Provides download options for the full transcription in CSV and SRT formats.**
--   Includes a debug mode for viewing detailed logs and message exchanges.
-
-## 🛠️ Development
-
-To set up a development environment:
-
-```bash
-# Clone the repository
-git clone https://github.com/pnivek/Parakeet-ASR-FastAPI.git
-cd Parakeet-ASR-FastAPI
-
-# Create and activate a virtual environment (recommended)
-python -m venv venv
-# On Windows: venv\Scripts\activate
-# On macOS/Linux: source venv/bin/activate
-
-# Install dependencies
-pip install -r app/requirements.txt
-
-# Run with debug logging (from the 'app' directory)
-cd app
-LOG_LEVEL=DEBUG python main.py
+```
+WS /v1/audio/transcriptions
 ```
 
-## 🔍 Troubleshooting
+The first frame is a JSON config; subsequent frames are audio bytes; an empty binary frame or the text `"END"` signals end-of-stream.
 
-Common issues:
+Config frame:
 
--   **Model Loading Errors**: Ensure you have enough GPU memory. If using CPU, transcription will be significantly slower.
+```json
+{
+  "sample_rate": 16000,
+  "channels": 1,
+  "bytes_per_sample": 2,
+  "format": "wav",
+  "chunk_length": 30.0,
+  "chunk_overlap": 5.0,
+  "batch_size": 1,
+  "long_audio_threshold": 480.0,
+  "strategy": "progressive",
+  "progressive_refinement": true,
+  "live_latency": false
+}
+```
 
-## 📄 License
+Messages from the server (one or more):
 
-This project is licensed under the [MIT License](LICENSE).
+| `type` | When | Notable fields |
+|--------|------|----------------|
+| `segments_batch` | After each engine commit (sentence-bounded) | `segments[]` |
+| `refined_transcription` | After EOF if `progressive_refinement` triggered | `segments`, `text`, `transcription_time`, `audio_duration_seconds` |
+| `final_transcription` | Last message before close | `text`, `segments`, `transcription_time`, `total_segments`, `csv_content`, `srt_content`, `refinement_applied` |
+| `error` | On server error | `error` |
 
-## 🙏 Acknowledgements
+### WebSocket — legacy aliases
 
--   [NVIDIA NeMo](https://github.com/NVIDIA/NeMo) for the Parakeet ASR model
--   [FastAPI](https://fastapi.tiangolo.com/) for the web framework
--   [PyTorch](https://pytorch.org/) and [torchaudio](https://pytorch.org/audio) for audio processing
--   The developers of all other libraries listed in `requirements.txt`.
+These remain as thin compatibility wrappers and forward to the unified handler with `strategy` forced.
+
+```
+WS /v1/audio/transcriptions/ws_upload   # forces strategy=chunked
+WS /v1/audio/transcriptions/ws_stream   # forces strategy=progressive
+```
+
+### Health
+
+```
+GET /health
+```
+
+Always 200 once the process is up. Returns model + decoder + config snapshot. Suitable for both liveness and observability.
+
+```
+GET /readyz
+```
+
+200 with `{"status":"ready","model_loaded":true}` once the ASR model is loaded; 503 with `{"status":"not_ready"}` otherwise. Use this for orchestrator readiness gates.
+
+## Strategy guidance
+
+| If… | Use |
+|-----|-----|
+| File ≤ 24 min, want best quality | `full` |
+| File 24 min – 30 min, want best chunked quality | `chunked` (stateful) |
+| File > 30 min | `chunked` (auto-falls-back to legacy above `STATEFUL_MAX_DURATION_S`) |
+| Live audio, low latency more important than chunk-boundary quality | `progressive` + `live_latency: true` |
+| Live audio, want offline-quality output after EOF | `progressive` + `progressive_refinement: true` (default) |
+
+The 10-10-5 and 10-2-2 presets come from NVIDIA's TDT streaming benchmarks; 10-10-5 yields "results similar to offline," 10-2-2 yields ~4 s live latency at slightly lower quality.
+
+## Web Interface
+
+Open `http://localhost:8777/` in a browser. Features:
+
+- Upload an audio file.
+- Pick REST, WebSocket Full Upload, or WebSocket Live Stream.
+- Choose a strategy (`auto` / `full` / `chunked` / `progressive`).
+- Toggle `progressive_refinement` and `live_latency`.
+- Inspect the resolved strategy, transcription time, and segment table (click a row to scrub).
+- Download CSV / SRT.
+- Optional debug log panel.
+
+## Development
+
+```bash
+python -m venv venv && source venv/bin/activate
+pip install -r app/requirements.txt
+cd app && LOG_LEVEL=DEBUG python main.py
+```
+
+## Troubleshooting
+
+- **Model load OOM** — Parakeet-TDT-0.6B-v2 needs roughly 4 GB GPU memory in bf16. Reduce to fp16/fp32 with care; this server pins bf16 at load on CUDA-bf16-capable hardware.
+- **`cudaErrorIllegalAddress` on repeated transcribes** — keep `USE_CUDA_GRAPHS=false` (the default). The investigation notes are in `.claude/plans/cuda-graph-investigation.md`.
+- **Stateful chunked feels slow on multi-hour files** — that's by design; the FIFO engine is batch-1 and trades throughput for boundary quality. `STATEFUL_MAX_DURATION_S` controls the auto-fallback to the faster independent-chunk path.
+
+## License
+
+[MIT](LICENSE).
+
+## Acknowledgements
+
+- [NVIDIA NeMo](https://github.com/NVIDIA/NeMo) for the Parakeet-TDT model and the `BatchedFrameASRTDT` streaming utilities.
+- [FastAPI](https://fastapi.tiangolo.com/) for the web framework.
+- [PyTorch](https://pytorch.org/) and [torchaudio](https://pytorch.org/audio) for audio processing.

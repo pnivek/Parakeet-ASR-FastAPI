@@ -1005,10 +1005,33 @@ async def handle_streaming_pcm(
                        chunk_length, overlap, batch_size, format, etc.
     """
     sent_segments_pcm: List[dict] = [] # Stores all segments sent to client for final aggregation
-    
-    # ASR chunking parameters based on target 16kHz mono PCM from ffmpeg
-    asr_chunk_len_s = client_config["chunk_length"]
-    asr_chunk_overlap_s = client_config["chunk_overlap"]
+
+    # `live_latency` (client opt-in) trades quality for latency: the smaller
+    # 10-2-2 NVIDIA preset emits partials every ~2s instead of every chunk
+    # length. We map it onto the legacy independent-chunk consumer by shrinking
+    # the chunk_length and overlap. (Once progressive migrates onto
+    # BatchedFrameASRTDT, this should switch to the engine's chunk_secs /
+    # left/right_context_secs knobs.)
+    live_latency = bool(client_config.get("live_latency", False))
+    if live_latency:
+        asr_chunk_len_s = STREAMING_LIVE_CHUNK_S
+        asr_chunk_overlap_s = min(client_config.get("chunk_overlap", 0.0), STREAMING_LIVE_CHUNK_S - 0.1)
+        if asr_chunk_overlap_s < 0:
+            asr_chunk_overlap_s = 0.0
+        logger.info(
+            f"({session_id}) Stream: live_latency=True → using {asr_chunk_len_s}s chunks "
+            f"(overlap {asr_chunk_overlap_s:.2f}s) instead of client's {client_config['chunk_length']}s."
+        )
+    else:
+        asr_chunk_len_s = client_config["chunk_length"]
+        asr_chunk_overlap_s = client_config["chunk_overlap"]
+
+    # `progressive_refinement` (defaults True): after EOF, if the full audio
+    # fits the FULL-mode ceiling, run a single transcribe pass over the entire
+    # buffered PCM and emit a `refined_transcription` message — better quality
+    # than the streamed partials, since FULL gets the whole context at once.
+    progressive_refinement = bool(client_config.get("progressive_refinement", True))
+    refinement_pcm_accumulator: Optional[bytearray] = bytearray() if progressive_refinement else None
     
     # Target PCM characteristics (output from ffmpeg, input to ASR chunker)
     target_pcm_sample_rate = MODEL_SAMPLE_RATE # 16000 Hz
@@ -1165,6 +1188,8 @@ async def handle_streaming_pcm(
                     
                     pcm_buffer_for_asr_chunks.extend(pcm_data_from_ffmpeg)
                     temp_total_pcm_bytes_read_from_ffmpeg += len(pcm_data_from_ffmpeg)
+                    if refinement_pcm_accumulator is not None:
+                        refinement_pcm_accumulator.extend(pcm_data_from_ffmpeg)
                     
                     chunks_created_this_read_cycle = 0
                     # Create as many full ASR chunks as possible from the current buffer
@@ -1405,23 +1430,85 @@ async def handle_streaming_pcm(
         # For now, assume they are appended in rough chronological order.
         final_transcribed_text_pcm = " ".join(s["text"] for s in sent_segments_pcm).strip()
 
+        # progressive_refinement: re-transcribe the accumulated PCM as a single
+        # FULL pass before emitting final_transcription. Cheaper than re-running
+        # the whole pipeline and yields offline-quality segments instead of the
+        # independent-chunk approximations that were streamed live.
+        refined_segments: Optional[List[dict]] = None
+        refined_text: Optional[str] = None
+        refinement_asr_t: float = 0.0
+        if refinement_pcm_accumulator is not None and len(refinement_pcm_accumulator) > 0:
+            full_audio_duration_s = (len(refinement_pcm_accumulator) // (target_pcm_bytes_per_sample)) / target_pcm_sample_rate
+            if full_audio_duration_s > MAX_FULL_WAVEFORM_S:
+                logger.info(
+                    f"({session_id}) Stream: progressive_refinement skipped — accumulated audio "
+                    f"{full_audio_duration_s:.1f}s > MAX_FULL_WAVEFORM_S ({MAX_FULL_WAVEFORM_S:.0f}s)."
+                )
+            elif asr_model is not None:
+                try:
+                    full_pcm_bytes = bytes(refinement_pcm_accumulator)
+                    full_tensor = await asyncio.to_thread(_create_asr_tensor_from_bytes, full_pcm_bytes)
+                    hypotheses_refined, refinement_asr_t = await _perform_asr_transcription(
+                        asr_model_instance=asr_model,
+                        audio_input_list=[full_tensor],
+                        batch_size_for_transcribe_call=1,
+                        num_asr_workers=NUM_WORKERS,
+                        request_id=f"WS-Stream-{session_id}-refine",
+                    )
+                    refined_segments = _process_hypotheses_to_segments(
+                        hypotheses_refined,
+                        [0.0] * (len(hypotheses_refined) if hypotheses_refined else 0),
+                        f"{session_id}-refine",
+                    )
+                    refined_text = " ".join(s["text"] for s in refined_segments).strip()
+                    logger.info(
+                        f"({session_id}) Stream: progressive_refinement complete — "
+                        f"{len(refined_segments)} refined segs in {refinement_asr_t:.2f}s "
+                        f"over {full_audio_duration_s:.1f}s audio."
+                    )
+                    if websocket.application_state == WebSocketState.CONNECTED:
+                        await websocket.send_json({
+                            "type": "refined_transcription",
+                            "segments": refined_segments,
+                            "text": refined_text,
+                            "transcription_time": round(refinement_asr_t, 3),
+                            "audio_duration_seconds": round(full_audio_duration_s, 3),
+                        })
+                except Exception as e_refine:
+                    logger.warning(
+                        f"({session_id}) Stream: progressive_refinement failed ({e_refine!r}); "
+                        f"final_transcription will use the live-streamed segments.",
+                        exc_info=True,
+                    )
+                    refined_segments = None
+                    refined_text = None
+
         if websocket.application_state == WebSocketState.CONNECTED:
             logger.info(f"({session_id}) Streaming: Sending final_transcription message to client. "
                         f"Total ASR input duration (from ffmpeg PCM): {total_duration_processed_seconds_for_asr:.2f}s")
-            
+
+            use_refined = refined_segments is not None and refined_text is not None
+            final_segments_for_payload = refined_segments if use_refined else sent_segments_pcm
+            final_text_for_payload = refined_text if use_refined else final_transcribed_text_pcm
+            final_total_asr_t = accumulated_asr_processing_time_s + refinement_asr_t
+
             final_message_payload = {
                 "type": "final_transcription",
-                "text": final_transcribed_text_pcm,
+                "text": final_text_for_payload,
                 "language": "en", # Assuming English, could be made configurable
-                "transcription_time": round(accumulated_asr_processing_time_s, 3),
-                "total_segments": len(sent_segments_pcm),
+                "transcription_time": round(final_total_asr_t, 3),
+                "total_segments": len(final_segments_for_payload),
                 "final_duration_processed_seconds": round(total_duration_processed_seconds_for_asr, 3),
-                "csv_content": generate_csv_content(sent_segments_pcm), # Utility function
-                "srt_content": generate_srt_content(sent_segments_pcm), # Utility function
-                "streaming_mode": client_config.get("format", "unknown") # Reflect client-declared format
+                "csv_content": generate_csv_content(final_segments_for_payload),
+                "srt_content": generate_srt_content(final_segments_for_payload),
+                "streaming_mode": client_config.get("format", "unknown"), # Reflect client-declared format
+                "refinement_applied": use_refined,
             }
             await websocket.send_json(final_message_payload)
-            logger.info(f"({session_id}) Streaming: Final transcription message sent.")
+            logger.info(
+                f"({session_id}) Streaming: Final transcription message sent "
+                f"(refinement_applied={use_refined})."
+            )
         else:
             logger.info(f"({session_id}) Streaming: WebSocket disconnected before final_transcription could be sent.")
 

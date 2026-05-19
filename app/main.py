@@ -2987,11 +2987,17 @@ async def transcribe_endpoint_rest(
                         )
 
             except Exception as e_locked_rest_processing:
-                logger.error(f"({request_id}) REST: Error occurred during locked ASR processing: {e_locked_rest_processing}", exc_info=True)
+                import traceback
+                tb_str = traceback.format_exc()
+                logger.error(f"({request_id}) REST: Error occurred during locked ASR processing: {e_locked_rest_processing!r}\n{tb_str}", exc_info=False)
                 # Ensure a response is set if not already
                 if final_response_content is None:
                     response_status_code = 500 # Internal Server Error
-                    final_response_content = {"error": "An unexpected error occurred during transcription processing.", "detail": str(e_locked_rest_processing)}
+                    final_response_content = {
+                        "error": "An unexpected error occurred during transcription processing.",
+                        "detail": f"{type(e_locked_rest_processing).__name__}: {e_locked_rest_processing}",
+                        "traceback": tb_str.splitlines()[-15:],  # last 15 lines, for debugging
+                    }
             finally:
                 logger.debug(f"({request_id}) REST: Releasing ASR model lock and reverting model state.")
                 # Always revert model state at the end of the locked block

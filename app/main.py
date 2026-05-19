@@ -8,6 +8,9 @@ import json
 import base64
 import asyncio
 import logging
+import threading
+import functools
+import concurrent.futures
 from enum import Enum
 from typing import Awaitable, Callable, Optional, Tuple, List
 import subprocess
@@ -127,6 +130,13 @@ USE_STATEFUL_CHUNKED = os.getenv("USE_STATEFUL_CHUNKED", "false").lower() == "tr
 # quality). Set to 0 to disable the cap (always use stateful when on).
 STATEFUL_MAX_DURATION_S = float(os.getenv("STATEFUL_MAX_DURATION_S", 1800.0))
 
+# CUDA graph decoder for RNNT/TDT. NeMo 2.7.x defaults to ON (FULL_GRAPH mode)
+# but we've previously hit cudaErrorIllegalAddress with our request pattern.
+# Investigation plan at .claude/plans/cuda-graph-investigation.md.
+# Leave off by default; flip to true to opt in (requires the dedicated single-
+# worker ASR executor — see _asr_executor below).
+USE_CUDA_GRAPHS = os.getenv("USE_CUDA_GRAPHS", "false").lower() == "true"
+
 logger.info(
     f"Configuration loaded:\n"
     f"  App: workers={NUM_WORKERS}, sample_rate={MODEL_SAMPLE_RATE}, port={PORT}\n"
@@ -169,6 +179,7 @@ def _collect_health_info() -> dict:
             "long_audio_threshold_s": LONG_AUDIO_THRESHOLD_S,
             "use_stateful_chunked": USE_STATEFUL_CHUNKED,
             "stateful_max_duration_s": STATEFUL_MAX_DURATION_S,
+            "use_cuda_graphs": USE_CUDA_GRAPHS,
             "early_buffer_target_s": EARLY_BUFFER_TARGET_S,
             "streaming_context_s": {
                 "offline_left": STREAMING_LEFT_CONTEXT_S,
@@ -295,7 +306,7 @@ try:
                 cfg.preserve_alignments = False
                 if "greedy" in cfg:
                     with open_dict(cfg.greedy):
-                        cfg.greedy.use_cuda_graph_decoder = False
+                        cfg.greedy.use_cuda_graph_decoder = USE_CUDA_GRAPHS
             # NOTE: we do NOT switch to strategy=greedy + preserve_alignments here
             # even when USE_STATEFUL_CHUNKED=true. Doing so globally would force
             # the FAST greedy_batch decoder off the model and make the legacy
@@ -307,7 +318,7 @@ try:
             final_mode = getattr(computer, "cuda_graphs_mode", "<no computer>")
             final_allow = getattr(computer, "allow_cuda_graphs", "<no computer>")
             logger.info(
-                f"Decoding strategy reapplied with use_cuda_graph_decoder=False, "
+                f"Decoding strategy reapplied with use_cuda_graph_decoder={USE_CUDA_GRAPHS}, "
                 f"compute_timestamps=True. cuda_graphs_mode={final_mode!r}, "
                 f"allow_cuda_graphs={final_allow!r}"
             )
@@ -333,6 +344,39 @@ except Exception as e:
 # Asynchronous lock to ensure exclusive access to the ASR model during transcription calls.
 # This prevents concurrent modifications to model state (e.g., device, dtype, attention settings).
 model_access_lock = asyncio.Lock()
+
+# Dedicated single-thread executor for ASR calls. CUDA graphs are stream-bound:
+# a graph captured on stream A cannot be safely replayed on stream B. Python's
+# default ThreadPoolExecutor (used by asyncio.to_thread) hands work to any free
+# worker, so successive transcribes can land on different threads → different
+# current CUDA streams → graph replay UB → cudaErrorIllegalAddress.
+# Pinning all ASR work to one thread keeps the stream identity stable. Eager
+# (graphs-off) path also goes through it for consistency; the lock above
+# already serializes transcribes, so single-worker doesn't reduce concurrency
+# we were actually using.
+_asr_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr")
+
+
+async def _run_on_asr_executor(fn, *args, **kwargs):
+    """asyncio.to_thread() analogue that pins to the dedicated ASR executor."""
+    loop = asyncio.get_running_loop()
+    if kwargs:
+        return await loop.run_in_executor(_asr_executor, functools.partial(fn, *args, **kwargs))
+    return await loop.run_in_executor(_asr_executor, fn, *args)
+
+
+def _log_torch_stream(request_id: str, label: str) -> None:
+    """Diagnostic helper: log current thread id and CUDA stream pointer.
+    Direct evidence for H1 (thread/stream drift) when graphs are enabled."""
+    try:
+        tid = threading.get_ident()
+        if torch.cuda.is_available():
+            stream = torch.cuda.current_stream().cuda_stream
+            logger.info(f"({request_id}) {label}: thread={tid} cuda_stream={stream:x}")
+        else:
+            logger.info(f"({request_id}) {label}: thread={tid} (no cuda)")
+    except Exception as e:
+        logger.warning(f"({request_id}) {label}: stream-introspect failed: {e}")
 
 
 async def load_and_preprocess_audio(
@@ -434,7 +478,7 @@ async def _apply_model_settings_for_session(
         # att_context_size, update_config) — it does NOT accept a device kwarg.
         # Internally it forwards self.device to the encoder, so new modules
         # land on the model's current device automatically.
-        await asyncio.to_thread(
+        await _run_on_asr_executor(
             asr_model.change_attention_model,
             "rel_pos_local_attn", [256, 256], True,
         )
@@ -444,7 +488,7 @@ async def _apply_model_settings_for_session(
         # "mat1 and mat2 must have the same dtype". Cast the whole model to
         # its current dtype so new modules join the bf16 majority.
         pinned_dtype = global_original_model_dtype_torch
-        await asyncio.to_thread(asr_model.to, dtype=pinned_dtype)
+        await _run_on_asr_executor(asr_model.to, dtype=pinned_dtype)
         return True
     except Exception as e_long:
         logger.warning(f"({request_id}) Session: Failed to apply long-audio attention: {e_long}")
@@ -473,7 +517,7 @@ async def _revert_model_to_global_original_state(
             logger.info(f"({request_id}) End of Session: Reverting to rel_pos attention.")
             try:
                 # See _apply_model_settings_for_session for signature explanation.
-                await asyncio.to_thread(
+                await _run_on_asr_executor(
                     asr_model.change_attention_model,
                     "rel_pos", None, True,
                 )
@@ -481,13 +525,13 @@ async def _revert_model_to_global_original_state(
                 # change_attention_model are float32 by default; cast back to
                 # the model's pinned dtype.
                 pinned_dtype = global_original_model_dtype_torch
-                await asyncio.to_thread(asr_model.to, dtype=pinned_dtype)
+                await _run_on_asr_executor(asr_model.to, dtype=pinned_dtype)
             except Exception as e_rev_long_specific:
                 logger.warning(f"({request_id}) End of Session: Failed to revert long-audio attention: {e_rev_long_specific}")
 
         if session_processing_device == "cuda" and torch.cuda.is_available():
-            await asyncio.to_thread(gc.collect)
-            await asyncio.to_thread(torch.cuda.empty_cache)
+            await _run_on_asr_executor(gc.collect)
+            await _run_on_asr_executor(torch.cuda.empty_cache)
     except Exception as e_restore_globally:
         logger.error(f"({request_id}) Error during final model state reversion: {e_restore_globally}", exc_info=True)
 
@@ -545,7 +589,8 @@ async def _perform_asr_transcription(
     
     start_time = time.time()
     try:
-        raw_hypotheses = await asyncio.to_thread(
+        _log_torch_stream(request_id, "_perform_asr_transcription pre-transcribe")
+        raw_hypotheses = await _run_on_asr_executor(
             asr_model_instance.transcribe,
             audio=audio_for_preprocessor_on_device, # Pass float32 audio list
             batch_size=batch_size_for_transcribe_call,
@@ -1343,7 +1388,7 @@ async def handle_streaming_pcm(
                         if hasattr(tensor, "detach")
                         else np.asarray(tensor, dtype=np.float32)
                     )
-                    await asyncio.to_thread(engine.feed_float32, samples_np)
+                    await _run_on_asr_executor(engine.feed_float32, samples_np)
                     total_engine_chunks += 1
                     new_segs = engine.pop_committed_segments()
                     if new_segs and websocket.application_state == WebSocketState.CONNECTED:
@@ -1354,7 +1399,7 @@ async def handle_streaming_pcm(
                             logger.warning(f"({session_id}) Stream(stateful): segment send failed: {e_send}")
 
                 # EOF — pad + flush to commit trailing tokens
-                await asyncio.to_thread(engine.flush)
+                await _run_on_asr_executor(engine.flush)
                 final_partials = engine.pop_final_segments()
                 if final_partials and websocket.application_state == WebSocketState.CONNECTED:
                     try:
@@ -2310,7 +2355,7 @@ async def _swap_decoder_to_stateful_tdt() -> dict:
         decoding_cfg.strategy = "greedy"
         decoding_cfg.preserve_alignments = True
         decoding_cfg.fused_batch_size = -1
-    await asyncio.to_thread(asr_model.change_decoding_strategy, decoding_cfg, verbose=False)
+    await _run_on_asr_executor(asr_model.change_decoding_strategy, decoding_cfg, verbose=False)
     return saved
 
 
@@ -2322,7 +2367,7 @@ async def _restore_decoder(saved: dict) -> None:
         decoding_cfg.strategy = saved["strategy"]
         decoding_cfg.preserve_alignments = saved["preserve_alignments"]
         decoding_cfg.fused_batch_size = saved["fused_batch_size"]
-    await asyncio.to_thread(asr_model.change_decoding_strategy, decoding_cfg, verbose=False)
+    await _run_on_asr_executor(asr_model.change_decoding_strategy, decoding_cfg, verbose=False)
 
 
 async def _transcribe_chunked_stateful(
@@ -2367,7 +2412,7 @@ async def _transcribe_chunked_stateful(
     # ~20× (they rely on greedy_batch). Swap transiently here.
     saved = await _swap_decoder_to_stateful_tdt()
     try:
-        text, asr_time, token_times = await asyncio.to_thread(
+        text, asr_time, token_times = await _run_on_asr_executor(
             _stateful_chunked_sync,
             waveform_np,
             chunk_len,

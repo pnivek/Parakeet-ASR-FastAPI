@@ -6,3 +6,6 @@ __pycache__/
 # Test fixtures are downloaded on demand, not checked in
 tests/fixtures/
 tests/results/
+
+# Claude runtime state
+.claude/

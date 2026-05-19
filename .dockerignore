@@ -29,6 +29,12 @@ venv/
 env/
 ENV/
 
+# Test harness — fixtures (~850 MB) and results not needed in image
+tests/
+
+# Claude runtime state
+.claude/
+
 # IDE files
 .idea/
 .vscode/

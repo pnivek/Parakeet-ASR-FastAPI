@@ -130,12 +130,14 @@ USE_STATEFUL_CHUNKED = os.getenv("USE_STATEFUL_CHUNKED", "false").lower() == "tr
 # quality). Set to 0 to disable the cap (always use stateful when on).
 STATEFUL_MAX_DURATION_S = float(os.getenv("STATEFUL_MAX_DURATION_S", 1800.0))
 
-# CUDA graph decoder for RNNT/TDT. NeMo 2.7.x defaults to ON (FULL_GRAPH mode)
-# but we've previously hit cudaErrorIllegalAddress with our request pattern.
-# Investigation plan at .claude/plans/cuda-graph-investigation.md.
-# Leave off by default; flip to true to opt in (requires the dedicated single-
-# worker ASR executor — see _asr_executor below).
-USE_CUDA_GRAPHS = os.getenv("USE_CUDA_GRAPHS", "false").lower() == "true"
+# CUDA graph decoder for RNNT/TDT. NeMo 2.7.x defaults to ON (FULL_GRAPH mode).
+# Earlier attempts crashed with cudaErrorIllegalAddress on the 2nd transcribe;
+# root cause was `torch.cuda.empty_cache()` between requests invalidating the
+# static buffer addresses baked into the captured graph (NeMo issue #14727).
+# That cache-flush is now gated on `not USE_CUDA_GRAPHS`, so flipping graphs
+# on is safe. Stress: 30/30 FULL transcribes pass at p99=0.16s (~30% faster
+# than eager). Investigation notes at .claude/plans/cuda-graph-investigation.md.
+USE_CUDA_GRAPHS = os.getenv("USE_CUDA_GRAPHS", "true").lower() == "true"
 
 logger.info(
     f"Configuration loaded:\n"

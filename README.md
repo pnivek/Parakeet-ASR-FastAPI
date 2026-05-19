@@ -90,11 +90,13 @@ Measured wall-clock on a DGX Spark (single-stream):
 | Stateful (10-10-5) | ~0.022 | ~40 s | ~4 min |
 | Legacy fallback | ~0.005 | ~9 s | ~1 min |
 
-### Experimental — CUDA graph decoder
+### CUDA graph decoder
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `USE_CUDA_GRAPHS` | Enable NeMo's CUDA-graph RNNT/TDT decoder. Currently default off — H1 (single-thread executor) was tested and doesn't unblock; investigation parked at `.claude/plans/cuda-graph-investigation.md`. | false |
+| `USE_CUDA_GRAPHS` | NeMo's CUDA-graph RNNT/TDT decoder (FULL_GRAPH mode). Captures the decoder label loop into a single graph; encoder runs eagerly. ~30% speedup on the FULL transcribe path. Implementation details in `.claude/plans/cuda-graph-investigation.md`. | true |
+
+`empty_cache()` calls between transcribes are skipped when graphs are on — releasing caching-allocator blocks invalidates the static-buffer addresses captured in the graph (NeMo issue #14727). PyTorch's allocator handles unreferenced blocks fine on its own.
 
 ## API
 
@@ -227,7 +229,7 @@ cd app && LOG_LEVEL=DEBUG python main.py
 ## Troubleshooting
 
 - **Model load OOM** — Parakeet-TDT-0.6B-v2 needs roughly 4 GB GPU memory in bf16. Reduce to fp16/fp32 with care; this server pins bf16 at load on CUDA-bf16-capable hardware.
-- **`cudaErrorIllegalAddress` on repeated transcribes** — keep `USE_CUDA_GRAPHS=false` (the default). The investigation notes are in `.claude/plans/cuda-graph-investigation.md`.
+- **`cudaErrorIllegalAddress` on repeated transcribes** — should not happen with the current defaults (graphs on, no `empty_cache` between calls). If you re-introduce `torch.cuda.empty_cache()` while `USE_CUDA_GRAPHS=true`, this will return. Flip `USE_CUDA_GRAPHS=false` to confirm graphs are the cause.
 - **Stateful chunked feels slow on multi-hour files** — that's by design; the FIFO engine is batch-1 and trades throughput for boundary quality. `STATEFUL_MAX_DURATION_S` controls the auto-fallback to the faster independent-chunk path.
 
 ## License

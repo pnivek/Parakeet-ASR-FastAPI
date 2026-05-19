@@ -1,11 +1,13 @@
 FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
 
 # Swap the arm64 Ubuntu mirror. The default ports.ubuntu.com (Canonical's
-# non-amd64 mirror) has had recurring connectivity issues from this builder;
-# mirrors.kernel.org is consistently reachable. Idempotent — if the
-# sources file doesn't exist or already points elsewhere, sed is a no-op.
+# non-amd64 mirror) has had recurring connectivity issues from this builder.
+# mirror.us.leaseweb.net carries a complete noble ubuntu-ports tree and
+# is consistently reachable. (mirrors.kernel.org redirects to an edge
+# host that 404s on ubuntu-ports/noble, so it's NOT a working alternate.)
+# Idempotent — guarded by the sources file existing.
 RUN if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
-        sed -i 's|http://ports.ubuntu.com/ubuntu-ports|http://mirrors.kernel.org/ubuntu-ports|g' \
+        sed -i 's|http://ports.ubuntu.com/ubuntu-ports|http://mirror.us.leaseweb.net/ubuntu-ports|g' \
             /etc/apt/sources.list.d/ubuntu.sources; \
     fi
 

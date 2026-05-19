@@ -12,6 +12,10 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [react()],
+    // FastAPI mounts the build output at /static (see app/main.py). Setting
+    // base here makes Vite emit asset URLs as `/static/assets/...` so the
+    // existing StaticFiles mount serves them without backend changes.
+    base: '/static/',
     build: {
       outDir: '../static',
       emptyOutDir: true,

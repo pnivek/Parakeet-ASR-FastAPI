@@ -4,6 +4,7 @@ import { FileUploadPanel } from './components/FileUploadPanel'
 import { LiveCapturePanel } from './components/LiveCapturePanel'
 import { SettingsPanel } from './components/SettingsPanel'
 import { OutputView } from './components/OutputView'
+import { ThemeToggle } from './components/ThemeToggle'
 import { setAudioFile, seek, useAudioContainer, useCurrentTime } from './lib/playback'
 import './App.css'
 
@@ -22,10 +23,13 @@ export default function App() {
   return (
     <div className="app">
       <header className="app__header">
-        <h1>Parakeet ASR</h1>
-        <p className="app__tagline">
-          OpenAI Whisper-compatible API · <code>nvidia/parakeet-tdt-0.6b-v2</code>
-        </p>
+        <div className="app__title">
+          <h1>Parakeet ASR</h1>
+          <p className="app__tagline">
+            OpenAI Whisper-compatible API · <code>nvidia/parakeet-tdt-0.6b-v2</code>
+          </p>
+        </div>
+        <ThemeToggle />
       </header>
 
       <main className="app__main">

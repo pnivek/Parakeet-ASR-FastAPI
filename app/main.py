@@ -1616,19 +1616,156 @@ async def _transcribe_chunked_waveform(
     return deduped, total_asr_time
 
 
+def _extract_tdt_token_times(
+    frame_asr,
+    delay: int,
+    tokens_per_chunk: int,
+    chunk_len_s: float,
+    model_stride_s: float,
+) -> List[Tuple[int, float]]:
+    """
+    Mirror BatchedFrameASRTDT.transcribe()'s middle-token merge to recover
+    (token_id, audio_time_s) pairs for batch slot 0.
+
+    The class's own transcribe() discards alignment frame indices via
+    _alignment_decoder. We walk the same per-chunk slicing rules but keep
+    `(frame_idx_in_alignment, token_id)` tuples, then convert the slice-local
+    frame index to global audio time via `chunk_idx * chunk_len_s + (frame_idx
+    - base_start) * model_stride_s`.
+    """
+    all_alignments = frame_asr.all_alignments[0]
+    signal_end_idx = frame_asr.frame_bufferer.signal_end_index[0]
+    blank_id = frame_asr.blank_id
+    tdt_search_boundary = getattr(frame_asr, "tdt_search_boundary", 4)
+
+    out: List[Tuple[int, float]] = []
+    unmerged_ids: List[int] = []
+
+    def _walk_with_times(slice_align, slice_start_idx):
+        toks_with_t: List[Tuple[int, int]] = []
+        for fi, frame in enumerate(slice_align):
+            global_fi = slice_start_idx + fi
+            for u in range(len(frame)):
+                _, tid = frame[u]
+                tid = int(tid)
+                if tid != blank_id:
+                    toks_with_t.append((global_fi, tid))
+        return toks_with_t
+
+    for a_idx, alignment in enumerate(all_alignments):
+        if delay == len(alignment):
+            offset = 0
+        else:
+            offset = 1
+        base_start = len(alignment) - offset - delay
+        base_end = base_start + tokens_per_chunk
+        long_start = base_start - tdt_search_boundary
+        long_end = base_end
+
+        # Decode "longer" slice (for boundary-search) and the base slice with frame indices.
+        longer_with_t = _walk_with_times(alignment[long_start:long_end], long_start)
+        base_with_t = _walk_with_times(alignment[base_start:base_end], base_start)
+
+        if not longer_with_t or (signal_end_idx is not None and a_idx >= signal_end_idx):
+            continue
+
+        if a_idx == 0 or len(unmerged_ids) == 0:
+            use_with_t = base_with_t
+        elif len(unmerged_ids) > 0 and len(longer_with_t) > 1:
+            id_to_match = unmerged_ids[-1]
+            longer_ids_only = [t[1] for t in longer_with_t]
+            start_idx = min(len(longer_ids_only) - len(base_with_t), len(longer_ids_only) - 1)
+            use_with_t = base_with_t  # fallback when no match
+            for i in range(start_idx, -1, -1):
+                if longer_ids_only[i] == id_to_match:
+                    use_with_t = longer_with_t[i + 1:]
+                    break
+        else:
+            use_with_t = base_with_t
+
+        chunk_audio_start_s = a_idx * chunk_len_s
+        for frame_idx_in_align, tid in use_with_t:
+            t_within_chunk = frame_idx_in_align - base_start
+            time_s = chunk_audio_start_s + t_within_chunk * model_stride_s
+            if time_s < 0.0:
+                time_s = chunk_audio_start_s  # clamp the small (<=tdt_search_boundary*stride) backshift
+            out.append((tid, float(time_s)))
+            unmerged_ids.append(tid)
+
+    return out
+
+
+def _segments_from_token_times(
+    tokens_with_times: List[Tuple[int, float]],
+    tokenizer,
+    duration_s: float,
+) -> List[dict]:
+    """
+    Group (token_id, time_s) pairs into sentence-bounded segments.
+
+    Splits on subword tokens whose decoded text ends in '.', '!' or '?'.
+    Uses actual per-token timestamps for start/end, not proportional
+    distribution.
+    """
+    if not tokens_with_times:
+        return []
+
+    segments: List[dict] = []
+    cur_ids: List[int] = []
+    cur_start: Optional[float] = None
+    cur_last_t: float = 0.0
+    seg_id = 0
+
+    def flush(end_t: float):
+        nonlocal cur_ids, cur_start, seg_id
+        if not cur_ids:
+            return
+        text = tokenizer.ids_to_text(cur_ids).strip()
+        if text:
+            start_clamped = max(0.0, cur_start if cur_start is not None else 0.0)
+            end_clamped = min(duration_s, max(start_clamped, end_t))
+            segments.append({
+                "start": round(start_clamped, 3),
+                "end": round(end_clamped, 3),
+                "text": text,
+                "id": seg_id,
+            })
+            seg_id += 1
+        cur_ids = []
+        cur_start = None
+
+    for tid, t in tokens_with_times:
+        if cur_start is None:
+            cur_start = t
+        cur_ids.append(tid)
+        cur_last_t = t
+        try:
+            tok = tokenizer.ids_to_tokens([tid])[0]
+        except Exception:
+            tok = ""
+        if tok and tok[-1] in ".!?":
+            flush(t)
+
+    if cur_ids:
+        flush(cur_last_t)
+
+    return segments
+
+
 def _stateful_chunked_sync(
     waveform_np: np.ndarray,
     chunk_len_s: float,
     total_buffer_s: float,
     model_stride_s: float,
     request_id: str,
-) -> Tuple[str, float]:
+) -> Tuple[str, float, List[Tuple[int, float]]]:
     """
     Synchronous core of the BatchedFrameASRTDT stateful chunked engine.
 
     Designed to be called via asyncio.to_thread from `_transcribe_chunked_stateful`.
-    Returns (joined_text, asr_time_s). Runs at batch_size=1 (one waveform per
-    request) to keep memory predictable; callers serialize via model_access_lock.
+    Returns (joined_text, asr_time_s, token_times) where token_times is the
+    `(token_id, audio_time_s)` stream produced by mirroring the middle-token
+    merge over `frame_asr.all_alignments`. Runs at batch_size=1.
     """
     tokens_per_chunk = math.ceil(chunk_len_s / model_stride_s)
     mid_delay = math.ceil((chunk_len_s + (total_buffer_s - chunk_len_s) / 2) / model_stride_s)
@@ -1674,12 +1811,30 @@ def _stateful_chunked_sync(
             outputs = frame_asr.transcribe(tokens_per_chunk=tokens_per_chunk, delay=mid_delay)
         asr_time = time.time() - t0
         text = outputs[0] if outputs else ""
+
+        token_times: List[Tuple[int, float]] = []
+        try:
+            token_times = _extract_tdt_token_times(
+                frame_asr=frame_asr,
+                delay=mid_delay,
+                tokens_per_chunk=tokens_per_chunk,
+                chunk_len_s=chunk_len_s,
+                model_stride_s=model_stride_s,
+            )
+        except Exception as e_tt:
+            logger.warning(
+                f"({request_id}) Stateful: per-token timestamp extraction failed "
+                f"({e_tt!r}); falling back to text-based approximation.",
+                exc_info=True,
+            )
+            token_times = []
+
         logger.info(
             f"({request_id}) Stateful: chunk={chunk_len_s}s buf={total_buffer_s}s "
             f"stride={model_stride_s:.4f}s tpc={tokens_per_chunk} delay={mid_delay} "
-            f"→ {len(text)} chars in {asr_time:.2f}s"
+            f"→ {len(text)} chars in {asr_time:.2f}s (token_times={len(token_times)})"
         )
-        return text, asr_time
+        return text, asr_time, token_times
     finally:
         # Free the per-session decoder state; the FrameBatchASR allocates
         # per-batch buffers that we don't want lingering between requests.
@@ -1700,9 +1855,10 @@ async def _transcribe_chunked_stateful(
 
     Carries decoder state across chunks; the middle-token TDT merge stitches
     chunk outputs into one coherent transcript without boundary duplicates or
-    drops. Returns a single-segment list `[{start:0, end:duration, text:...}]`
-    — per-token timestamps are present internally (frame_asr.all_timestamps)
-    but extracting per-utterance segments is a future enhancement.
+    drops. Emits sentence-bounded segments with real per-token timestamps
+    recovered by walking `frame_asr.all_alignments` (see
+    `_extract_tdt_token_times`). Falls back to proportional approximation only
+    if extraction fails.
 
     The 10-10-5 / 10-2-2 NeMo recommendations map to:
         chunk_len_in_secs  = STREAMING_CHUNK_S
@@ -1747,7 +1903,7 @@ async def _transcribe_chunked_stateful(
             decoding_cfg.fused_batch_size = -1
         await asyncio.to_thread(asr_model.change_decoding_strategy, decoding_cfg, verbose=False)
 
-        text, asr_time = await asyncio.to_thread(
+        text, asr_time, token_times = await asyncio.to_thread(
             _stateful_chunked_sync,
             waveform_np,
             chunk_len,
@@ -1765,7 +1921,21 @@ async def _transcribe_chunked_stateful(
     if not text:
         return [], asr_time
 
-    segments = _approximate_segments_from_text(text.strip(), audio_duration_s)
+    segments: List[dict] = []
+    if token_times:
+        try:
+            segments = _segments_from_token_times(token_times, asr_model.tokenizer, audio_duration_s)
+        except Exception as e_seg:
+            logger.warning(
+                f"({request_id}) Stateful: building segments from token_times "
+                f"failed ({e_seg!r}); falling back to approximation.",
+                exc_info=True,
+            )
+            segments = []
+
+    if not segments:
+        segments = _approximate_segments_from_text(text.strip(), audio_duration_s)
+
     return segments, asr_time
 
 

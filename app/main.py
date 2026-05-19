@@ -158,17 +158,25 @@ if not os.path.exists(static_dir): # Ensure static directory exists
     logger.info(f"Created static directory at {static_dir}")
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-@app.get("/v1/debug/state", include_in_schema=False)
-async def debug_state():
-    """Internal debug — current model + decoder state. Temporary; will move under /health later."""
+def _collect_health_info() -> dict:
+    """Snapshot of model load + decoding/runtime config for /health and /v1/debug/state."""
     info: dict = {
         "model_loaded": asr_model is not None,
-        "use_stateful_chunked": USE_STATEFUL_CHUNKED,
-        "stateful_max_duration_s": STATEFUL_MAX_DURATION_S,
-        "streaming_context_s": {
-            "offline_left": STREAMING_LEFT_CONTEXT_S,
-            "offline_chunk": STREAMING_CHUNK_S,
-            "offline_right": STREAMING_RIGHT_CONTEXT_S,
+        "model_name": ASR_MODEL_NAME,
+        "config": {
+            "default_strategy": DEFAULT_STRATEGY,
+            "max_full_waveform_s": MAX_FULL_WAVEFORM_S,
+            "long_audio_threshold_s": LONG_AUDIO_THRESHOLD_S,
+            "use_stateful_chunked": USE_STATEFUL_CHUNKED,
+            "stateful_max_duration_s": STATEFUL_MAX_DURATION_S,
+            "early_buffer_target_s": EARLY_BUFFER_TARGET_S,
+            "streaming_context_s": {
+                "offline_left": STREAMING_LEFT_CONTEXT_S,
+                "offline_chunk": STREAMING_CHUNK_S,
+                "offline_right": STREAMING_RIGHT_CONTEXT_S,
+                "live_chunk": STREAMING_LIVE_CHUNK_S,
+                "live_right": STREAMING_LIVE_RIGHT_CONTEXT_S,
+            },
         },
     }
     try:
@@ -195,6 +203,28 @@ async def debug_state():
     except Exception as e:
         info["decoder_introspect_error"] = str(e)
     return info
+
+
+@app.get("/health")
+async def health():
+    """Liveness + introspection. Always 200 once the process is up. For readiness gating, use /readyz."""
+    info = _collect_health_info()
+    info["status"] = "ok" if info["model_loaded"] else "loading"
+    return info
+
+
+@app.get("/readyz")
+async def readyz():
+    """Readiness probe. 200 when the ASR model is loaded; 503 otherwise."""
+    if asr_model is None:
+        return JSONResponse(status_code=503, content={"status": "not_ready", "model_loaded": False})
+    return {"status": "ready", "model_loaded": True}
+
+
+@app.get("/v1/debug/state", include_in_schema=False)
+async def debug_state():
+    """Back-compat alias — same payload as /health for the test/debug scripts that already query it."""
+    return _collect_health_info()
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)

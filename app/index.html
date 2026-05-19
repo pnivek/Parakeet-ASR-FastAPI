@@ -329,6 +329,30 @@
         <span id="advancedToggle">▼</span>
       </div>
       <div class="advanced-settings-content" id="advancedSettingsContent">
+        <!-- Strategy Selection (Phase 7) -->
+        <div class="settings-section" id="strategyConfigSection">
+          <h3>Processing Strategy</h3>
+          <div class="setting-group">
+            <label for="strategySelect">Strategy:</label>
+            <select id="strategySelect">
+              <option value="auto" selected>auto (server picks based on duration / stream state)</option>
+              <option value="full">full (single transcribe pass, best quality, &le; MAX_FULL_WAVEFORM_S)</option>
+              <option value="chunked">chunked (BatchedFrameASRTDT stateful; legacy fallback above STATEFUL_MAX_DURATION_S)</option>
+              <option value="progressive">progressive (streaming partials; live-only)</option>
+            </select>
+            <span class="description">Server-side dispatch. "auto" honors DEFAULT_STRATEGY from .env.</span>
+          </div>
+          <div class="setting-group">
+            <input type="checkbox" id="progressiveRefinement" />
+            <label for="progressiveRefinement">progressive_refinement</label>
+            <span class="description">On EOF, run a full pass and replace streamed segments (if duration &le; MAX_FULL_WAVEFORM_S).</span>
+          </div>
+          <div class="setting-group">
+            <input type="checkbox" id="liveLatency" />
+            <label for="liveLatency">live_latency</label>
+            <span class="description">Use the 10-2-2 streaming preset (~4s latency) instead of 10-10-5 (offline-like quality).</span>
+          </div>
+        </div>
         <!-- Global ASR Configuration -->
         <div class="settings-section" id="globalAsrConfigSection">
           <h3>Global ASR Configuration</h3>
@@ -416,6 +440,7 @@
 
     <!-- Timing Information -->
     <div class="timing-info">
+      <div>Resolved Strategy: <span id="resolvedStrategy">N/A</span></div>
       <div>Time to First Segment: <span id="timeToFirstSegment">N/A</span></div>
       <div>Transcription Time: <span id="time">N/A</span></div>
       <div>Total Request Time: <span id="totalRequestTime">N/A</span></div>
@@ -498,6 +523,10 @@
       chunkLengthInput: document.getElementById('chunkLength'),
       chunkOverlapInput: document.getElementById('chunkOverlap'),
       batchSizeInput: document.getElementById('batchSize'),
+      strategySelect: document.getElementById('strategySelect'),
+      progressiveRefinementInput: document.getElementById('progressiveRefinement'),
+      liveLatencyInput: document.getElementById('liveLatency'),
+      resolvedStrategySpan: document.getElementById('resolvedStrategy'),
       wsSampleRateSelect: document.getElementById('wsSampleRate'),
       wsChannelsSelect: document.getElementById('wsChannels'),
       wsBytesPerSampleSelect: document.getElementById('wsBytesPerSample'),
@@ -590,7 +619,10 @@
         chunkOverlap: parseFloat(dom.chunkOverlapInput.value),
         batchSize: parseInt(dom.batchSizeInput.value),
         streamingChunkSizeBytes: parseInt(dom.streamingChunkSizeBytesInput.value),
-        networkDelayMs: parseInt(dom.networkDelayMsInput.value)
+        networkDelayMs: parseInt(dom.networkDelayMsInput.value),
+        strategy: dom.strategySelect ? dom.strategySelect.value : 'auto',
+        progressiveRefinement: dom.progressiveRefinementInput ? dom.progressiveRefinementInput.checked : false,
+        liveLatency: dom.liveLatencyInput ? dom.liveLatencyInput.checked : false
       };
     }
 
@@ -876,6 +908,9 @@
 function displayFinalTranscriptionResult(data, modeName) {
   logDebug(`${modeName} final data`, data);
 
+  if (dom.resolvedStrategySpan) {
+    dom.resolvedStrategySpan.textContent = data.strategy ? String(data.strategy) : "N/A";
+  }
   if (dom.time) dom.time.textContent = `${(data.transcription_time !== undefined ? data.transcription_time : 0).toFixed(3)}s`;
 
   if (dom.totalRequestTime && transcriptionStartTime > 0) {
@@ -945,14 +980,18 @@ function displayFinalTranscriptionResult(data, modeName) {
       const formData = new FormData();
       formData.append("file", file);
       const settings = getClientSettings();
-      const queryParams = new URLSearchParams({ 
+      const queryParams = new URLSearchParams({
         long_audio_threshold: settings.longAudioThreshold,
         batch_size: settings.batchSize
       });
+      if (settings.strategy && settings.strategy !== 'auto') queryParams.set('strategy', settings.strategy);
+      if (settings.progressiveRefinement) queryParams.set('progressive_refinement', 'true');
+      if (settings.liveLatency) queryParams.set('live_latency', 'true');
 
       if (dom.progressBar) { dom.progressBar.style.display = "block"; dom.progressBar.value = 0; }
       updateStatus("Uploading and processing (REST)...", "info");
       ['time', 'timeToFirstSegment', 'totalRequestTime'].forEach(k => { if (dom[k]) dom[k].textContent = "Calculating..."; });
+      if (dom.resolvedStrategySpan) dom.resolvedStrategySpan.textContent = "...";
       
       let pVal = 0;
       const pInt = setInterval(() => {
@@ -996,6 +1035,7 @@ function displayFinalTranscriptionResult(data, modeName) {
       if (dom.segmentsTableBody) dom.segmentsTableBody.innerHTML = "";
       if (dom.result) dom.result.textContent = "Connecting (WS Full Upload)...";
       ['time', 'timeToFirstSegment', 'totalRequestTime'].forEach(k => { if (dom[k]) dom[k].textContent = "Calculating..."; });
+      if (dom.resolvedStrategySpan) dom.resolvedStrategySpan.textContent = "...";
 
       try {
         if (currentWebSocket?.readyState === WebSocket.OPEN) currentWebSocket.close();
@@ -1027,6 +1067,9 @@ function displayFinalTranscriptionResult(data, modeName) {
             chunk_overlap: clientSettings.chunkOverlap,
             batch_size: clientSettings.batchSize,
             long_audio_threshold: clientSettings.longAudioThreshold,
+            strategy: clientSettings.strategy,
+            progressive_refinement: clientSettings.progressiveRefinement,
+            live_latency: clientSettings.liveLatency,
           };
           socket.send(JSON.stringify(config));
           logDebug(`Sent config (WS Full Upload)`, config);
@@ -1173,6 +1216,7 @@ function displayFinalTranscriptionResult(data, modeName) {
       if (dom.segmentsTableBody) dom.segmentsTableBody.innerHTML = ""; 
       if (dom.result) dom.result.textContent = "Starting Live Stream...";
       ['time', 'timeToFirstSegment', 'totalRequestTime'].forEach(k => { if (dom[k]) dom[k].textContent = "Calculating..."; });
+      if (dom.resolvedStrategySpan) dom.resolvedStrategySpan.textContent = "...";
 
       try {
         if (currentWebSocket?.readyState === WebSocket.OPEN) currentWebSocket.close();
@@ -1195,8 +1239,11 @@ function displayFinalTranscriptionResult(data, modeName) {
             batch_size: clientSettings.batchSize,
             long_audio_threshold: clientSettings.longAudioThreshold,
 
-            streaming_chunk_size_bytes: clientSettings.streamingChunkSizeBytes, 
-            network_delay_ms: clientSettings.networkDelayMs 
+            streaming_chunk_size_bytes: clientSettings.streamingChunkSizeBytes,
+            network_delay_ms: clientSettings.networkDelayMs,
+            strategy: clientSettings.strategy,
+            progressive_refinement: clientSettings.progressiveRefinement,
+            live_latency: clientSettings.liveLatency,
           };
           socket.send(JSON.stringify(config));
           logDebug(`Sent config (Live Stream WS)`, config);

@@ -1,5 +1,14 @@
 FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
 
+# Swap the arm64 Ubuntu mirror. The default ports.ubuntu.com (Canonical's
+# non-amd64 mirror) has had recurring connectivity issues from this builder;
+# mirrors.kernel.org is consistently reachable. Idempotent — if the
+# sources file doesn't exist or already points elsewhere, sed is a no-op.
+RUN if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
+        sed -i 's|http://ports.ubuntu.com/ubuntu-ports|http://mirrors.kernel.org/ubuntu-ports|g' \
+            /etc/apt/sources.list.d/ubuntu.sources; \
+    fi
+
 # Install system deps
 RUN apt-get update && apt-get install -y \
     python3 \

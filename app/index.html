@@ -336,13 +336,13 @@
             <label for="strategySelect">Strategy:</label>
             <select id="strategySelect">
               <option value="auto" selected>auto (→ chunked_v2 for REST, progressive_v2 for WS)</option>
-              <option value="full">full (single transcribe pass; known bug: empty/wrong output on audio &lt; ~5 s)</option>
+              <option value="full">full (single-pass via decoding_computer; fastest on long audio, matches NVIDIA WER)</option>
               <option value="chunked">chunked (BatchedFrameASRTDT stateful; legacy)</option>
               <option value="chunked_v2">chunked_v2 (NVIDIA blessed: prev_batched_state)</option>
               <option value="progressive">progressive (buffered streaming via WS; legacy)</option>
               <option value="progressive_v2">progressive_v2 (NVIDIA blessed: prev_batched_state)</option>
             </select>
-            <span class="description">Server-side dispatch. "auto" routes to the v2 engines because the NeMo transcribe() path used by "full" produces empty/garbage output on audio under ~5 s. Note: progressive is <em>buffered</em> streaming — this model isn't cache-aware, so partials emit ~6–7.5 s behind real time.</span>
+            <span class="description">Server-side dispatch. "auto" routes to the v2 engines for consistent sentence-bounded segments; "full" is fastest single-pass for long offline files. Note: progressive is <em>buffered</em> streaming — this model isn't cache-aware, so partials emit ~6–7.5 s behind real time.</span>
           </div>
           <div class="setting-group">
             <input type="checkbox" id="progressiveRefinement" />

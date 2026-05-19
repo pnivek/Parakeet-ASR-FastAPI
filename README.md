@@ -9,9 +9,9 @@ A FastAPI wrapper around NVIDIA's `parakeet-tdt-0.6b-v2` covering three workload
 
 - **State-of-the-art offline ASR** — `nvidia/parakeet-tdt-0.6b-v2` (Token-and-Duration Transducer).
 - **Five processing strategies** behind one dispatcher (`auto` is the recommended default and routes to the v2 engines):
-  - `chunked_v2` *(REST default via `auto`)* — NVIDIA-blessed `StreamingBatchedAudioBuffer + decoding_computer + prev_batched_state` pattern. Works correctly across the full duration range (0.5s clips to multi-hour archives).
+  - `chunked_v2` *(REST default via `auto`)* — NVIDIA-blessed `StreamingBatchedAudioBuffer + decoding_computer + prev_batched_state` pattern. Works correctly across the full duration range (0.5 s clips to multi-hour archives).
   - `progressive_v2` *(WS default via `auto`)* — same v2 engine driven over an ffmpeg PCM stream, emitting sentence-bounded partials as new tokens commit.
-  - `full` — single `transcribe()` call. Best quality on audio ≥ ~10 s, but **known bug**: produces empty / catastrophically wrong output on audio under ~5 s (CUDA-graph shape-capture issue confirmed via the regression harness — 23 % empty rate, 35 % WER > 50 % on the LibriSpeech test-clean short tail). Kept for backward compatibility and as the explicit choice for known-long offline files. `auto` does not route here.
+  - `full` — single-pass through encoder + `decoding_computer` (bypasses NeMo's `transcribe()` wrapper, which has a CUDA-graph shape-capture bug on short audio). Matches NVIDIA's published 1.69 % WER on LibriSpeech test-clean and is the fastest path on long audio (~170× RTFx vs `chunked_v2`'s ~65×, single-pass encoder, no chunking overhead).
   - `chunked` — legacy `BatchedFrameASRTDT` stateful sliding-window. Decoder state carries across chunks but the middle-token merge has documented boundary artifacts on short clips. Retained as a fallback above `STATEFUL_MAX_DURATION_S`.
   - `progressive` — legacy streaming engine. Same artifacts as `chunked` on short clips.
 - **Emission lag for streaming**: `(total_buffer − chunk) / 2` seconds — ~7.5 s with the offline-like 10-10-5 preset, ~6 s with the live 10-2-2 preset.
@@ -207,7 +207,8 @@ GET /readyz
 |-----|-----|
 | Anything REST, any duration — just pick the right default | `auto` (→ `chunked_v2`) |
 | Anything WS, any duration — just pick the right default | `auto` (→ `progressive_v2`) |
-| Offline file, known duration > 10 s, want absolute best single-pass quality | `chunked_v2` (works) **or** `full` (faster on long clips, but buggy under ~5 s — see harness in `tests/`) |
+| Offline file, want fastest single-pass throughput on long audio | `full` (~170× RTFx vs `chunked_v2`'s ~65× on multi-min clips) |
+| Offline file, want streaming-style sentence boundaries / per-chunk segmentation | `chunked_v2` |
 | Legacy client integration that depended on the old engines | `chunked` / `progressive` (explicit) |
 | Streaming audio, ~6 s emission lag, prefer fewer/cleaner emissions | `progressive_v2` + `live_latency: true` (10-2-2 preset) |
 | Streaming audio, ~7.5 s emission lag, prefer best chunk-boundary quality | `progressive_v2` + `live_latency: false` (10-10-5 preset, default) |

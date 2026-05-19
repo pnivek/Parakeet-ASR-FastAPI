@@ -173,7 +173,14 @@ class StreamingPrevBatchedEngine:
     # --------- Public feed/flush ----------
 
     def feed_float32(self, samples_f32: np.ndarray) -> None:
-        """Append float32 PCM in [-1, 1]; advance the engine for any complete chunks."""
+        """Append float32 PCM in [-1, 1]; advance the engine for any complete chunks.
+
+        Per NeMo's reference loop: the FIRST chunk needs `chunk + right` samples
+        to prime the buffer's right context, then every subsequent chunk is
+        just `chunk` samples. Trying to feed `chunk` samples on iter 0 trips
+        the assertion `self.right == expected_context.right` inside
+        StreamingBatchedAudioBuffer because the right side starts unprimed.
+        """
         if samples_f32 is None or samples_f32.size == 0:
             return
         if self._eof_flushed:
@@ -181,24 +188,21 @@ class StreamingPrevBatchedEngine:
         tensor = torch.from_numpy(np.ascontiguousarray(samples_f32, dtype=np.float32)).to(self._device)
         self._pcm_buffer = torch.cat([self._pcm_buffer, tensor], dim=0)
         chunk_samples = self.context_samples.chunk
-        while self._pcm_buffer.numel() >= chunk_samples:
-            chunk = self._pcm_buffer[:chunk_samples]
-            self._pcm_buffer = self._pcm_buffer[chunk_samples:]
+        right_samples = self.context_samples.right
+        while True:
+            needed = (chunk_samples + right_samples) if self._chunk_index == 0 else chunk_samples
+            if self._pcm_buffer.numel() < needed:
+                break
+            chunk = self._pcm_buffer[:needed]
+            self._pcm_buffer = self._pcm_buffer[needed:]
             self._step_one_chunk(chunk, is_last_chunk=False)
 
     def flush(self) -> None:
         """Drain any residual PCM as the LAST chunk so the right context closes out."""
         if self._eof_flushed:
             return
-        chunk_samples = self.context_samples.chunk
         residual = self._pcm_buffer
-        # Even a zero-length residual needs one last_chunk call to flush the
-        # right-context buffer through the decoder (otherwise tokens whose
-        # right context never fully filled stay un-committed).
         self._pcm_buffer = torch.zeros(0, dtype=torch.float32, device=self._device)
-        if residual.numel() == 0:
-            # Send a zero-length last-chunk to flush remaining context.
-            residual = torch.zeros(0, dtype=torch.float32, device=self._device)
         self._step_one_chunk(residual, is_last_chunk=True)
         self._eof_flushed = True
 

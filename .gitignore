@@ -9,3 +9,8 @@ tests/results/
 
 # Claude runtime state
 .claude/
+
+# Web client build outputs (Vite builds app/web/ → app/static/, both transient)
+app/web/node_modules/
+app/web/dist/
+app/static/

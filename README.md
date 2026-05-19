@@ -8,12 +8,11 @@ A FastAPI wrapper around NVIDIA's `parakeet-tdt-0.6b-v2` covering three workload
 ## Features
 
 - **State-of-the-art offline ASR** — `nvidia/parakeet-tdt-0.6b-v2` (Token-and-Duration Transducer).
-- **Five processing strategies** behind one dispatcher (`auto` is the recommended default and routes to the v2 engines):
-  - `chunked_v2` *(REST default via `auto`)* — NVIDIA-blessed `StreamingBatchedAudioBuffer + decoding_computer + prev_batched_state` pattern. Works correctly across the full duration range (0.5 s clips to multi-hour archives).
-  - `progressive_v2` *(WS default via `auto`)* — same v2 engine driven over an ffmpeg PCM stream, emitting sentence-bounded partials as new tokens commit.
-  - `full` — single-pass through encoder + `decoding_computer` (bypasses NeMo's `transcribe()` wrapper, which has a CUDA-graph shape-capture bug on short audio). Matches NVIDIA's published 1.69 % WER on LibriSpeech test-clean and is the fastest path on long audio (~170× RTFx vs `chunked_v2`'s ~65×, single-pass encoder, no chunking overhead).
-  - `chunked` — legacy `BatchedFrameASRTDT` stateful sliding-window. Decoder state carries across chunks but the middle-token merge has documented boundary artifacts on short clips. Retained as a fallback above `STATEFUL_MAX_DURATION_S`.
-  - `progressive` — legacy streaming engine. Same artifacts as `chunked` on short clips.
+- **Three processing strategies**, one decoding pipeline (encoder + `decoding_computer` with optional `prev_batched_state` threading):
+  - `chunked` *(REST default via `auto`)* — offline waveform fed chunk-by-chunk through NVIDIA's `StreamingBatchedAudioBuffer + decoding_computer + prev_batched_state` engine. Sentence-bounded segments, works across the full duration range.
+  - `progressive` *(WS default via `auto`)* — same engine driven over an ffmpeg PCM stream, emitting sentence-bounded partials as new tokens commit.
+  - `full` — single-pass encode + decode of the whole waveform. Fastest on long offline audio (~170× RTFx vs `chunked`'s ~65×), matches NVIDIA's published 1.69 % WER on LibriSpeech test-clean. Bypasses NeMo's `transcribe()` wrapper to dodge a FULL_GRAPH-mode CUDA-graph short-audio bug.
+- **Whisper-compatible response shape** — segments follow OpenAI Whisper's `verbose_json` (`id`, `seek`, `start`, `end`, `text`, `tokens`, `temperature`, `avg_logprob`, `compression_ratio`, `no_speech_prob`). Top-level fields include `task`, `language`, `duration` alongside our extension fields (strategy, csv_content, srt_content, etc.).
 - **Emission lag for streaming**: `(total_buffer − chunk) / 2` seconds — ~7.5 s with the offline-like 10-10-5 preset, ~6 s with the live 10-2-2 preset.
 - **Per-token timestamps** recovered from the stateful TDT merge — segment starts/ends align with the `full` strategy within ~40 ms.
 - **Optional end-of-stream refinement** — `progressive_refinement` runs a single FULL pass over the accumulated PCM at EOF and replaces the streamed segments with offline-quality output (when audio ≤ `MAX_FULL_WAVEFORM_S`).
@@ -72,7 +71,7 @@ Configure via environment variables or `app/.env`.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DEFAULT_STRATEGY` | `auto` \| `full` \| `chunked` \| `chunked_v2` \| `progressive` \| `progressive_v2`. `auto` routes to `chunked_v2` for REST and `progressive_v2` for WS (v2 engines bypass the buggy `transcribe()` path). | auto |
+| `DEFAULT_STRATEGY` | `auto` \| `full` \| `chunked` \| `progressive`. `auto` routes to `chunked` for REST and `progressive` for WS. Aliases `chunked_v2` / `progressive_v2` still accepted for backward compatibility. | auto |
 | `MAX_FULL_WAVEFORM_S` | Hard cap for `full`; longer audio routes to `chunked`. Default matches NeMo's full-attention ceiling. | 1440 |
 | `EARLY_BUFFER_TARGET_S` | Progressive mode — PCM seconds buffered before the first partial. | 15 |
 
@@ -117,7 +116,7 @@ Form upload (`file=@…`), optional query parameters:
 
 | Query param | Description |
 |-------------|-------------|
-| `strategy` | `auto` \| `full` \| `chunked` \| `chunked_v2` \| `progressive` \| `progressive_v2`. `auto` honors `DEFAULT_STRATEGY`. |
+| `strategy` | `auto` \| `full` \| `chunked` \| `progressive`. `auto` honors `DEFAULT_STRATEGY`. `chunked_v2` / `progressive_v2` accepted as aliases. |
 | `chunk_length`, `chunk_overlap`, `batch_size`, `long_audio_threshold` | Override server defaults. |
 
 Example:
@@ -205,14 +204,12 @@ GET /readyz
 
 | If… | Use |
 |-----|-----|
-| Anything REST, any duration — just pick the right default | `auto` (→ `chunked_v2`) |
-| Anything WS, any duration — just pick the right default | `auto` (→ `progressive_v2`) |
-| Offline file, want fastest single-pass throughput on long audio | `full` (~170× RTFx vs `chunked_v2`'s ~65× on multi-min clips) |
-| Offline file, want streaming-style sentence boundaries / per-chunk segmentation | `chunked_v2` |
-| Legacy client integration that depended on the old engines | `chunked` / `progressive` (explicit) |
-| Streaming audio, ~6 s emission lag, prefer fewer/cleaner emissions | `progressive_v2` + `live_latency: true` (10-2-2 preset) |
-| Streaming audio, ~7.5 s emission lag, prefer best chunk-boundary quality | `progressive_v2` + `live_latency: false` (10-10-5 preset, default) |
-| Streaming audio, want offline-quality replacement at EOF | `progressive_v2` + `progressive_refinement: true` (default) |
+| Anything REST, any duration — pick the default | `auto` (→ `chunked`) |
+| Anything WS, any duration — pick the default | `auto` (→ `progressive`) |
+| Offline file, want fastest single-pass throughput on long audio | `full` (~170× RTFx vs `chunked`'s ~65× on multi-min clips) |
+| Streaming audio, ~6 s emission lag, prefer fewer/cleaner emissions | `progressive` + `live_latency: true` (10-2-2 preset) |
+| Streaming audio, ~7.5 s emission lag, best chunk-boundary quality | `progressive` + `live_latency: false` (10-10-5 preset, default) |
+| Streaming audio, want offline-quality replacement at EOF | `progressive` + `progressive_refinement: true` (default) |
 
 ### About the latency numbers
 

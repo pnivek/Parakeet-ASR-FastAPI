@@ -61,18 +61,49 @@ def _make_divisible_by(value: int, factor: int) -> int:
     return (value // factor) * factor
 
 
+def _whisper_segment(
+    seg_id: int,
+    start: float,
+    end: float,
+    text: str,
+    token_ids: List[int],
+) -> dict:
+    """One segment in OpenAI Whisper's verbose_json shape.
+
+    We populate `id`, `start`, `end`, `text`, `tokens`, and `seek`; the
+    confidence/probability fields (`avg_logprob`, `compression_ratio`,
+    `no_speech_prob`) are left None because we don't compute them — but
+    they're present so clients can introspect the response shape without
+    hitting KeyError. `temperature` is fixed at 0.0 since we use greedy
+    decoding.
+    """
+    return {
+        "id": seg_id,
+        "seek": 0,
+        "start": round(max(0.0, start), 3),
+        "end": round(end, 3),
+        "text": text,
+        "tokens": list(token_ids),
+        "temperature": 0.0,
+        "avg_logprob": None,
+        "compression_ratio": None,
+        "no_speech_prob": None,
+    }
+
+
 def tokens_to_sentence_segments(
     token_ids: List[int],
     token_times_s: List[float],
     tokenizer,
     start_seg_id: int = 0,
 ) -> List[dict]:
-    """Group `(token_id, audio_time_s)` pairs into sentence-bounded segment dicts.
+    """Group `(token_id, audio_time_s)` pairs into Whisper-shaped segments.
 
-    Used by both the streaming engine and the single-pass `full_v2` path so they
-    produce identical segment formats. Sentences terminate on '.', '!', '?'; a
-    trailing partial sentence (no terminal punctuation) is flushed as the final
-    segment.
+    Used by both the streaming engine and the single-pass `full` path so they
+    produce identical segment formats. Sentences terminate on '.', '!', '?';
+    a trailing partial sentence (no terminal punctuation) is flushed as the
+    last segment. Output matches OpenAI Whisper's `verbose_json` shape so
+    clients drop in.
     """
     segments: List[dict] = []
     buf_ids: List[int] = []
@@ -91,24 +122,16 @@ def tokens_to_sentence_segments(
         if tok and tok[-1] in ".!?":
             text = tokenizer.ids_to_text(buf_ids).strip()
             if text:
-                segments.append({
-                    "start": round(max(0.0, buf_start), 3),
-                    "end": round(t_s, 3),
-                    "text": text,
-                    "id": seg_id,
-                })
+                segments.append(_whisper_segment(seg_id, buf_start, t_s, text, buf_ids))
                 seg_id += 1
             buf_ids = []
             buf_start = None
     if buf_ids:
         text = tokenizer.ids_to_text(buf_ids).strip()
         if text:
-            segments.append({
-                "start": round(max(0.0, buf_start or 0.0), 3),
-                "end": round(buf_last_t, 3),
-                "text": text,
-                "id": seg_id,
-            })
+            segments.append(
+                _whisper_segment(seg_id, buf_start or 0.0, buf_last_t, text, buf_ids)
+            )
     return segments
 
 
@@ -271,12 +294,13 @@ class StreamingPrevBatchedEngine:
         if self._sentence_buffer_ids:
             text = self.tokenizer.ids_to_text(self._sentence_buffer_ids).strip()
             if text:
-                committed.append({
-                    "start": round(max(0.0, self._sentence_buffer_start or 0.0), 3),
-                    "end": round(self._sentence_buffer_last_t, 3),
-                    "text": text,
-                    "id": self._next_seg_id,
-                })
+                committed.append(_whisper_segment(
+                    self._next_seg_id,
+                    self._sentence_buffer_start or 0.0,
+                    self._sentence_buffer_last_t,
+                    text,
+                    self._sentence_buffer_ids,
+                ))
                 self._next_seg_id += 1
             self._sentence_buffer_ids = []
             self._sentence_buffer_start = None
@@ -407,24 +431,26 @@ class StreamingPrevBatchedEngine:
             if tok and tok[-1] in ".!?":
                 text = tokenizer.ids_to_text(self._sentence_buffer_ids).strip()
                 if text:
-                    segments.append({
-                        "start": round(max(0.0, self._sentence_buffer_start), 3),
-                        "end": round(t, 3),
-                        "text": text,
-                        "id": self._next_seg_id,
-                    })
+                    segments.append(_whisper_segment(
+                        self._next_seg_id,
+                        self._sentence_buffer_start or 0.0,
+                        t,
+                        text,
+                        self._sentence_buffer_ids,
+                    ))
                     self._next_seg_id += 1
                 self._sentence_buffer_ids = []
                 self._sentence_buffer_start = None
         if flush_partial and self._sentence_buffer_ids:
             text = tokenizer.ids_to_text(self._sentence_buffer_ids).strip()
             if text:
-                segments.append({
-                    "start": round(max(0.0, self._sentence_buffer_start or 0.0), 3),
-                    "end": round(self._sentence_buffer_last_t, 3),
-                    "text": text,
-                    "id": self._next_seg_id,
-                })
+                segments.append(_whisper_segment(
+                    self._next_seg_id,
+                    self._sentence_buffer_start or 0.0,
+                    self._sentence_buffer_last_t,
+                    text,
+                    self._sentence_buffer_ids,
+                ))
                 self._next_seg_id += 1
             self._sentence_buffer_ids = []
             self._sentence_buffer_start = None

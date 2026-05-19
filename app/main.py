@@ -29,13 +29,8 @@ import torch
 import torchaudio
 import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.models.asr_model import ASRModel as NeMoASRModelType
-from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
-from nemo.collections.asr.parts.utils.streaming_utils import (
-    BatchedFrameASRTDT,
-    AudioFeatureIterator,
-)
 
-# StreamingPrevBatchedEngine — Option C, NVIDIA's blessed streaming pattern.
+# Streaming engine — NVIDIA's blessed pattern (NeMo PR #9106).
 # Lives in its own module to keep main.py from growing further.
 from streaming_v2 import StreamingPrevBatchedEngine, tokens_to_sentence_segments
 
@@ -93,17 +88,33 @@ FFMPEG_PCM_CHUNK_SIZE_BYTES = int(os.getenv("FFMPEG_PCM_CHUNK_SIZE_BYTES", 16384
 
 
 class ProcessingStrategy(str, Enum):
-    """Transcription dispatch modes. See README and resolve_strategy() for selection rules."""
+    """Transcription dispatch modes. See README and resolve_strategy() for selection rules.
+
+    All three offline/streaming strategies share one decoding pipeline
+    (encoder + `decoding_computer` with optional `prev_batched_state` threading):
+
+      - FULL          single-pass encode → decode of the whole waveform
+      - CHUNKED       same engine driven chunk-by-chunk over an offline waveform
+      - PROGRESSIVE   same engine driven chunk-by-chunk over an ffmpeg PCM stream
+
+    The legacy `BatchedFrameASRTDT`-based chunked + progressive engines were
+    retired in C6 once v2 parity was verified end-to-end on the LibriSpeech
+    test-clean + TED-LIUM 3 harness. String aliases `chunked_v2` /
+    `progressive_v2` map to CHUNKED / PROGRESSIVE for client-side backward
+    compatibility — see `parse_request_config`.
+    """
     AUTO = "auto"
     FULL = "full"
     CHUNKED = "chunked"
     PROGRESSIVE = "progressive"
-    # NVIDIA's blessed streaming pattern (NeMo PR #9106), via StreamingPrevBatchedEngine.
-    # Same UX as `progressive` but uses public API (decoding_computer + prev_batched_state).
-    # Will replace `progressive` and `chunked` once parity is verified. See
-    # .claude/plans/option-c-prev-batched-state.md.
-    CHUNKED_V2 = "chunked_v2"
-    PROGRESSIVE_V2 = "progressive_v2"
+
+
+# Backward-compat aliases. Old clients sending `?strategy=chunked_v2` or
+# `progressive_v2` still work — they just route to the (now-default) v2 engine.
+_STRATEGY_ALIASES = {
+    "chunked_v2": "chunked",
+    "progressive_v2": "progressive",
+}
 
 
 # Strategy configuration.
@@ -113,8 +124,9 @@ class ProcessingStrategy(str, Enum):
 DEFAULT_STRATEGY = os.getenv("DEFAULT_STRATEGY", ProcessingStrategy.AUTO.value).lower()
 MAX_FULL_WAVEFORM_S = float(os.getenv("MAX_FULL_WAVEFORM_S", 1440.0))
 
-# Streaming context windows for the stateful (BatchedFrameASRTDT) engine — Phase 6.
-# NeMo's reference recommends 10-10-5 for offline-like quality, 10-2-2 for live latency.
+# Streaming context windows. NeMo's reference recommends 10-10-5 for offline-like
+# quality, 10-2-2 for live latency. These drive `StreamingPrevBatchedEngine`
+# in both the CHUNKED (offline) and PROGRESSIVE (live) strategies.
 STREAMING_LEFT_CONTEXT_S = float(os.getenv("STREAMING_LEFT_CONTEXT_S", 10.0))
 STREAMING_CHUNK_S = float(os.getenv("STREAMING_CHUNK_S", 10.0))
 STREAMING_RIGHT_CONTEXT_S = float(os.getenv("STREAMING_RIGHT_CONTEXT_S", 5.0))
@@ -123,22 +135,6 @@ STREAMING_LIVE_RIGHT_CONTEXT_S = float(os.getenv("STREAMING_LIVE_RIGHT_CONTEXT_S
 
 # Progressive mode: PCM buffered before emitting the first partial.
 EARLY_BUFFER_TARGET_S = float(os.getenv("EARLY_BUFFER_TARGET_S", 15.0))
-
-# Phase 6 — Stateful chunked engine (BatchedFrameASRTDT). When true, the
-# chunked strategy carries decoder state across chunks instead of running
-# independent overlapping transcribe() calls. Better quality (no boundary
-# duplicates / drops), but currently produces a single concatenated text
-# segment rather than per-utterance timestamps. Toggle false to fall back to
-# the legacy independent-chunk path (which keeps timestamps).
-USE_STATEFUL_CHUNKED = os.getenv("USE_STATEFUL_CHUNKED", "false").lower() == "true"
-
-# Stateful engine ties up the model lock proportional to audio duration
-# (chunks process sequentially with batch_size=1). Measured RTF ≈ 0.022 on
-# DGX Spark — a 30 min file takes ~40s, a 3h file takes ~4min. Above the
-# threshold, fall back to the legacy independent-chunk path (which batches
-# 4 chunks per call and is ~20× faster, at the cost of some boundary
-# quality). Set to 0 to disable the cap (always use stateful when on).
-STATEFUL_MAX_DURATION_S = float(os.getenv("STATEFUL_MAX_DURATION_S", 1800.0))
 
 # CUDA graph decoder for RNNT/TDT. NeMo 2.7.x defaults to ON (FULL_GRAPH mode).
 # Earlier attempts crashed with cudaErrorIllegalAddress on the 2nd transcribe;
@@ -156,10 +152,9 @@ logger.info(
     f"  Chunking Defaults: length={TRANSCRIBE_CHUNK_LEN}s, overlap={TRANSCRIBE_OVERLAP}s, batch_cap={CHUNKING_BATCH_SIZE}\n"
     f"  Streaming (ffmpeg): pcm_read_chunk_size={FFMPEG_PCM_CHUNK_SIZE_BYTES}B\n"
     f"  Strategy: default={DEFAULT_STRATEGY}, max_full_waveform_s={MAX_FULL_WAVEFORM_S}, early_buffer_target_s={EARLY_BUFFER_TARGET_S}\n"
-    f"  Stateful streaming: offline {STREAMING_LEFT_CONTEXT_S}-{STREAMING_CHUNK_S}-{STREAMING_RIGHT_CONTEXT_S}, "
+    f"  Streaming windows: offline {STREAMING_LEFT_CONTEXT_S}-{STREAMING_CHUNK_S}-{STREAMING_RIGHT_CONTEXT_S}, "
     f"live {STREAMING_LEFT_CONTEXT_S}-{STREAMING_LIVE_CHUNK_S}-{STREAMING_LIVE_RIGHT_CONTEXT_S}\n"
-    f"  Stateful chunked engine: USE_STATEFUL_CHUNKED={USE_STATEFUL_CHUNKED}, "
-    f"STATEFUL_MAX_DURATION_S={STATEFUL_MAX_DURATION_S}"
+    f"  CUDA graphs: {USE_CUDA_GRAPHS}"
 )
 
 # --- FastAPI App Setup ---
@@ -189,8 +184,6 @@ def _collect_health_info() -> dict:
             "default_strategy": DEFAULT_STRATEGY,
             "max_full_waveform_s": MAX_FULL_WAVEFORM_S,
             "long_audio_threshold_s": LONG_AUDIO_THRESHOLD_S,
-            "use_stateful_chunked": USE_STATEFUL_CHUNKED,
-            "stateful_max_duration_s": STATEFUL_MAX_DURATION_S,
             "use_cuda_graphs": USE_CUDA_GRAPHS,
             "early_buffer_target_s": EARLY_BUFFER_TARGET_S,
             "streaming_context_s": {
@@ -260,14 +253,6 @@ global_original_model_device_str: str = "cpu"  # Default, will be updated after 
 global_original_model_dtype_torch: torch.dtype = torch.float32 # Default
 
 # Dual-decoder pinning — both RNNTDecoding instances built once at startup.
-# `decoding_greedy_batch` is the active default (used by FULL and the legacy
-# chunked fallback). `decoding_stateful_tdt` is used by BatchedFrameASRTDT
-# (CHUNKED stateful + PROGRESSIVE streaming). Swapping by reference instead
-# of via change_decoding_strategy() preserves the captured CUDA graph in
-# each decoder's decoding_computer across requests.
-decoding_greedy_batch = None
-decoding_stateful_tdt = None
-
 try:
     logger.info(f"Loading ASR model: {ASR_MODEL_NAME}...")
     # Load the pre-trained NeMo ASR model
@@ -308,71 +293,33 @@ try:
         # rebuild keeps cuda graphs off. Also pre-set compute_timestamps=True
         # so transcribe(timestamps=True) doesn't trigger the internal rebuild
         # on the first call (would otherwise hit a brief inconsistent state).
+        # Pin the decoding strategy at the CONFIG level. Doing this once at
+        # load and never re-running change_decoding_strategy() preserves the
+        # captured CUDA graph in decoding_computer across requests (re-running
+        # rebuilds the computer and re-captures). compute_timestamps=True is
+        # set up-front so nothing internal flips it later.
         try:
-            from omegaconf import open_dict, OmegaConf
+            from omegaconf import open_dict
             cfg = asr_model.cfg.decoding
             with open_dict(cfg):
                 cfg.compute_timestamps = True
-                # Explicit fast default — parakeet-tdt checkpoints can ship with
-                # strategy unset or 'greedy', which would make the FULL path and
-                # the legacy chunked fallback fall through to the non-batched
-                # GreedyTDTInfer (~20× slower than GreedyBatchedTDTInfer).
+                # greedy_batch keeps the fast GreedyBatchedTDTInfer with its
+                # captured graph; parakeet-tdt checkpoints sometimes ship
+                # with strategy unset or 'greedy' (non-batched, ~20× slower).
                 cfg.strategy = "greedy_batch"
                 cfg.preserve_alignments = False
                 if "greedy" in cfg:
                     with open_dict(cfg.greedy):
                         cfg.greedy.use_cuda_graph_decoder = USE_CUDA_GRAPHS
-            # NOTE: we do NOT switch to strategy=greedy + preserve_alignments here
-            # even when USE_STATEFUL_CHUNKED=true. Doing so globally would force
-            # the FAST greedy_batch decoder off the model and make the legacy
-            # chunked fallback (and the FULL path) ~20× slower. Instead we swap
-            # to greedy transiently inside _transcribe_chunked_stateful only.
             asr_model.change_decoding_strategy(cfg, verbose=False)
-            inferer = asr_model.decoding.decoding
-            computer = getattr(inferer, "decoding_computer", None)
-            final_mode = getattr(computer, "cuda_graphs_mode", "<no computer>")
-            final_allow = getattr(computer, "allow_cuda_graphs", "<no computer>")
+            computer = getattr(asr_model.decoding.decoding, "decoding_computer", None)
             logger.info(
-                f"Decoding strategy reapplied with use_cuda_graph_decoder={USE_CUDA_GRAPHS}, "
-                f"compute_timestamps=True. cuda_graphs_mode={final_mode!r}, "
-                f"allow_cuda_graphs={final_allow!r}"
-            )
-
-            # Pre-build the second decoder needed by BatchedFrameASRTDT
-            # (greedy + preserve_alignments=True + fused_batch_size=-1). The
-            # streaming/chunked paths swap between the two by reference
-            # instead of calling change_decoding_strategy(), so each decoder
-            # KEEPS its captured CUDA graph across requests. Without this,
-            # every stateful request rebuilt the computer and re-captured.
-            decoding_greedy_batch = asr_model.decoding
-            cfg_greedy_batch = OmegaConf.create(OmegaConf.to_container(asr_model.cfg.decoding, resolve=True))
-
-            stateful_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
-            with open_dict(stateful_cfg):
-                stateful_cfg.strategy = "greedy"
-                stateful_cfg.preserve_alignments = True
-                stateful_cfg.fused_batch_size = -1
-                stateful_cfg.compute_timestamps = True
-                if "greedy" in stateful_cfg:
-                    with open_dict(stateful_cfg.greedy):
-                        stateful_cfg.greedy.use_cuda_graph_decoder = USE_CUDA_GRAPHS
-            asr_model.change_decoding_strategy(stateful_cfg, verbose=False)
-            decoding_stateful_tdt = asr_model.decoding
-
-            # Reinstate the greedy_batch decoding as the active default.
-            # asr_model.cfg.decoding currently points at stateful_cfg; restore
-            # it to cfg_greedy_batch so transcribe()'s compute_timestamps
-            # check (rnnt_models.py:301-315) sees the correct config.
-            asr_model.decoding = decoding_greedy_batch
-            asr_model.cfg.decoding = cfg_greedy_batch
-            logger.info(
-                "Dual decoder ready: greedy_batch (active) + greedy/preserve_alignments "
-                "(for BatchedFrameASRTDT). Both keep independent captured CUDA graphs."
+                f"Decoding strategy pinned: greedy_batch, "
+                f"use_cuda_graph_decoder={USE_CUDA_GRAPHS}, compute_timestamps=True, "
+                f"cuda_graphs_mode={getattr(computer, 'cuda_graphs_mode', '<no computer>')!r}"
             )
         except Exception as e_cg:
-            logger.warning(f"config-level cuda-graph disable failed: {e_cg}", exc_info=True)
-            decoding_greedy_batch = None
-            decoding_stateful_tdt = None
+            logger.warning(f"Decoding strategy pin failed: {e_cg}", exc_info=True)
 
         # Globals now reflect the pinned resting state, not where NeMo first put it.
         global_original_model_device_str = str(next(asr_model.parameters()).device)
@@ -599,315 +546,6 @@ async def _revert_model_to_global_original_state(
         logger.error(f"({request_id}) Error during final model state reversion: {e_restore_globally}", exc_info=True)
 
 
-async def _perform_asr_transcription(
-    asr_model_instance: NeMoASRModelType,
-    audio_input_list: List[torch.Tensor], # Expected to be float32 from load_and_preprocess_audio
-    batch_size_for_transcribe_call: int,
-    num_asr_workers: int,
-    request_id: str = "asr"
-) -> Tuple[Optional[List[Hypothesis]], float]:
-    """
-    Performs ASR transcription using the NeMo model.
-
-    Args:
-        asr_model_instance: The loaded NeMo ASR model.
-        audio_input_list: A list of 1D float32 audio tensors for transcription.
-        batch_size_for_transcribe_call: Batch size for the model's transcribe method.
-        num_asr_workers: Number of workers for the model's internal DataLoader.
-        request_id: Identifier for logging.
-
-    Returns:
-        A tuple containing the list of Hypothesis objects and the ASR processing time in seconds.
-        Returns (None, 0.0) on failure.
-    """
-    if not audio_input_list or not asr_model_instance:
-        logger.warning(f"({request_id}) _perform_asr_transcription called with no audio or no model.")
-        return None, 0.0
-        
-    hypotheses: Optional[List[Hypothesis]] = None
-    asr_processing_duration_s: float = 0.0
-    
-    try:
-        model_device = next(asr_model_instance.parameters()).device
-        # The model's compute layers (encoder, decoder) should be in target_operational_dtype (e.g. bfloat16)
-        # as set by _apply_model_settings_for_session.
-        # The NeMo AudioPreprocessor internally expects/handles float32 input signals.
-    except Exception as e_dev:
-        logger.error(f"({request_id}) Error getting model device: {e_dev}", exc_info=True)
-        raise
-    
-    audio_for_preprocessor_on_device: List[torch.Tensor] = []
-    try:
-        # Ensure audio tensors are on the model's device AND are float32 for the preprocessor
-        # (as per NeMo preprocessor warning/behavior).
-        for audio_tensor in audio_input_list:
-            if audio_tensor.dtype != torch.float32:
-                logger.warning(f"({request_id}) Input audio tensor was not float32 ({audio_tensor.dtype}), casting.")
-            audio_for_preprocessor_on_device.append(
-                audio_tensor.to(device=model_device, dtype=torch.float32)
-            )
-    except Exception as e_mov:
-        logger.error(f"({request_id}) Error moving audio to device '{model_device}' and ensuring float32: {e_mov}", exc_info=True)
-        raise
-    
-    start_time = time.time()
-    try:
-        _log_torch_stream(request_id, "_perform_asr_transcription pre-transcribe")
-        raw_hypotheses = await _run_on_asr_executor(
-            asr_model_instance.transcribe,
-            audio=audio_for_preprocessor_on_device, # Pass float32 audio list
-            batch_size=batch_size_for_transcribe_call,
-            num_workers=num_asr_workers,
-            return_hypotheses=True,  # Required for accessing detailed timestamp info
-            timestamps=True,         # Request word/segment timestamps
-            verbose=False            # Reduce NeMo's internal verbosity
-        )
-        asr_processing_duration_s = round(time.time() - start_time, 3)
-
-        # Process raw_hypotheses which can be List[Hypothesis] or List[List[Hypothesis]]
-        if raw_hypotheses:
-            if all(isinstance(h, Hypothesis) for h in raw_hypotheses):
-                hypotheses = raw_hypotheses
-            elif all(isinstance(h_list, list) for h_list in raw_hypotheses): # Handle list of lists (common for batch>1)
-                hypotheses = [h_item for h_sublist in raw_hypotheses for h_item in h_sublist if isinstance(h_item, Hypothesis)]
-            elif isinstance(raw_hypotheses, Hypothesis): # Single hypothesis for single audio
-                hypotheses = [raw_hypotheses]
-            else:
-                logger.warning(f"({request_id}) Unexpected hypothesis format from model.transcribe: {type(raw_hypotheses)}")
-        
-        if hypotheses:
-             logger.debug(f"({request_id}) Transcription successful, {len(hypotheses)} hypotheses obtained in {asr_processing_duration_s}s.")
-        else:
-            logger.warning(f"({request_id}) Transcription yielded no valid hypotheses in {asr_processing_duration_s}s.")
-            
-        return hypotheses, asr_processing_duration_s
-        
-    except Exception as e_trans:
-        logger.error(f"({request_id}) Error during asr_model.transcribe call: {e_trans}", exc_info=True)
-        raise
-
-
-def _process_hypotheses_to_segments(
-    batch_hypotheses: Optional[List[Hypothesis]], # Made Optional
-    batch_offsets_s: List[float],
-    request_id: str = "seg_proc"
-) -> List[dict]:
-    """
-    Converts a list of NeMo Hypothesis objects into a list of segment dictionaries.
-    Each segment contains start time, end time, and text.
-
-    Args:
-        batch_hypotheses: A list of Hypothesis objects from NeMo ASR.
-        batch_offsets_s: A list of time offsets (in seconds) corresponding to the
-                         start of each audio chunk that generated a hypothesis.
-        request_id: Identifier for logging.
-
-    Returns:
-        A list of segment dictionaries.
-    """
-    all_segments: List[dict] = []
-    if not batch_hypotheses: # Check if None or empty
-        logger.debug(f"({request_id}) No hypotheses provided to process into segments.")
-        return all_segments
-        
-    if len(batch_hypotheses) != len(batch_offsets_s):
-        logger.warning(f"({request_id}) Mismatch between number of hypotheses ({len(batch_hypotheses)}) and offsets ({len(batch_offsets_s)}). Cannot process segments accurately.")
-        return all_segments 
-    
-    for hyp_idx, hyp_obj in enumerate(batch_hypotheses):
-        if hyp_obj is None:
-            logger.debug(f"({request_id}) Hypothesis at index {hyp_idx} is None, skipping.")
-            continue
-            
-        chunk_offset_s = batch_offsets_s[hyp_idx]
-        
-        # Check for NeMo's detailed timestamp structure
-        if hasattr(hyp_obj, "timestamp") and hyp_obj.timestamp and isinstance(hyp_obj.timestamp, dict):
-            # 'segment' level timestamps are usually word groups or phrases
-            segments_in_hyp = hyp_obj.timestamp.get("segment", []) 
-            if not segments_in_hyp and hasattr(hyp_obj, "text") and hyp_obj.text:
-                 # Fallback if 'segment' is empty but 'word' timestamps might exist or just plain text
-                word_timestamps = hyp_obj.timestamp.get("word", [])
-                if word_timestamps:
-                    logger.debug(f"({request_id}) No 'segment' timestamps, but found {len(word_timestamps)} 'word' timestamps for hypothesis {hyp_idx}. Combining them.")
-                    current_segment_text = []
-                    current_segment_start = -1
-                    for i, word_info in enumerate(word_timestamps):
-                        word_text = word_info.get("word", "").strip()
-                        word_start = word_info.get("start_offset", -1.0) # NeMo uses start_offset/end_offset for words
-                        word_end = word_info.get("end_offset", -1.0)
-                        if not word_text or word_start < 0 or word_end < word_start : continue
-
-                        if current_segment_start == -1:
-                            current_segment_start = word_start
-                        current_segment_text.append(word_text)
-                        
-                        # Heuristic: end segment on punctuation or if next word is significantly later
-                        is_last_word = (i == len(word_timestamps) - 1)
-                        next_word_start = word_timestamps[i+1].get("start_offset", -1.0) if not is_last_word else -1.0
-                        
-                        if word_text.endswith(('.', '?', '!')) or is_last_word or \
-                           (not is_last_word and next_word_start > word_end + 0.5): # End segment if >0.5s gap
-                            segment_text_final = " ".join(current_segment_text)
-                            start_time = round(current_segment_start + chunk_offset_s, 3)
-                            end_time = round(word_end + chunk_offset_s, 3)
-                            all_segments.append({"start": start_time, "end": end_time, "text": segment_text_final})
-                            current_segment_text = []
-                            current_segment_start = -1
-                    if current_segment_text : # remaining text
-                        segment_text_final = " ".join(current_segment_text)
-                        start_time = round(current_segment_start + chunk_offset_s, 3)
-                        # Estimate end time if only one word and no proper end
-                        end_time = round((word_timestamps[-1].get("end_offset", current_segment_start + 1.0)) + chunk_offset_s, 3)
-                        all_segments.append({"start": start_time, "end": end_time, "text": segment_text_final})
-
-                elif hyp_obj.text: # No segment or word timestamps, use full text as one segment
-                     logger.debug(f"({request_id}) No 'segment' or 'word' timestamps, using full hypothesis text for hypothesis {hyp_idx}.")
-                     all_segments.append({
-                        "start": chunk_offset_s, 
-                        "end": round(chunk_offset_s + (len(hyp_obj.text.split()) * 0.5), 3), # Rough estimate for end
-                        "text": hyp_obj.text.strip()
-                    })
-
-            for seg_idx, seg_meta in enumerate(segments_in_hyp): # Original loop for 'segment' level
-                seg_text = seg_meta.get("segment", "").strip()
-                if not seg_text: continue
-                
-                start_time = round(seg_meta.get("start", 0.0) + chunk_offset_s, 3)
-                end_time = round(seg_meta.get("end", 0.0) + chunk_offset_s, 3)
-                
-                if start_time < 0 or end_time < start_time:
-                    logger.warning(f"({request_id}) Invalid segment timing: start={start_time}, end={end_time} for text '{seg_text}'. Skipping.")
-                    continue
-                all_segments.append({"start": start_time, "end": end_time, "text": seg_text})
-        
-        elif hasattr(hyp_obj, "text") and hyp_obj.text: # Fallback if no timestamp attribute at all
-            logger.debug(f"({request_id}) Hypothesis {hyp_idx} has no 'timestamp' attribute, using full text.")
-            all_segments.append({
-                "start": chunk_offset_s, 
-                "end": round(chunk_offset_s + (len(hyp_obj.text.split()) * 0.5), 3), # Rough estimate
-                "text": hyp_obj.text.strip()
-            })
-            
-    # Add default keys if missing from any segment (simplifies downstream processing)
-    final_output_segments = []
-    for i, seg in enumerate(all_segments):
-        seg_template = {"id": i, "seek":0, "tokens":[], "temperature":0.0, "avg_logprob":None, "compression_ratio":None, "no_speech_prob":None}
-        seg_template.update(seg) # Override defaults with actual segment data
-        final_output_segments.append(seg_template)
-
-    logger.debug(f"({request_id}) Processed {len(batch_hypotheses)} hypotheses into {len(final_output_segments)} segments.")
-    return final_output_segments
-
-
-def _deduplicate_segments(
-    raw_segments: List[dict],
-    overlap_threshold_seconds: float = 0.3
-) -> List[dict]:
-    """
-    Deduplicates a list of transcribed segments by merging or removing overlapping ones.
-
-    The function sorts segments by start time. It iterates through them, deciding whether
-    to keep, merge, or discard segments based on their temporal relationship with the
-    previously accepted segment and the `overlap_threshold_seconds`.
-
-    Args:
-        raw_segments: A list of segment dictionaries. Each dictionary is expected
-                      to have at least 'start', 'end', and 'text' keys.
-        overlap_threshold_seconds: The maximum allowed overlap (in seconds) between
-                                   the end of one segment and the start of the next
-                                   before they are considered significantly overlapping.
-                                   This also influences merging logic.
-
-    Returns:
-        A list of deduplicated and cleaned segment dictionaries, with updated 'id' fields.
-        Returns an empty list if input is empty or segments are malformed.
-    """
-    if not raw_segments:
-        return []
-
-    # Attempt to sort segments; return empty if essential keys are missing causing TypeError
-    try:
-        # Sort by start time, then by end time as a secondary criterion.
-        sorted_segments = sorted(raw_segments, key=lambda s: (s.get('start', float('inf')), s.get('end', float('inf'))))
-    except TypeError:
-        logger.warning("(_deduplicate_segments) Segments list contained items missing 'start' or 'end' keys, or they were not comparable. Returning empty list.")
-        return [] # Segments are malformed for sorting
-
-    final_segments: List[dict] = []
-    prev_seg: Optional[dict] = None
-
-    for current_segment in sorted_segments:
-        # Ensure basic structure of the current segment
-        if not all(key in current_segment for key in ["start", "end", "text"]):
-            logger.debug(f"(_deduplicate_segments) Skipping segment due to missing keys: {current_segment.get('text', 'N/A')[:30]}")
-            continue
-
-        if prev_seg is None:
-            # This is the first valid segment
-            current_segment["id"] = len(final_segments)
-            final_segments.append(current_segment)
-            prev_seg = current_segment
-            continue
-
-        # prev_seg is guaranteed to be not None here
-        current_start = current_segment["start"]
-        prev_end = prev_seg["end"]
-
-        # Condition 1: Current segment starts after (or very slightly before) previous segment ends.
-        # This means they are distinct or have a minor, acceptable overlap.
-        if current_start >= prev_end - overlap_threshold_seconds:
-            # If there's a slight overlap, adjust the end of the previous segment
-            # to ensure no temporal overlap in the final list.
-            if current_start < prev_end:
-                # Ensure prev_seg end doesn't go before its start
-                prev_seg["end"] = max(prev_seg["start"], current_start - 0.001)
-            
-            current_segment["id"] = len(final_segments)
-            final_segments.append(current_segment)
-            prev_seg = current_segment
-        else:
-            # Condition 2: Current segment overlaps significantly with the previous segment.
-            # This is the more complex case requiring a decision to replace or discard.
-            
-            # Heuristic: If the current segment is much shorter and ends not much later
-            # than the previous one, it's likely a less complete version of the same utterance.
-            # The 0.7 factor means if current is less than 70% of prev's duration.
-            # The overlap_threshold_seconds / 2 provides a small buffer for the end time.
-            current_duration = current_segment["end"] - current_segment["start"]
-            prev_duration = prev_seg["end"] - prev_seg["start"]
-
-            if current_segment["end"] < prev_end + (overlap_threshold_seconds / 2.0) and \
-               current_duration < prev_duration * 0.7:
-                # Discard current segment as it seems to be a less complete, overlapping part
-                logger.debug(f"(_deduplicate_segments) Discarding shorter overlapping segment: '{current_segment['text'][:30]}...'")
-                continue
-            else:
-                # Replace previous segment with current segment if current segment is preferred
-                # (e.g., longer, or starts earlier but considered more complete by this logic path).
-                logger.debug(f"(_deduplicate_segments) Replacing segment '{prev_seg['text'][:30]}...' with '{current_segment['text'][:30]}...'")
-                current_segment["id"] = prev_seg["id"] # Retain ID of the segment being replaced
-                final_segments[-1] = current_segment
-                prev_seg = current_segment
-
-    # Final cleanup: ensure segments have valid durations (end > start)
-    cleaned_segments: List[dict] = []
-    for i, seg in enumerate(final_segments):
-        if seg["end"] <= seg["start"]:
-            # If duration is zero or negative, but there's text, give it a minimal duration.
-            if seg["text"].strip():
-                seg["end"] = seg["start"] + 0.001 # Minimal positive duration
-                seg["id"] = len(cleaned_segments)
-                cleaned_segments.append(seg)
-            # If no text and invalid duration, it's likely an artifact; discard.
-        else:
-            seg["id"] = len(cleaned_segments) # Re-assign ID based on final position
-            cleaned_segments.append(seg)
-            
-    logger.info(f"(_deduplicate_segments) Raw segments: {len(raw_segments)}, Deduplicated segments: {len(cleaned_segments)}")
-    return cleaned_segments
-
-
 def parse_request_config(
     c_len: Optional[float] = None,
     c_ov: Optional[float] = None,
@@ -946,13 +584,12 @@ def parse_request_config(
         ValueError: If any parameter value is outside its allowed range.
     """
     requested_strategy = (strategy or DEFAULT_STRATEGY).lower()
+    requested_strategy = _STRATEGY_ALIASES.get(requested_strategy, requested_strategy)
     try:
         strategy_enum = ProcessingStrategy(requested_strategy)
     except ValueError:
-        raise ValueError(
-            f"Invalid strategy '{requested_strategy}'. "
-            f"Must be one of: {[s.value for s in ProcessingStrategy]}."
-        )
+        valid = [s.value for s in ProcessingStrategy] + sorted(_STRATEGY_ALIASES.keys())
+        raise ValueError(f"Invalid strategy '{requested_strategy}'. Must be one of: {valid}.")
 
     config = {
         "chunk_length": c_len if c_len is not None else TRANSCRIBE_CHUNK_LEN,
@@ -991,32 +628,27 @@ def resolve_strategy(
     """
     Resolve the processing strategy for a request.
 
-    Explicit non-AUTO strategies from client_config win. Otherwise AUTO routes
-    to the v2 engines (NVIDIA-blessed `StreamingBatchedAudioBuffer` +
-    `decoding_computer` + `prev_batched_state` pattern):
+    Explicit non-AUTO strategies from client_config win. Otherwise AUTO routes:
 
-    - Streaming  -> PROGRESSIVE_V2
-    - Otherwise  -> CHUNKED_V2 (handles any duration without fallback).
+    - Streaming  -> PROGRESSIVE  (live PCM through the v2 streaming engine)
+    - Otherwise  -> CHUNKED      (offline waveform through the same engine)
 
-    AUTO used to route short audio to FULL (NeMo's high-level `transcribe()`),
-    but harness testing on the LibriSpeech test-clean 2620-utterance set
-    showed that path produces 23 % empty / 35 % catastrophically wrong
-    output on audio under ~5 s — consistent with a CUDA-graph shape-capture
-    issue in `transcribe()`. The v2 engines bypass `transcribe()` entirely
-    via `decoding_computer` and don't exhibit this regression. `FULL` /
-    `CHUNKED` / `PROGRESSIVE` remain explicit-only.
+    `FULL` remains explicit-only — it's the fastest single-pass path for known-long
+    offline files but skips the per-sentence segmentation the chunked engine
+    provides. All three strategies share one encoder + `decoding_computer`
+    pipeline; the legacy `BatchedFrameASRTDT`-based engines were retired in C6.
     """
     requested = client_config.get("strategy", ProcessingStrategy.AUTO)
     if isinstance(requested, str):
-        requested = ProcessingStrategy(requested)
+        requested = ProcessingStrategy(_STRATEGY_ALIASES.get(requested, requested))
 
     if requested != ProcessingStrategy.AUTO:
         return requested
 
     if is_streaming:
-        return ProcessingStrategy.PROGRESSIVE_V2
+        return ProcessingStrategy.PROGRESSIVE
 
-    return ProcessingStrategy.CHUNKED_V2
+    return ProcessingStrategy.CHUNKED
 
 
 def parse_websocket_config(client_cfg: dict) -> dict:
@@ -1089,24 +721,19 @@ async def handle_streaming_pcm(
     client_config: dict
 ):
     """
-    Handles the audio streaming pipeline for a WebSocket connection using ffmpeg.
+    Handles the live PROGRESSIVE pipeline for a WebSocket connection.
 
-    This function sets up a producer-consumer pattern:
-    - Producer:
-        - Receives audio byte chunks from the WebSocket client.
-        - Pipes these bytes to an `ffmpeg` subprocess.
-        - `ffmpeg` decodes/resamples the input audio to 16kHz mono PCM.
-        - Reads the standardized PCM output from `ffmpeg`.
-        - Buffers and segments this PCM data into ASR-ready chunks (fixed duration).
-        - Puts these (audio_tensor, offset_s) tuples onto an asyncio Queue.
-    - Consumer:
-        - Retrieves ASR chunks from the queue.
-        - Batches them according to `client_config["batch_size"]`.
-        - Performs ASR transcription using `_perform_asr_transcription`.
-        - Processes hypotheses into segments.
-        - Sends `segments_batch` messages back to the client via WebSocket.
+    Producer/consumer pattern:
+    - Producer: receives audio from the WS, pipes through ffmpeg → 16 kHz mono
+      PCM, segments into engine-sized chunks, puts (tensor, offset_s) onto a
+      queue.
+    - Consumer: drains the queue and feeds each chunk into the
+      StreamingPrevBatchedEngine. Newly committed sentence-bounded segments
+      are emitted as `segments_batch` messages.
 
-    Finally, it sends a `final_transcription` message with aggregated results.
+    On EOF: optional `progressive_refinement` runs a single FULL pass over the
+    accumulated PCM (offline-quality replacement). Finally emits
+    `final_transcription`.
 
     Args:
         websocket: The active WebSocket connection.
@@ -1115,50 +742,25 @@ async def handle_streaming_pcm(
         client_config: Parsed configuration dictionary from the client, including
                        chunk_length, overlap, batch_size, format, etc.
     """
-    sent_segments_pcm: List[dict] = [] # Stores all segments sent to client for final aggregation
+    sent_segments_pcm: List[dict] = []  # all segments sent to client, for final aggregation
 
     live_latency = bool(client_config.get("live_latency", False))
-    resolved_strategy_str = client_config.get("_resolved_strategy", "progressive")
-    use_v2_engine = resolved_strategy_str == ProcessingStrategy.PROGRESSIVE_V2.value
-    # USE_STATEFUL_CHUNKED also gates progressive: when enabled the live partial
-    # pipeline runs `StreamingTdtEngine` (BatchedFrameASRTDT chunk-by-chunk)
-    # instead of the legacy independent-chunk consumer. Same flag means callers
-    # get coherent decoder-state continuity in BOTH offline and live mode.
-    # When strategy=progressive_v2 the new `StreamingPrevBatchedEngine` is used
-    # instead (NVIDIA's blessed `prev_batched_state` API).
-    use_stateful_progressive = USE_STATEFUL_CHUNKED or use_v2_engine
 
-    if use_stateful_progressive:
-        # Engine chunk + buffer follow the live or offline-like preset.
-        engine_chunk_len_s = STREAMING_LIVE_CHUNK_S if live_latency else STREAMING_CHUNK_S
-        if live_latency:
-            engine_total_buffer_s = STREAMING_LEFT_CONTEXT_S + STREAMING_LIVE_CHUNK_S + STREAMING_LIVE_RIGHT_CONTEXT_S
-            preset_label = f"10-{STREAMING_LIVE_CHUNK_S:g}-{STREAMING_LIVE_RIGHT_CONTEXT_S:g} live"
-        else:
-            engine_total_buffer_s = STREAMING_LEFT_CONTEXT_S + STREAMING_CHUNK_S + STREAMING_RIGHT_CONTEXT_S
-            preset_label = f"{STREAMING_LEFT_CONTEXT_S:g}-{STREAMING_CHUNK_S:g}-{STREAMING_RIGHT_CONTEXT_S:g} offline-like"
-        # The producer pushes engine-sized chunks with zero overlap; the engine
-        # holds its own context window via the FIFO buffer.
-        asr_chunk_len_s = engine_chunk_len_s
-        asr_chunk_overlap_s = 0.0
-        logger.info(
-            f"({session_id}) Stream: stateful TDT engine — chunk={engine_chunk_len_s:g}s, "
-            f"buffer={engine_total_buffer_s:g}s ({preset_label})."
-        )
-    elif live_latency:
-        # Legacy independent-chunk path: smaller chunks ≈ faster partials, no
-        # state carry. Quality is lower than the stateful path but no rebuild.
-        asr_chunk_len_s = STREAMING_LIVE_CHUNK_S
-        asr_chunk_overlap_s = min(client_config.get("chunk_overlap", 0.0), STREAMING_LIVE_CHUNK_S - 0.1)
-        if asr_chunk_overlap_s < 0:
-            asr_chunk_overlap_s = 0.0
-        logger.info(
-            f"({session_id}) Stream: legacy + live_latency → {asr_chunk_len_s}s chunks "
-            f"(overlap {asr_chunk_overlap_s:.2f}s) instead of client's {client_config['chunk_length']}s."
-        )
-    else:
-        asr_chunk_len_s = client_config["chunk_length"]
-        asr_chunk_overlap_s = client_config["chunk_overlap"]
+    # The producer pushes engine-sized chunks with zero overlap; the engine
+    # owns its own context window via its FIFO buffer.
+    engine_chunk_len_s = STREAMING_LIVE_CHUNK_S if live_latency else STREAMING_CHUNK_S
+    right_context_secs = STREAMING_LIVE_RIGHT_CONTEXT_S if live_latency else STREAMING_RIGHT_CONTEXT_S
+    engine_total_buffer_s = STREAMING_LEFT_CONTEXT_S + engine_chunk_len_s + right_context_secs
+    preset_label = (
+        f"{STREAMING_LEFT_CONTEXT_S:g}-{engine_chunk_len_s:g}-{right_context_secs:g} "
+        f"{'live' if live_latency else 'offline-like'}"
+    )
+    asr_chunk_len_s = engine_chunk_len_s
+    asr_chunk_overlap_s = 0.0
+    logger.info(
+        f"({session_id}) Stream: chunk={engine_chunk_len_s:g}s, "
+        f"buffer={engine_total_buffer_s:g}s ({preset_label})."
+    )
 
     # `progressive_refinement` (defaults True): after EOF, if the full audio
     # fits the FULL-mode ceiling, run a single transcribe pass over the entire
@@ -1418,239 +1020,73 @@ async def handle_streaming_pcm(
 
     async def consumer():
         """
-        Consumer coroutine.
-
-        When `use_stateful_progressive` is True: drains the chunk_queue and
-        feeds each tensor to `StreamingTdtEngine`, which advances the
-        BatchedFrameASRTDT FIFO buffer one chunk at a time. After each step,
-        the middle-token merge is re-run over `frame_asr.all_alignments`;
-        newly completed sentences are emitted as `segments_batch` messages.
-        At sentinel, `engine.flush()` pushes trailing silence so the merge
-        can commit the final tokens.
-
-        Otherwise: legacy independent-chunk consumer (one transcribe() call
-        per consumer_batch_size_cap chunks, no cross-chunk state).
+        Consumer coroutine. Drains chunk_queue and feeds each tensor into
+        `StreamingPrevBatchedEngine` (the v2 engine — NVIDIA's blessed
+        prev_batched_state pattern). After each step, newly committed
+        sentence-bounded segments are sent as `segments_batch` messages.
+        At EOF (sentinel), `engine.flush()` closes out the trailing context.
         """
         nonlocal accumulated_asr_processing_time_s, sent_segments_pcm
 
-        if use_stateful_progressive and asr_model is not None:
-            if use_v2_engine:
-                # Option C engine — NVIDIA's blessed pattern. Reads its own
-                # config off the model (sample_rate, feature_stride, subsampling).
-                left_context_secs = (
-                    STREAMING_LEFT_CONTEXT_S
-                )
-                right_context_secs = (
-                    STREAMING_LIVE_RIGHT_CONTEXT_S if live_latency else STREAMING_RIGHT_CONTEXT_S
-                )
-                engine = StreamingPrevBatchedEngine(
-                    asr_model_instance=asr_model,
-                    chunk_secs=engine_chunk_len_s,
-                    left_context_secs=left_context_secs,
-                    right_context_secs=right_context_secs,
-                    request_id=f"WS-Stream-{session_id}-engV2",
-                )
-                logger.info(
-                    f"({session_id}) Stream(v2): emission_lag={engine.emission_lag_secs:.2f}s "
-                    f"(chunk={engine.chunk_secs}s + right={right_context_secs}s)"
-                )
-            else:
-                feature_stride = asr_model._cfg.preprocessor["window_stride"]
-                model_stride_s = feature_stride * asr_model.encoder.subsampling_factor
-                engine = StreamingTdtEngine(
-                    asr_model_instance=asr_model,
-                    chunk_len_s=engine_chunk_len_s,
-                    total_buffer_s=engine_total_buffer_s,
-                    model_stride_s=model_stride_s,
-                    sample_rate=target_pcm_sample_rate,
-                    request_id=f"WS-Stream-{session_id}-eng",
-                )
-            total_engine_chunks = 0
-            try:
-                while True:
-                    item = await chunk_queue.get()
-                    if item is None:
-                        chunk_queue.task_done()
-                        break
-                    tensor, _offset_s = item
-                    chunk_queue.task_done()
-                    samples_np = (
-                        tensor.detach().cpu().numpy()
-                        if hasattr(tensor, "detach")
-                        else np.asarray(tensor, dtype=np.float32)
-                    )
-                    await _run_on_asr_executor(engine.feed_float32, samples_np)
-                    total_engine_chunks += 1
-                    new_segs = engine.pop_committed_segments()
-                    if new_segs and websocket.application_state == WebSocketState.CONNECTED:
-                        try:
-                            await websocket.send_json({"type": "segments_batch", "segments": new_segs})
-                            sent_segments_pcm.extend(new_segs)
-                        except Exception as e_send:
-                            logger.warning(f"({session_id}) Stream(stateful): segment send failed: {e_send}")
-
-                # EOF — pad + flush to commit trailing tokens
-                await _run_on_asr_executor(engine.flush)
-                final_partials = engine.pop_final_segments()
-                if final_partials and websocket.application_state == WebSocketState.CONNECTED:
-                    try:
-                        await websocket.send_json({"type": "segments_batch", "segments": final_partials})
-                        sent_segments_pcm.extend(final_partials)
-                    except Exception as e_send:
-                        logger.warning(f"({session_id}) Stream(stateful): final segment send failed: {e_send}")
-
-                logger.info(
-                    f"({session_id}) Stream(stateful): processed {total_engine_chunks} engine chunks "
-                    f"in {engine.asr_time_s:.2f}s ASR time, emitted {len(sent_segments_pcm)} segments."
-                )
-            finally:
-                accumulated_asr_processing_time_s += engine.asr_time_s
-                engine.reset()
+        if asr_model is None:
             return
 
-        consumer_batch_size_cap = client_config["batch_size"]
-        total_asr_chunks_processed_by_consumer = 0
-        
-        while True:
-            batch_audio_tensors: List[torch.Tensor] = []
-            batch_offsets_s: List[float] = []
-            first_item_in_batch_is_sentinel = False
+        engine = StreamingPrevBatchedEngine(
+            asr_model_instance=asr_model,
+            chunk_secs=engine_chunk_len_s,
+            left_context_secs=STREAMING_LEFT_CONTEXT_S,
+            right_context_secs=right_context_secs,
+            request_id=f"WS-Stream-{session_id}-eng",
+        )
+        logger.info(
+            f"({session_id}) Stream: emission_lag={engine.emission_lag_secs:.2f}s "
+            f"(chunk={engine.chunk_secs}s + right={right_context_secs}s)"
+        )
 
-            # Try to fill a batch up to consumer_batch_size_cap
-            for _ in range(consumer_batch_size_cap):
-                item: Optional[Tuple[torch.Tensor, float]] = None
-                try:
-                    # Determine timeout for queue.get()
-                    # If batch is partially full, use short timeout to quickly process it.
-                    # If producer is done and queue is empty, short timeout to exit soon.
-                    # Otherwise, wait longer if batch is empty and producer is active.
-                    timeout_val = None # Default: wait indefinitely if producer is active and batch empty
-                    if batch_audio_tensors: # Batch is partially filled
-                        timeout_val = 0.02 # Short timeout to process what we have
-                    elif producer_done_event.is_set(): # Producer is done
-                        timeout_val = 0.1 # Short timeout to quickly check for remaining items or sentinel
-
-                    if producer_done_event.is_set() and chunk_queue.empty() and not batch_audio_tensors:
-                        # Optimization: if producer is done, queue is empty, and batch is empty,
-                        # try non-blocking get to fetch potential sentinel quickly.
-                        try:
-                            item = chunk_queue.get_nowait()
-                        except asyncio.QueueEmpty:
-                            # This means queue is truly empty and sentinel might have been processed or is next.
-                            # The outer loop's break condition will handle exit.
-                            break 
-                    else:
-                        item = await asyncio.wait_for(chunk_queue.get(), timeout=timeout_val)
-                
-                except (asyncio.TimeoutError, asyncio.QueueEmpty):
-                    # Timeout or queue empty means no more items for this batching iteration.
-                    # Break inner loop to process current batch (if any).
-                    break 
-                
-                if item is None: # Sentinel received
-                    chunk_queue.task_done() # Acknowledge sentinel
-                    # If this sentinel is the first thing we got for this batch,
-                    # it means no more audio data will come.
-                    if not batch_audio_tensors:
-                        first_item_in_batch_is_sentinel = True
-                    # Else, if batch_audio_tensors is not empty, the sentinel was picked up after some data.
-                    # We'll process the current batch, then the outer loop will break.
-                    break # Exit inner loop to process current batch (if any) before stopping.
-                
-                # Valid audio item received
-                audio_tensor, offset_s = item
-                batch_audio_tensors.append(audio_tensor)
-                batch_offsets_s.append(offset_s)
-                chunk_queue.task_done() # Acknowledge item
-
-                # If producer is done and queue is now empty, break to process current batch.
-                if producer_done_event.is_set() and chunk_queue.empty():
+        total_engine_chunks = 0
+        try:
+            while True:
+                item = await chunk_queue.get()
+                if item is None:
+                    chunk_queue.task_done()
                     break
-            
-            if not batch_audio_tensors:
-                # No data collected for this batch.
-                # If it's because we got a sentinel as the first item, or if producer is done and queue is drained,
-                # then it's time to exit the consumer.
-                if first_item_in_batch_is_sentinel or (producer_done_event.is_set() and chunk_queue.empty()):
-                    logger.info(f"({session_id}) Stream Consumer: No more audio chunks to process. Exiting.")
-                    break 
-                else:
-                    # No data, but producer might still be working, or sentinel not yet received. Continue waiting.
-                    continue 
-
-            # We have a batch of audio tensors to process
-            total_asr_chunks_processed_by_consumer += len(batch_audio_tensors)
-            logger.info(f"({session_id}) Stream Consumer: Processing ASR batch of {len(batch_audio_tensors)} audio chunks. "
-                        f"(Total ASR chunks processed by consumer so far: {total_asr_chunks_processed_by_consumer})")
-            
-            hypotheses_list, asr_call_duration_s = await _perform_asr_transcription(
-                asr_model_instance=asr_model, # type: ignore # Checked at endpoint start
-                audio_input_list=batch_audio_tensors,
-                batch_size_for_transcribe_call=len(batch_audio_tensors), # Process the whole collected batch
-                num_asr_workers=NUM_WORKERS,
-                request_id=f"WS-Stream-{session_id}-b{total_asr_chunks_processed_by_consumer}"
-            )
-            accumulated_asr_processing_time_s += asr_call_duration_s
-            
-            # Clear CUDA cache periodically if using CUDA to manage memory.
-            # Skip when CUDA graphs are on — see _revert_model_to_global_original_state
-            # for the full explanation. Calling empty_cache between batches
-            # would tear down the static buffers the graph captured.
-            if (
-                not USE_CUDA_GRAPHS
-                and processing_device == "cuda"
-                and torch.cuda.is_available()
-            ):
-                await _run_on_asr_executor(torch.cuda.empty_cache)
-
-            if hypotheses_list:
-                segments_from_batch = _process_hypotheses_to_segments(
-                    hypotheses_list, batch_offsets_s, f"{session_id}-segproc"
+                tensor, _offset_s = item
+                chunk_queue.task_done()
+                samples_np = (
+                    tensor.detach().cpu().numpy()
+                    if hasattr(tensor, "detach")
+                    else np.asarray(tensor, dtype=np.float32)
                 )
-                logger.info(f"({session_id}) Stream Consumer: Generated {len(segments_from_batch)} segments from "
-                            f"{len(hypotheses_list)} hypotheses for the current batch.")
-                
-                if segments_from_batch and websocket.application_state == WebSocketState.CONNECTED:
+                await _run_on_asr_executor(engine.feed_float32, samples_np)
+                total_engine_chunks += 1
+                new_segs = engine.pop_committed_segments()
+                if new_segs and websocket.application_state == WebSocketState.CONNECTED:
                     try:
-                        await websocket.send_json({"type": "segments_batch", "segments": segments_from_batch})
-                        sent_segments_pcm.extend(segments_from_batch) # Track all sent segments
-                        logger.info(f"({session_id}) Stream Consumer: Successfully sent {len(segments_from_batch)} segments to client. "
-                                    f"(Total segments sent this session: {len(sent_segments_pcm)})")
-                        await asyncio.sleep(0.001) # Tiny sleep to allow other tasks (e.g., network I/O)
+                        await websocket.send_json({"type": "segments_batch", "segments": new_segs})
+                        sent_segments_pcm.extend(new_segs)
                     except Exception as e_send:
-                        logger.warning(f"({session_id}) Stream Consumer: Failed to send segments batch to client: {e_send}", exc_info=True)
-                        # If send fails, we still add to sent_segments_pcm for the final transcription if connection is restored
-                        # or if we want to log what *would* have been sent.
-                        sent_segments_pcm.extend(segments_from_batch)
-                elif segments_from_batch: # Segments generated but WebSocket no longer connected
-                    sent_segments_pcm.extend(segments_from_batch)
-                    logger.info(f"({session_id}) Stream Consumer: Generated {len(segments_from_batch)} segments, "
-                                f"but WebSocket is disconnected. Segments stored for potential final summary.")
-            else:
-                logger.info(f"({session_id}) Stream Consumer: No hypotheses generated from ASR for the current batch, thus no segments to send.")
+                        logger.warning(f"({session_id}) Stream: segment send failed: {e_send}")
 
-            # If the sentinel was received and processed along with the last batch of data,
-            # now is the time to exit the consumer loop.
-            if first_item_in_batch_is_sentinel and not batch_audio_tensors : # Should have been handled by the top break
-                 pass # This case should be caught by the break at the start of the loop
-            elif item is None and not batch_audio_tensors : # Also should be caught
-                 pass
+            # EOF — pad + flush to commit trailing tokens
+            await _run_on_asr_executor(engine.flush)
+            final_partials = engine.pop_final_segments()
+            if final_partials and websocket.application_state == WebSocketState.CONNECTED:
+                try:
+                    await websocket.send_json({"type": "segments_batch", "segments": final_partials})
+                    sent_segments_pcm.extend(final_partials)
+                except Exception as e_send:
+                    logger.warning(f"({session_id}) Stream: final segment send failed: {e_send}")
 
-
-        logger.info(f"({session_id}) Stream Consumer: Finished processing. "
-                    f"Total ASR chunks processed: {total_asr_chunks_processed_by_consumer}. "
-                    f"Total segments generated and queued/sent: {len(sent_segments_pcm)}.")
+            logger.info(
+                f"({session_id}) Stream: processed {total_engine_chunks} engine chunks "
+                f"in {engine.asr_time_s:.2f}s ASR time, emitted {len(sent_segments_pcm)} segments."
+            )
+        finally:
+            accumulated_asr_processing_time_s += engine.asr_time_s
+            engine.reset()
 
     # Main execution block for handle_streaming_pcm
-    # The LEGACY stateful engine (StreamingTdtEngine) needs the swapped decoder
-    # (greedy + preserve_alignments=True) to drive BatchedFrameASRTDT. The v2
-    # engine uses the DEFAULT greedy_batch decoder (which has decoding_computer
-    # for prev_batched_state). Skip the swap when v2 is active.
-    saved_decoder_state: Optional[dict] = None
     try:
-        if use_stateful_progressive and not use_v2_engine and asr_model is not None:
-            saved_decoder_state = await _swap_decoder_to_stateful_tdt()
-            logger.info(f"({session_id}) Stream: decoder swapped to (greedy, preserve_alignments=True) for legacy stateful engine.")
         logger.info(f"({session_id}) Streaming Pipeline (ffmpeg-based): Starting producer and consumer tasks.")
         # Run producer and consumer concurrently
         await asyncio.gather(producer(), consumer())
@@ -1679,7 +1115,7 @@ async def handle_streaming_pcm(
                 try:
                     full_pcm_bytes = bytes(refinement_pcm_accumulator)
                     full_tensor = await asyncio.to_thread(_create_asr_tensor_from_bytes, full_pcm_bytes)
-                    refined_segments, refinement_asr_t = await _transcribe_full_v2(
+                    refined_segments, refinement_asr_t = await _transcribe_full(
                         waveform=full_tensor,
                         audio_duration_s=full_audio_duration_s,
                         request_id=f"WS-Stream-{session_id}-refine",
@@ -1718,14 +1154,19 @@ async def handle_streaming_pcm(
 
             final_message_payload = {
                 "type": "final_transcription",
+                # Whisper-compatible fields
+                "task": "transcribe",
+                "language": "en",
+                "duration": round(total_duration_processed_seconds_for_asr, 3),
                 "text": final_text_for_payload,
-                "language": "en", # Assuming English, could be made configurable
+                "segments": final_segments_for_payload,
+                # Extensions:
                 "transcription_time": round(final_total_asr_t, 3),
                 "total_segments": len(final_segments_for_payload),
                 "final_duration_processed_seconds": round(total_duration_processed_seconds_for_asr, 3),
                 "csv_content": generate_csv_content(final_segments_for_payload),
                 "srt_content": generate_srt_content(final_segments_for_payload),
-                "streaming_mode": client_config.get("format", "unknown"), # Reflect client-declared format
+                "streaming_mode": client_config.get("format", "unknown"),
                 "refinement_applied": use_refined,
             }
             await websocket.send_json(final_message_payload)
@@ -1756,881 +1197,27 @@ async def handle_streaming_pcm(
         except (asyncio.QueueFull, Exception):
             # Queue might be full if consumer also exited prematurely, or other rare conditions.
             logger.warning(f"({session_id}) Streaming: Could not put sentinel in queue during final pipeline cleanup (queue full or other error).")
-        if saved_decoder_state is not None:
-            try:
-                await _restore_decoder(saved_decoder_state)
-                logger.info(f"({session_id}) Stream: decoder restored after stateful session.")
-            except Exception as e_restore:
-                logger.warning(f"({session_id}) Stream: decoder restore failed: {e_restore}", exc_info=True)
 
 
-def create_audio_chunks(
-    waveform: torch.Tensor,
-    sample_rate: int = MODEL_SAMPLE_RATE,
-    chunk_len_s: float = TRANSCRIBE_CHUNK_LEN,
-    overlap_s: float = TRANSCRIBE_OVERLAP
-) -> Tuple[List[torch.Tensor], List[float]]:
-    """
-    Splits a long audio waveform tensor into smaller, overlapping chunks.
-
-    This is typically used for processing very long audio files that cannot be
-    fed to the ASR model in one go.
-
-    Args:
-        waveform: A 1D PyTorch tensor containing the audio data.
-        sample_rate: The sample rate of the input waveform (in Hz).
-        chunk_len_s: The desired length of each chunk in seconds.
-        overlap_s: The desired overlap between consecutive chunks in seconds.
-
-    Returns:
-        A tuple containing:
-            - chunks (List[torch.Tensor]): A list of 1D audio tensors, each representing a chunk.
-            - offsets (List[float]): A list of floats, where each float is the starting
-                                     time (in seconds) of the corresponding chunk in the
-                                     original waveform.
-    Raises:
-        AssertionError: If the input waveform is not 1D.
-        ValueError: If `overlap_s` is not less than `chunk_len_s` (i.e., stride <= 0).
-    """
-    assert waveform.ndim == 1, "Input waveform must be a 1D tensor."
-    
-    total_duration_s = waveform.shape[0] / sample_rate
-    
-    stride_s = chunk_len_s - overlap_s
-    if stride_s <= 0:
-        raise ValueError("Overlap duration must be less than chunk length duration for a positive stride.")
-
-    chunks: List[torch.Tensor] = []
-    offsets_s: List[float] = []
-    
-    current_offset_s = 0.0
-    while current_offset_s < total_duration_s:
-        start_sample_idx = int(current_offset_s * sample_rate)
-        # Ensure end_sample_idx does not exceed waveform length
-        end_sample_idx = int(min(total_duration_s, current_offset_s + chunk_len_s) * sample_rate)
-
-        # If the calculated chunk is empty or too small (e.g., due to rounding at the very end)
-        if end_sample_idx <= start_sample_idx:
-            # If advancing by stride would still be within the audio, continue to next possible chunk
-            if current_offset_s + stride_s < total_duration_s:
-                current_offset_s += stride_s
-                continue
-            else: # No more meaningful chunks can be formed
-                break
-        
-        chunk_tensor = waveform[start_sample_idx:end_sample_idx].clone() # Clone to avoid views if tensor is modified
-        
-        if chunk_tensor.numel() > 0: # Ensure the chunk is not empty
-            chunks.append(chunk_tensor)
-            offsets_s.append(round(current_offset_s, 3)) # Store offset with precision
-
-        # If this chunk reaches or exceeds the end of the waveform, stop
-        if end_sample_idx >= waveform.shape[0]:
-            break 
-            
-        current_offset_s += stride_s
-
-        # Safety break for very tiny residual audio that might cause near-infinite loops if stride is small
-        # and remaining audio is smaller than a full chunk but offsets don't align perfectly.
-        # If we have chunks, and the last chunk's intended end was before total_duration,
-        # but current_offset_s is now >= total_duration, it implies we might be stuck.
-        if current_offset_s >= total_duration_s:
-            if chunks and (offsets_s[-1] + chunk_len_s < total_duration_s - 0.01): # Last chunk didn't cover end
-                 # This condition tries to catch if the last segment was small and we are past the audio
-                 # but there was still a tiny bit left. This usually means the last chunk should be the end.
-                 pass # Allow one more pass if a tiny sliver is left. The outer while will catch it.
-            # Avoid infinite loop if offsets get stuck due to floating point issues on tiny final segments
-            if len(chunks) > 1 and offsets_s[-1] == offsets_s[-2]:
-                logger.warning(f"(create_audio_chunks) Detected potential stuck loop with duplicate offsets. Breaking.")
-                break
-    
-    logger.debug(f"(create_audio_chunks) Created {len(chunks)} chunks from audio of {total_duration_s:.2f}s.")
-    return chunks, offsets_s
-
-
-async def _transcribe_chunked_waveform(
-    waveform: torch.Tensor,
-    client_config: dict,
-    request_id: str = "chunked",
-    on_batch_segments: Optional[Callable[[List[dict], int], Awaitable[bool]]] = None,
-) -> Tuple[List[dict], float]:
-    """
-    Sliding-window chunked transcription of an in-memory waveform.
-
-    Mirrors the pattern used inside `websocket_transcribe_endpoint_full_file_upload`:
-    chunk via `create_audio_chunks`, batch through `_perform_asr_transcription`,
-    convert to segments, dedup. Used by REST when `?strategy=chunked` (or auto
-    resolves there for long audio). Phase 6 will swap this for stateful streaming
-    via `BatchedFrameASRTDT`.
-
-    Args:
-        on_batch_segments: optional async callback invoked with
-            (batch_segments, batch_num) after each ASR batch produces segments.
-            Return True to continue, False to abort the loop early (used by WS
-            handlers to emit `segments_batch` messages and bail on disconnect).
-
-    Returns:
-        Tuple of (deduplicated_segments, total_asr_processing_time_seconds).
-        Empty list and 0.0 if the waveform produces no chunks.
-    """
-    chunk_len_s = client_config["chunk_length"]
-    chunk_overlap_s = client_config["chunk_overlap"]
-    batch_size = client_config["batch_size"]
-
-    chunks, offsets = create_audio_chunks(
-        waveform=waveform,
-        sample_rate=MODEL_SAMPLE_RATE,
-        chunk_len_s=chunk_len_s,
-        overlap_s=chunk_overlap_s,
-    )
-    if not chunks:
-        logger.warning(f"({request_id}) Chunked: create_audio_chunks returned no chunks.")
-        return [], 0.0
-
-    logger.info(
-        f"({request_id}) Chunked: {len(chunks)} chunks "
-        f"(len={chunk_len_s}s overlap={chunk_overlap_s}s), batching by {batch_size}."
-    )
-
-    all_raw_segments: List[dict] = []
-    total_asr_time = 0.0
-
-    for batch_num, batch_start in enumerate(range(0, len(chunks), batch_size)):
-        batch_chunks = chunks[batch_start:batch_start + batch_size]
-        batch_offsets = offsets[batch_start:batch_start + batch_size]
-        if not batch_chunks:
-            continue
-
-        hyps, asr_dur = await _perform_asr_transcription(
-            asr_model_instance=asr_model,
-            audio_input_list=batch_chunks,
-            batch_size_for_transcribe_call=len(batch_chunks),
-            num_asr_workers=NUM_WORKERS,
-            request_id=f"{request_id}-b{batch_num}",
-        )
-        total_asr_time += asr_dur
-
-        if hyps:
-            batch_segs = _process_hypotheses_to_segments(
-                hyps, batch_offsets, f"{request_id}-segproc_b{batch_num}",
-            )
-            if batch_segs:
-                batch_segs.sort(key=lambda s: s.get("start", float("inf")))
-                all_raw_segments.extend(batch_segs)
-                if on_batch_segments is not None:
-                    keep_going = await on_batch_segments(batch_segs, batch_num)
-                    if not keep_going:
-                        logger.info(
-                            f"({request_id}) Chunked: callback signaled abort at batch {batch_num + 1}/"
-                            f"{(len(chunks) + batch_size - 1) // batch_size}."
-                        )
-                        break
-
-    deduped = _deduplicate_segments(
-        all_raw_segments,
-        chunk_overlap_s / 2.0,
-    )
-    return deduped, total_asr_time
-
-
-def _extract_tdt_token_times(
-    frame_asr,
-    delay: int,
-    tokens_per_chunk: int,
-    chunk_len_s: float,
-    total_buffer_s: float,
-    model_stride_s: float,
-) -> List[Tuple[int, float]]:
-    """
-    Mirror BatchedFrameASRTDT.transcribe()'s middle-token merge to recover
-    (token_id, audio_time_s) pairs for batch slot 0.
-
-    The class's own transcribe() discards alignment frame indices via
-    _alignment_decoder. We walk the same per-chunk slicing rules but keep
-    `(frame_idx_in_alignment, token_id)` tuples and convert the alignment
-    frame to global audio time via the buffer geometry:
-
-        After chunk `a_idx` is fed, the FIFO buffer ends at audio time
-        `(a_idx + 1) * chunk_len_s` and is `total_buffer_s` wide. Encoder
-        frame `f` of that chunk's alignment therefore corresponds to
-        audio time `(a_idx + 1) * chunk_len_s - total_buffer_s + f * stride`.
-
-    The "middle token" slice picks frames in the centre of the buffer, so
-    using the absolute frame index naturally produces the right time even
-    though the slice does not start at the chunk's nominal beginning.
-
-    NOTE: this helper is used only by the OFFLINE _stateful_chunked_sync
-    path now (one-shot, no O(N²) risk). The live streaming path runs an
-    incremental version of the same merge inside StreamingTdtEngine. Both
-    will be retired when we migrate to NVIDIA's StreamingBatchedAudioBuffer
-    + prev_batched_state pattern (see
-    .claude/plans/option-c-prev-batched-state.md).
-    """
-    all_alignments = frame_asr.all_alignments[0]
-    signal_end_idx = frame_asr.frame_bufferer.signal_end_index[0]
-    blank_id = frame_asr.blank_id
-    tdt_search_boundary = getattr(frame_asr, "tdt_search_boundary", 4)
-
-    out: List[Tuple[int, float]] = []
-    unmerged_ids: List[int] = []
-
-    def _walk_with_times(slice_align, slice_start_idx):
-        toks_with_t: List[Tuple[int, int]] = []
-        for fi, frame in enumerate(slice_align):
-            global_fi = slice_start_idx + fi
-            for u in range(len(frame)):
-                _, tid = frame[u]
-                tid = int(tid)
-                if tid != blank_id:
-                    toks_with_t.append((global_fi, tid))
-        return toks_with_t
-
-    for a_idx, alignment in enumerate(all_alignments):
-        if delay == len(alignment):
-            offset = 0
-        else:
-            offset = 1
-        base_start = len(alignment) - offset - delay
-        base_end = base_start + tokens_per_chunk
-        long_start = base_start - tdt_search_boundary
-        long_end = base_end
-
-        # Decode "longer" slice (for boundary-search) and the base slice with frame indices.
-        longer_with_t = _walk_with_times(alignment[long_start:long_end], long_start)
-        base_with_t = _walk_with_times(alignment[base_start:base_end], base_start)
-
-        if not longer_with_t or (signal_end_idx is not None and a_idx >= signal_end_idx):
-            continue
-
-        if a_idx == 0 or len(unmerged_ids) == 0:
-            use_with_t = base_with_t
-        elif len(unmerged_ids) > 0 and len(longer_with_t) > 1:
-            id_to_match = unmerged_ids[-1]
-            longer_ids_only = [t[1] for t in longer_with_t]
-            start_idx = min(len(longer_ids_only) - len(base_with_t), len(longer_ids_only) - 1)
-            use_with_t = base_with_t  # fallback when no match
-            for i in range(start_idx, -1, -1):
-                if longer_ids_only[i] == id_to_match:
-                    use_with_t = longer_with_t[i + 1:]
-                    break
-        else:
-            use_with_t = base_with_t
-
-        buffer_end_audio_s = (a_idx + 1) * chunk_len_s
-        for frame_idx_in_align, tid in use_with_t:
-            time_s = buffer_end_audio_s - total_buffer_s + frame_idx_in_align * model_stride_s
-            if time_s < 0.0:
-                time_s = 0.0  # clamp pre-roll pad
-            out.append((tid, float(time_s)))
-            unmerged_ids.append(tid)
-
-    return out
-
-
-def _segments_from_token_times(
-    tokens_with_times: List[Tuple[int, float]],
-    tokenizer,
-    duration_s: float,
-) -> List[dict]:
-    """
-    Group (token_id, time_s) pairs into sentence-bounded segments.
-
-    Splits on subword tokens whose decoded text ends in '.', '!' or '?'.
-    Uses actual per-token timestamps for start/end, not proportional
-    distribution.
-    """
-    if not tokens_with_times:
-        return []
-
-    segments: List[dict] = []
-    cur_ids: List[int] = []
-    cur_start: Optional[float] = None
-    cur_last_t: float = 0.0
-    seg_id = 0
-
-    def flush(end_t: float):
-        nonlocal cur_ids, cur_start, seg_id
-        if not cur_ids:
-            return
-        text = tokenizer.ids_to_text(cur_ids).strip()
-        if text:
-            start_clamped = max(0.0, cur_start if cur_start is not None else 0.0)
-            end_clamped = min(duration_s, max(start_clamped, end_t))
-            segments.append({
-                "start": round(start_clamped, 3),
-                "end": round(end_clamped, 3),
-                "text": text,
-                "id": seg_id,
-            })
-            seg_id += 1
-        cur_ids = []
-        cur_start = None
-
-    for tid, t in tokens_with_times:
-        if cur_start is None:
-            cur_start = t
-        cur_ids.append(tid)
-        cur_last_t = t
-        try:
-            tok = tokenizer.ids_to_tokens([tid])[0]
-        except Exception:
-            tok = ""
-        if tok and tok[-1] in ".!?":
-            flush(t)
-
-    if cur_ids:
-        flush(cur_last_t)
-
-    return segments
-
-
-class StreamingTdtEngine:
-    """
-    Chunk-by-chunk driver for BatchedFrameASRTDT — the streaming counterpart
-    of the offline _stateful_chunked_sync helper.
-
-    Owns a BatchedFrameASRTDT instance plus an internal PCM accumulator. As
-    callers `feed()` raw 16-bit PCM bytes, the engine extracts features for
-    each complete `chunk_len_s` slice, advances the FIFO buffer one slot, and
-    runs encoder+decoder over the current buffer state via `_get_batch_preds`.
-    Each step appends one entry to `frame_asr.all_alignments[0]`.
-
-    `pop_committed_segments()` applies the middle-token merge incrementally
-    on chunks since the last call (NOT a global re-walk — that previously
-    caused O(N²) work and an event-loop stall around chunk ~700 in long
-    streams, which the WS keepalive task interpreted as a dead client and
-    closed with code 1011; see commit 4744180 for the fix). Emitted token
-    runs end at sentence boundaries ('.', '!', '?'); in-progress sentences
-    are held in `_sentence_buffer_*` until the terminal punctuation arrives.
-
-    --- LOAD-BEARING NEMO PRIVATE API ----------------------------------------
-    `BatchedFrameASRTDT` is designed for offline one-shot use (set the frame
-    reader, call transcribe(), get merged text). To drive it incrementally
-    from a live stream we reach into several leading-underscore internals:
-
-      - frame_bufferer._update_feature_buffer(features, idx)
-      - frame_bufferer.normalize_frame_buffers(buffers, (mean, std))
-      - frame_bufferer.signal_end[idx], signal_end_index[idx]
-      - frame_asr._get_batch_preds()
-      - frame_asr.all_alignments[idx], all_preds[idx], all_timestamps[idx]
-      - frame_asr.tdt_search_boundary, blank_id, data_layer[idx].set_signal
-
-    Any of these can rename or change semantics on a NeMo upgrade. When
-    bumping NeMo: re-read this class against the new
-    nemo/collections/asr/parts/utils/streaming_utils.py and confirm the
-    method signatures still hold. The planned migration target is the
-    cleaner `StreamingBatchedAudioBuffer + decoding_computer + prev_batched_state`
-    pattern NVIDIA introduced in NeMo PR #9106 — see
-    `.claude/plans/option-c-prev-batched-state.md`.
-    -------------------------------------------------------------------------
-
-    The engine assumes the model's decoding strategy has already been switched
-    to (`greedy`, `preserve_alignments=True`, `fused_batch_size=-1`) by the
-    caller — same contract as `_transcribe_chunked_stateful`.
-
-    Not async-safe — call from a single coroutine under `model_access_lock`.
-    """
-
-    def __init__(
-        self,
-        asr_model_instance,
-        chunk_len_s: float,
-        total_buffer_s: float,
-        model_stride_s: float,
-        sample_rate: int,
-        request_id: str,
-    ):
-        self.asr_model = asr_model_instance
-        self.chunk_len_s = chunk_len_s
-        self.total_buffer_s = total_buffer_s
-        self.model_stride_s = model_stride_s
-        self.sample_rate = sample_rate
-        self.request_id = request_id
-
-        self.frame_asr = BatchedFrameASRTDT(
-            asr_model=asr_model_instance,
-            frame_len=chunk_len_s,
-            total_buffer=total_buffer_s,
-            batch_size=1,
-            stateful_decoding=True,
-        )
-        self.tokens_per_chunk = math.ceil(chunk_len_s / model_stride_s)
-        self.mid_delay = math.ceil((chunk_len_s + (total_buffer_s - chunk_len_s) / 2) / model_stride_s)
-        self.samples_per_chunk = int(round(chunk_len_s * sample_rate))
-
-        self._pcm_buffer_f32 = np.zeros(0, dtype=np.float32)
-        self._chunks_processed = 0
-        self._eof_flushed = False
-        self._asr_time_s = 0.0
-
-        # Sentence-emission state — carries across pop_committed_segments() calls so
-        # tokens emitted in chunk N can be flushed when the sentence completes in chunk N+k.
-        self._sentence_buffer_ids: List[int] = []
-        self._sentence_buffer_start: Optional[float] = None
-        self._sentence_buffer_last_t: float = 0.0
-        self._next_seg_id: int = 0
-
-        # Incremental merge state. The middle-token merge walks each chunk's
-        # alignment exactly ONCE. `_merge_unmerged_ids` is the accumulated
-        # merged token id sequence (the same role NeMo's `unmerged[idx]` plays
-        # in BatchedFrameASRTDT.transcribe). `_next_chunk_to_merge` advances
-        # one step per pop. After a chunk is merged, its entry in
-        # frame_asr.all_alignments[0] is set to None to free memory — we no
-        # longer need it (the boundary search is intra-chunk, not cross-chunk).
-        self._next_chunk_to_merge: int = 0
-        self._merge_unmerged_ids: List[int] = []
-        self._tdt_search_boundary: int = getattr(self.frame_asr, "tdt_search_boundary", 4)
-
-        # Cached for autocast around inference calls
-        self._model_dtype = next(asr_model_instance.parameters()).dtype
-        self._device_type = asr_model_instance.device.type
-
-    def feed(self, pcm_bytes: bytes) -> None:
-        """Append s16le PCM and process any complete chunks immediately."""
-        if pcm_bytes:
-            arr = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            self._pcm_buffer_f32 = np.concatenate([self._pcm_buffer_f32, arr])
-        self._drain_complete_chunks()
-
-    def feed_float32(self, samples_f32: np.ndarray) -> None:
-        """Append already-converted float32 [-1, 1] samples and process any complete chunks."""
-        if samples_f32 is not None and samples_f32.size > 0:
-            self._pcm_buffer_f32 = np.concatenate(
-                [self._pcm_buffer_f32, samples_f32.astype(np.float32, copy=False)]
-            )
-        self._drain_complete_chunks()
-
-    def _drain_complete_chunks(self) -> None:
-        while len(self._pcm_buffer_f32) >= self.samples_per_chunk:
-            chunk = self._pcm_buffer_f32[:self.samples_per_chunk]
-            self._pcm_buffer_f32 = self._pcm_buffer_f32[self.samples_per_chunk:]
-            self._step_one_chunk(chunk)
-
-    def flush(self) -> None:
-        """
-        Signal EOF: pad any partial PCM, then push `mid_delay * stride` of
-        trailing silence so the middle-token merge can commit the tail.
-        """
-        if self._eof_flushed:
-            return
-        if len(self._pcm_buffer_f32) > 0:
-            pad_n = self.samples_per_chunk - len(self._pcm_buffer_f32)
-            self._pcm_buffer_f32 = np.pad(self._pcm_buffer_f32, (0, pad_n))
-            self._step_one_chunk(self._pcm_buffer_f32[:self.samples_per_chunk])
-            self._pcm_buffer_f32 = np.zeros(0, dtype=np.float32)
-
-        tail_samples = int(self.mid_delay * self.model_stride_s * self.sample_rate)
-        if tail_samples > 0:
-            self._pcm_buffer_f32 = np.zeros(tail_samples, dtype=np.float32)
-            while len(self._pcm_buffer_f32) >= self.samples_per_chunk:
-                chunk = self._pcm_buffer_f32[:self.samples_per_chunk]
-                self._pcm_buffer_f32 = self._pcm_buffer_f32[self.samples_per_chunk:]
-                self._step_one_chunk(chunk)
-            if len(self._pcm_buffer_f32) > 0:
-                pad_n = self.samples_per_chunk - len(self._pcm_buffer_f32)
-                self._pcm_buffer_f32 = np.pad(self._pcm_buffer_f32, (0, pad_n))
-                self._step_one_chunk(self._pcm_buffer_f32[:self.samples_per_chunk])
-                self._pcm_buffer_f32 = np.zeros(0, dtype=np.float32)
-
-        self._eof_flushed = True
-
-    def _step_one_chunk(self, chunk_f32: np.ndarray) -> None:
-        """Extract features for one chunk, slide the FIFO buffer, run encoder+decoder."""
-        t0 = time.time()
-        device = self.asr_model.device
-        audio = torch.from_numpy(chunk_f32.copy()).unsqueeze(0).to(device)
-        length = torch.tensor([chunk_f32.shape[0]], device=device)
-        with torch.inference_mode(), torch.amp.autocast(self._device_type, dtype=self._model_dtype):
-            features, _ = self.frame_asr.raw_preprocessor(input_signal=audio, length=length)
-        features = features.squeeze(0).detach().cpu().numpy()
-
-        # Per-chunk preprocessing produces one extra time frame compared to
-        # `_feature_frame_len` because of the windowing edge — AudioFeatureIterator
-        # avoids this by preprocessing the full waveform once and slicing.
-        # Trim/pad to the bufferer's expected `n_frame_len` so the FIFO insert
-        # broadcasts cleanly into the [batch, n_feat, total_buffer_len] buffer.
-        n_frame_len = self.frame_asr.frame_bufferer.n_frame_len
-        if features.shape[1] > n_frame_len:
-            features = features[:, :n_frame_len]
-        elif features.shape[1] < n_frame_len:
-            pad = np.zeros((features.shape[0], n_frame_len - features.shape[1]), dtype=features.dtype)
-            features = np.concatenate([features, pad], axis=1)
-
-        # NeMo's get_buffers_batch() does THREE things per chunk: (1) slide
-        # the FIFO buffer and insert the new features, (2) update a *separate*
-        # feature_buffer used to compute per-chunk normalization stats, and
-        # (3) z-normalize the just-built buffer. Steps (2) and (3) are
-        # mandatory — without them the encoder sees unnormalized features and
-        # the decoder emits no tokens. Replicate all three here since we're
-        # bypassing the frame_reader path.
-        bufferer = self.frame_asr.frame_bufferer
-        frame_buffers = bufferer.get_frame_buffers([features])
-        bufferer._update_feature_buffer(features, 0)
-        mean = np.mean(bufferer.feature_buffer, axis=2, keepdims=True)
-        std = np.std(bufferer.feature_buffer, axis=2, keepdims=True)
-        bufferer.normalize_frame_buffers(frame_buffers, (mean, std))
-
-        self.frame_asr.data_layer[0].set_signal(frame_buffers[0][:])
-        self.frame_asr.frame_bufferer.signal_end[0] = False
-        with torch.inference_mode(), torch.amp.autocast(self._device_type, dtype=self._model_dtype):
-            self.frame_asr._get_batch_preds()
-        self._chunks_processed += 1
-        self._asr_time_s += (time.time() - t0)
-
-    def pop_committed_segments(self) -> List[dict]:
-        """
-        Apply the middle-token merge to every chunk that's arrived since the
-        last call. Walks each chunk's alignment exactly once across the
-        engine's lifetime (vs. the old O(N²) global re-walk, which blocked
-        the event loop progressively longer until the WS keepalive dropped
-        the connection around chunk 700 — see commit message for details).
-
-        After a chunk is merged, its entry in `frame_asr.all_alignments[0]`
-        is replaced with `None` so the underlying tensors can be GC'd. The
-        merge is intra-chunk (`tdt_search_boundary` looks within the current
-        alignment, not into the previous one), so prior alignments are no
-        longer load-bearing once their tokens are committed.
-
-        Returns sentence-bounded segments — same emission policy as before.
-        """
-        if self._chunks_processed == 0:
-            return []
-
-        new_tokens: List[Tuple[int, float]] = []
-        try:
-            new_tokens = self._merge_new_chunks_incremental()
-        except Exception as e:
-            logger.warning(
-                f"({self.request_id}) StreamingTdtEngine: incremental merge failed ({e!r}).",
-                exc_info=True,
-            )
-
-        return self._consume_tokens_into_segments(new_tokens, flush_partial=False)
-
-    def _merge_new_chunks_incremental(self) -> List[Tuple[int, float]]:
-        """Mirror `BatchedFrameASRTDT.transcribe`'s middle-token merge, but
-        only over chunks `[self._next_chunk_to_merge, chunks_processed)`."""
-        all_alignments = self.frame_asr.all_alignments[0]
-        signal_end_idx = self.frame_asr.frame_bufferer.signal_end_index[0]
-        blank_id = self.frame_asr.blank_id
-        tdt_search_boundary = self._tdt_search_boundary
-        chunk_len_s = self.chunk_len_s
-        total_buffer_s = self.total_buffer_s
-        model_stride_s = self.model_stride_s
-        mid_delay = self.mid_delay
-        tokens_per_chunk = self.tokens_per_chunk
-
-        out: List[Tuple[int, float]] = []
-
-        def _walk_with_times(slice_align, slice_start_idx):
-            toks: List[Tuple[int, int]] = []
-            for fi, frame in enumerate(slice_align):
-                global_fi = slice_start_idx + fi
-                for u in range(len(frame)):
-                    _, tid = frame[u]
-                    tid = int(tid)
-                    if tid != blank_id:
-                        toks.append((global_fi, tid))
-            return toks
-
-        end_a_idx = len(all_alignments)
-        for a_idx in range(self._next_chunk_to_merge, end_a_idx):
-            alignment = all_alignments[a_idx]
-            if alignment is None:
-                # Already freed by a previous pop — shouldn't happen if
-                # _next_chunk_to_merge is maintained correctly, but guard anyway.
-                continue
-
-            if mid_delay == len(alignment):
-                offset = 0
-            else:
-                offset = 1
-            base_start = len(alignment) - offset - mid_delay
-            base_end = base_start + tokens_per_chunk
-            long_start = base_start - tdt_search_boundary
-            long_end = base_end
-
-            longer_with_t = _walk_with_times(alignment[long_start:long_end], long_start)
-            base_with_t = _walk_with_times(alignment[base_start:base_end], base_start)
-
-            ended = (signal_end_idx is not None and a_idx >= signal_end_idx)
-            if longer_with_t and not ended:
-                if a_idx == 0 or not self._merge_unmerged_ids:
-                    use_with_t = base_with_t
-                elif self._merge_unmerged_ids and len(longer_with_t) > 1:
-                    id_to_match = self._merge_unmerged_ids[-1]
-                    longer_ids_only = [t[1] for t in longer_with_t]
-                    start_idx = min(
-                        len(longer_ids_only) - len(base_with_t),
-                        len(longer_ids_only) - 1,
-                    )
-                    use_with_t = base_with_t  # fallback when no match
-                    for i in range(start_idx, -1, -1):
-                        if longer_ids_only[i] == id_to_match:
-                            use_with_t = longer_with_t[i + 1:]
-                            break
-                else:
-                    use_with_t = base_with_t
-
-                buffer_end_audio_s = (a_idx + 1) * chunk_len_s
-                for frame_idx_in_align, tid in use_with_t:
-                    time_s = buffer_end_audio_s - total_buffer_s + frame_idx_in_align * model_stride_s
-                    if time_s < 0.0:
-                        time_s = 0.0
-                    out.append((tid, float(time_s)))
-                    self._merge_unmerged_ids.append(tid)
-
-            # Free the alignment we just consumed. The merge for the next
-            # chunk only needs the current chunk's alignment + the running
-            # `_merge_unmerged_ids` tail — never an older alignment.
-            all_alignments[a_idx] = None
-            # Same logic for the parallel lists NeMo grows in lock-step;
-            # we never look at them, but they hold encoder-output references
-            # and would otherwise pin GPU/CPU memory for the whole stream.
-            try:
-                if a_idx < len(self.frame_asr.all_preds[0]):
-                    self.frame_asr.all_preds[0][a_idx] = None
-                if a_idx < len(self.frame_asr.all_timestamps[0]):
-                    self.frame_asr.all_timestamps[0][a_idx] = None
-            except Exception:
-                pass
-
-        self._next_chunk_to_merge = end_a_idx
-        return out
-
-    def pop_final_segments(self) -> List[dict]:
-        """Flush trailing in-progress sentence after EOF."""
-        committed = self.pop_committed_segments()
-        if self._sentence_buffer_ids:
-            text = self.asr_model.tokenizer.ids_to_text(self._sentence_buffer_ids).strip()
-            if text:
-                committed.append({
-                    "start": round(max(0.0, self._sentence_buffer_start or 0.0), 3),
-                    "end": round(self._sentence_buffer_last_t, 3),
-                    "text": text,
-                    "id": self._next_seg_id,
-                })
-                self._next_seg_id += 1
-            self._sentence_buffer_ids = []
-            self._sentence_buffer_start = None
-        return committed
-
-    def _consume_tokens_into_segments(
-        self, new_tokens: List[Tuple[int, float]], flush_partial: bool
-    ) -> List[dict]:
-        segments: List[dict] = []
-        tokenizer = self.asr_model.tokenizer
-        for tid, t in new_tokens:
-            if self._sentence_buffer_start is None:
-                self._sentence_buffer_start = t
-            self._sentence_buffer_ids.append(tid)
-            self._sentence_buffer_last_t = t
-            try:
-                tok = tokenizer.ids_to_tokens([tid])[0]
-            except Exception:
-                tok = ""
-            if tok and tok[-1] in ".!?":
-                text = tokenizer.ids_to_text(self._sentence_buffer_ids).strip()
-                if text:
-                    segments.append({
-                        "start": round(max(0.0, self._sentence_buffer_start), 3),
-                        "end": round(t, 3),
-                        "text": text,
-                        "id": self._next_seg_id,
-                    })
-                    self._next_seg_id += 1
-                self._sentence_buffer_ids = []
-                self._sentence_buffer_start = None
-        if flush_partial and self._sentence_buffer_ids:
-            text = tokenizer.ids_to_text(self._sentence_buffer_ids).strip()
-            if text:
-                segments.append({
-                    "start": round(max(0.0, self._sentence_buffer_start or 0.0), 3),
-                    "end": round(self._sentence_buffer_last_t, 3),
-                    "text": text,
-                    "id": self._next_seg_id,
-                })
-                self._next_seg_id += 1
-            self._sentence_buffer_ids = []
-            self._sentence_buffer_start = None
-        return segments
-
-    @property
-    def asr_time_s(self) -> float:
-        return self._asr_time_s
-
-    def reset(self) -> None:
-        try:
-            self.frame_asr.reset()
-        except Exception:
-            pass
-
-
-def _stateful_chunked_sync(
-    waveform_np: np.ndarray,
-    chunk_len_s: float,
-    total_buffer_s: float,
-    model_stride_s: float,
-    request_id: str,
-) -> Tuple[str, float, List[Tuple[int, float]]]:
-    """
-    Synchronous core of the BatchedFrameASRTDT stateful chunked engine.
-
-    Designed to be called via asyncio.to_thread from `_transcribe_chunked_stateful`.
-    Returns (joined_text, asr_time_s, token_times) where token_times is the
-    `(token_id, audio_time_s)` stream produced by mirroring the middle-token
-    merge over `frame_asr.all_alignments`. Runs at batch_size=1.
-    """
-    tokens_per_chunk = math.ceil(chunk_len_s / model_stride_s)
-    mid_delay = math.ceil((chunk_len_s + (total_buffer_s - chunk_len_s) / 2) / model_stride_s)
-
-    frame_asr = BatchedFrameASRTDT(
-        asr_model=asr_model,
-        frame_len=chunk_len_s,
-        total_buffer=total_buffer_s,
-        batch_size=1,
-        stateful_decoding=True,
-    )
-    try:
-        # Pad with `mid_delay * stride * sample_rate` trailing zeros (matches NeMo's
-        # `read_audio_file` preprocessing — the "middle token" algorithm needs the
-        # tail context to finalize the last chunk).
-        sr = asr_model._cfg.sample_rate
-        pad_samples = int(mid_delay * model_stride_s * sr)
-        if pad_samples > 0:
-            samples = np.pad(waveform_np, (0, pad_samples))
-        else:
-            samples = waveform_np
-
-        # Build the in-memory frame reader and register it as the only batch slot.
-        frame_reader = AudioFeatureIterator(
-            samples=samples,
-            frame_len=chunk_len_s,
-            preprocessor=frame_asr.raw_preprocessor,
-            device=asr_model.device,
-        )
-        frame_asr.set_frame_reader(frame_reader, 0)
-
-        t0 = time.time()
-        # transcribe() runs infer_logits() (encoder + decoder forward over all
-        # buffered chunks) and emits batch_size string hypotheses with the
-        # middle-token TDT merge applied across chunks.
-        # autocast is required: the model is pinned to bf16 but the audio
-        # samples are float32 (NeMo's preprocessor requirement). Without
-        # autocast the first matmul fails: "Input type (float) and bias
-        # type (c10::BFloat16) should be the same".
-        model_dtype = next(asr_model.parameters()).dtype
-        device_type = asr_model.device.type
-        with torch.inference_mode(), torch.amp.autocast(device_type, dtype=model_dtype):
-            outputs = frame_asr.transcribe(tokens_per_chunk=tokens_per_chunk, delay=mid_delay)
-        asr_time = time.time() - t0
-        text = outputs[0] if outputs else ""
-
-        token_times: List[Tuple[int, float]] = []
-        try:
-            token_times = _extract_tdt_token_times(
-                frame_asr=frame_asr,
-                delay=mid_delay,
-                tokens_per_chunk=tokens_per_chunk,
-                chunk_len_s=chunk_len_s,
-                total_buffer_s=total_buffer_s,
-                model_stride_s=model_stride_s,
-            )
-        except Exception as e_tt:
-            logger.warning(
-                f"({request_id}) Stateful: per-token timestamp extraction failed "
-                f"({e_tt!r}); falling back to text-based approximation.",
-                exc_info=True,
-            )
-            token_times = []
-
-        logger.info(
-            f"({request_id}) Stateful: chunk={chunk_len_s}s buf={total_buffer_s}s "
-            f"stride={model_stride_s:.4f}s tpc={tokens_per_chunk} delay={mid_delay} "
-            f"→ {len(text)} chars in {asr_time:.2f}s (token_times={len(token_times)})"
-        )
-        return text, asr_time, token_times
-    finally:
-        # Free the per-session decoder state; the FrameBatchASR allocates
-        # per-batch buffers that we don't want lingering between requests.
-        try:
-            frame_asr.reset()
-        except Exception:
-            pass
-
-
-async def _swap_decoder_to_stateful_tdt() -> dict:
-    """
-    Switch the active decoder reference to the pre-built greedy +
-    preserve_alignments=True instance (`decoding_stateful_tdt`) used by
-    BatchedFrameASRTDT. Returns the previous decoder ref so `_restore_decoder`
-    can put it back.
-
-    Both decoders are constructed once at model load and live in module-level
-    globals (`decoding_greedy_batch`, `decoding_stateful_tdt`). Reference swap
-    is O(1) and — crucially — preserves the CUDA graph captured inside each
-    decoder's `decoding_computer` across requests. The previous implementation
-    called `change_decoding_strategy()` per request, which rebuilt the
-    computer and threw away the captured graph each time.
-
-    Caller MUST be holding `model_access_lock`.
-    """
-    if decoding_stateful_tdt is None:
-        # Init never finished building the second decoder — fall back to the
-        # slow path so chunked/streaming still works.
-        from omegaconf import open_dict
-        decoding_cfg = asr_model.cfg.decoding
-        fallback_saved = {
-            "kind": "config_rebuild",
-            "strategy": decoding_cfg.strategy,
-            "preserve_alignments": decoding_cfg.get("preserve_alignments", False),
-            "fused_batch_size": decoding_cfg.get("fused_batch_size", -1),
-        }
-        with open_dict(decoding_cfg):
-            decoding_cfg.strategy = "greedy"
-            decoding_cfg.preserve_alignments = True
-            decoding_cfg.fused_batch_size = -1
-        await _run_on_asr_executor(asr_model.change_decoding_strategy, decoding_cfg, verbose=False)
-        return fallback_saved
-
-    saved = {"kind": "ref_swap", "prev_decoding": asr_model.decoding}
-    asr_model.decoding = decoding_stateful_tdt
-    return saved
-
-
-async def _restore_decoder(saved: dict) -> None:
-    """Reverse of `_swap_decoder_to_stateful_tdt`."""
-    if saved.get("kind") == "ref_swap":
-        asr_model.decoding = saved["prev_decoding"]
-        return
-    # Config-rebuild fallback path
-    from omegaconf import open_dict
-    decoding_cfg = asr_model.cfg.decoding
-    with open_dict(decoding_cfg):
-        decoding_cfg.strategy = saved["strategy"]
-        decoding_cfg.preserve_alignments = saved["preserve_alignments"]
-        decoding_cfg.fused_batch_size = saved["fused_batch_size"]
-    await _run_on_asr_executor(asr_model.change_decoding_strategy, decoding_cfg, verbose=False)
-
-
-async def _transcribe_chunked_v2(
+async def _transcribe_chunked(
     waveform: torch.Tensor,
     audio_duration_s: float,
     client_config: dict,
-    request_id: str = "chunked-v2",
+    request_id: str = "chunked",
 ) -> Tuple[List[dict], float]:
     """
-    Offline buffered chunked transcription using `StreamingPrevBatchedEngine` —
-    the Option C engine. Feeds the entire waveform through the same engine
-    the live `progressive_v2` path uses, just back-to-back as fast as the
-    GPU will accept. No middle-token merge, no private-API reach.
+    Offline chunked transcription using `StreamingPrevBatchedEngine`.
 
-    Caller MUST be holding `model_access_lock`. The dual decoder swap
-    (`_swap_decoder_to_stateful_tdt`) is required so the engine sees the
-    `greedy + preserve_alignments=True` decoder.
+    Feeds the entire waveform through the same engine the live `progressive`
+    path uses, just back-to-back as fast as the GPU will accept. Emits
+    sentence-bounded segments via the engine's pop_final_segments(). Uses
+    the default greedy_batch decoder (no per-request decoder swap) so the
+    captured CUDA graph in `decoding_computer` is preserved across requests.
+
+    Caller MUST be holding `model_access_lock`.
     """
     if asr_model is None:
-        logger.error(f"({request_id}) chunked_v2: asr_model is None.")
+        logger.error(f"({request_id}) chunked: asr_model is None.")
         return [], 0.0
 
     live_latency = bool(client_config.get("live_latency", False))
@@ -2644,10 +1231,6 @@ async def _transcribe_chunked_v2(
         else waveform.to(dtype=torch.float32).contiguous().cpu().numpy()
     )
 
-    # v2 uses the DEFAULT greedy_batch decoder (which is what has
-    # decoding_computer with the captured CUDA graph). It does NOT need
-    # preserve_alignments=True — the v2 engine reads per-token timestamps
-    # directly off chunk_hyps.timestamps. So no decoder swap here.
     def _run() -> Tuple[List[dict], float]:
         engine = StreamingPrevBatchedEngine(
             asr_model_instance=asr_model,
@@ -2667,17 +1250,17 @@ async def _transcribe_chunked_v2(
     segments, asr_time = await _run_on_asr_executor(_run)
 
     logger.info(
-        f"({request_id}) chunked_v2: dur={audio_duration_s:.2f}s "
+        f"({request_id}) chunked: dur={audio_duration_s:.2f}s "
         f"asr_t={asr_time:.2f}s segs={len(segments)} "
         f"chunk={chunk_secs}s right={right_secs}s"
     )
     return segments, asr_time
 
 
-async def _transcribe_full_v2(
+async def _transcribe_full(
     waveform: torch.Tensor,
     audio_duration_s: float,
-    request_id: str = "full-v2",
+    request_id: str = "full",
 ) -> Tuple[List[dict], float]:
     """Single-pass offline transcription via encoder + `decoding_computer`.
 
@@ -2688,16 +1271,17 @@ async def _transcribe_full_v2(
     23 % empty / 33 % catastrophic outputs on the LibriSpeech test-clean
     short tail — see the regression harness in `tests/`).
 
-    Same code pattern as `chunked_v2`'s `StreamingPrevBatchedEngine`, but
-    single-shot: encoder runs once on the full waveform, decoder runs once
-    with `prev_batched_state=None`, tokens are mapped to sentence-bounded
+    Same encoder + `decoding_computer` pipeline as `_transcribe_chunked`
+    and the streaming `StreamingPrevBatchedEngine`, but single-shot: encoder
+    runs once on the full waveform, decoder runs once with
+    `prev_batched_state=None`, tokens are mapped to sentence-bounded
     segments via the shared helper.
 
     Caller MUST hold `model_access_lock`. `_apply_model_settings_for_session`
     must have run first so local-attention mode is engaged for long audio.
     """
     if asr_model is None:
-        logger.error(f"({request_id}) full-v2: asr_model is None.")
+        logger.error(f"({request_id}) full: asr_model is None.")
         return [], 0.0
 
     device = next(asr_model.parameters()).device
@@ -2746,150 +1330,10 @@ async def _transcribe_full_v2(
 
     segments, asr_time = await _run_on_asr_executor(_run)
     logger.info(
-        f"({request_id}) full-v2: dur={audio_duration_s:.2f}s "
+        f"({request_id}) full: dur={audio_duration_s:.2f}s "
         f"asr_t={asr_time:.2f}s segs={len(segments)}"
     )
     return segments, asr_time
-
-
-async def _transcribe_chunked_stateful(
-    waveform: torch.Tensor,
-    audio_duration_s: float,
-    client_config: dict,
-    request_id: str = "stateful-chunked",
-) -> Tuple[List[dict], float]:
-    """
-    Stateful chunked transcription via NeMo's BatchedFrameASRTDT.
-
-    Carries decoder state across chunks; the middle-token TDT merge stitches
-    chunk outputs into one coherent transcript without boundary duplicates or
-    drops. Emits sentence-bounded segments with real per-token timestamps
-    recovered by walking `frame_asr.all_alignments` (see
-    `_extract_tdt_token_times`). Falls back to proportional approximation only
-    if extraction fails.
-
-    The 10-10-5 / 10-2-2 NeMo recommendations map to:
-        chunk_len_in_secs  = STREAMING_CHUNK_S
-        total_buffer_in_secs = STREAMING_LEFT_CONTEXT_S + STREAMING_CHUNK_S + STREAMING_RIGHT_CONTEXT_S
-    """
-    if asr_model is None:
-        logger.error(f"({request_id}) Stateful: asr_model is None.")
-        return [], 0.0
-
-    chunk_len = STREAMING_CHUNK_S
-    total_buffer = STREAMING_LEFT_CONTEXT_S + STREAMING_CHUNK_S + STREAMING_RIGHT_CONTEXT_S
-
-    feature_stride = asr_model._cfg.preprocessor["window_stride"]
-    model_stride_in_secs = feature_stride * asr_model.encoder.subsampling_factor
-
-    # Convert torch tensor (likely on CPU after load_and_preprocess_audio) to
-    # a contiguous float32 numpy array — that's what AudioFeatureIterator expects.
-    if waveform.dim() > 1:
-        waveform_np = waveform.squeeze().to(dtype=torch.float32).contiguous().cpu().numpy()
-    else:
-        waveform_np = waveform.to(dtype=torch.float32).contiguous().cpu().numpy()
-
-    # BatchedFrameASRTDT requires strategy=greedy + preserve_alignments=True;
-    # globally pinning those would slow FULL and the legacy chunked fallback
-    # ~20× (they rely on greedy_batch). Swap transiently here.
-    saved = await _swap_decoder_to_stateful_tdt()
-    try:
-        text, asr_time, token_times = await _run_on_asr_executor(
-            _stateful_chunked_sync,
-            waveform_np,
-            chunk_len,
-            total_buffer,
-            model_stride_in_secs,
-            request_id,
-        )
-    finally:
-        await _restore_decoder(saved)
-
-    if not text:
-        return [], asr_time
-
-    segments: List[dict] = []
-    if token_times:
-        try:
-            segments = _segments_from_token_times(token_times, asr_model.tokenizer, audio_duration_s)
-        except Exception as e_seg:
-            logger.warning(
-                f"({request_id}) Stateful: building segments from token_times "
-                f"failed ({e_seg!r}); falling back to approximation.",
-                exc_info=True,
-            )
-            segments = []
-
-    if not segments:
-        segments = _approximate_segments_from_text(text.strip(), audio_duration_s)
-
-    return segments, asr_time
-
-
-def _should_use_stateful_engine(audio_duration_s: Optional[float], request_id: str) -> bool:
-    """
-    Resolve which chunked engine to use for a request.
-
-    Returns True iff USE_STATEFUL_CHUNKED is on AND the audio (if known)
-    fits within STATEFUL_MAX_DURATION_S. Above the threshold (or when 0
-    means disabled), we fall back to the legacy independent-chunk path —
-    it batches 4 chunks per call and is ~20× faster on long audio at the
-    cost of some boundary-merge quality. Logs the bypass for visibility.
-    """
-    if not USE_STATEFUL_CHUNKED:
-        return False
-    if STATEFUL_MAX_DURATION_S <= 0:
-        return True  # explicit "no cap" mode
-    if audio_duration_s is not None and audio_duration_s > STATEFUL_MAX_DURATION_S:
-        logger.info(
-            f"({request_id}) Stateful chunked engine bypassed: duration "
-            f"{audio_duration_s:.1f}s > STATEFUL_MAX_DURATION_S ({STATEFUL_MAX_DURATION_S:.0f}s). "
-            f"Falling back to legacy independent-chunk path."
-        )
-        return False
-    return True
-
-
-_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
-
-def _approximate_segments_from_text(text: str, duration_s: float) -> List[dict]:
-    """
-    Split a concatenated transcript on sentence boundaries and distribute
-    timestamps proportionally over the audio duration.
-
-    Used by the stateful chunked engine (BatchedFrameASRTDT.transcribe() only
-    returns a string; its internal all_timestamps tracks per-chunk token
-    timing BEFORE the middle-token merge, so reconstructing per-utterance
-    timestamps after the merge would require duplicating NeMo's merge logic).
-
-    The output timestamps assume uniform speech rate — they're useful for
-    SRT/CSV consumption but not frame-accurate. For exact timestamps, use
-    the legacy independent-chunk path (USE_STATEFUL_CHUNKED=false).
-    """
-    if not text or duration_s <= 0:
-        return []
-    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text.strip()) if p.strip()]
-    if not parts:
-        return [{"start": 0.0, "end": round(duration_s, 3), "text": text.strip(), "id": 0}]
-
-    total_chars = sum(len(p) for p in parts)
-    if total_chars == 0:
-        return [{"start": 0.0, "end": round(duration_s, 3), "text": text.strip(), "id": 0}]
-
-    segments: List[dict] = []
-    cursor_s = 0.0
-    for i, part in enumerate(parts):
-        seg_dur = duration_s * (len(part) / total_chars)
-        start_s = cursor_s
-        end_s = min(cursor_s + seg_dur, duration_s) if i < len(parts) - 1 else duration_s
-        segments.append({
-            "start": round(start_s, 3),
-            "end": round(end_s, 3),
-            "text": part,
-            "id": i,
-        })
-        cursor_s = end_s
-    return segments
 
 
 @app.post("/v1/audio/transcriptions")
@@ -2899,7 +1343,7 @@ async def transcribe_endpoint_rest(
     chunk_overlap: Optional[float] = Query(None, description="Overlap between audio chunks in seconds. Uses server default if not set."),
     batch_size: Optional[int] = Query(None, description="Batch size for ASR model processing. Uses server default if not set."),
     long_audio_threshold: Optional[float] = Query(None, description="Threshold in seconds to apply long audio model settings. Uses server default if not set."),
-    strategy: Optional[str] = Query(None, description="Processing strategy: auto (default) → chunked_v2. Explicit values: full | chunked | chunked_v2 | progressive | progressive_v2."),
+    strategy: Optional[str] = Query(None, description="Processing strategy: auto (default) → chunked. Explicit: full | chunked | progressive. Legacy aliases chunked_v2 / progressive_v2 still accepted."),
 ):
     """
     Handles REST API requests for audio transcription of a single uploaded file.
@@ -3003,32 +1447,18 @@ async def transcribe_endpoint_rest(
                         )
                         logger.info(f"({request_id}) REST: ASR model settings applied for session. Long audio specific settings active: {long_audio_settings_applied_this_session}.")
 
-                        if resolved_strategy == ProcessingStrategy.CHUNKED_V2:
-                            segments, asr_processing_time_s = await _transcribe_chunked_v2(
+                        if resolved_strategy == ProcessingStrategy.CHUNKED:
+                            segments, asr_processing_time_s = await _transcribe_chunked(
                                 waveform=waveform_tensor,
                                 audio_duration_s=total_audio_duration_s,
                                 client_config=client_config_rest,
                                 request_id=f"REST-{request_id}",
                             )
-                        elif resolved_strategy == ProcessingStrategy.CHUNKED:
-                            if _should_use_stateful_engine(total_audio_duration_s, request_id):
-                                segments, asr_processing_time_s = await _transcribe_chunked_stateful(
-                                    waveform=waveform_tensor,
-                                    audio_duration_s=total_audio_duration_s,
-                                    client_config=client_config_rest,
-                                    request_id=f"REST-{request_id}",
-                                )
-                            else:
-                                segments, asr_processing_time_s = await _transcribe_chunked_waveform(
-                                    waveform=waveform_tensor,
-                                    client_config=client_config_rest,
-                                    request_id=f"REST-{request_id}",
-                                )
                         else:
                             # FULL: single-pass through encoder + decoding_computer.
                             # Bypasses NeMo's transcribe() wrapper to dodge the
-                            # short-audio CUDA-graph bug (see _transcribe_full_v2).
-                            segments, asr_processing_time_s = await _transcribe_full_v2(
+                            # short-audio CUDA-graph bug (see _transcribe_full).
+                            segments, asr_processing_time_s = await _transcribe_full(
                                 waveform=waveform_tensor,
                                 audio_duration_s=total_audio_duration_s,
                                 request_id=f"REST-{request_id}",
@@ -3037,16 +1467,21 @@ async def transcribe_endpoint_rest(
                         full_transcribed_text = " ".join(s['text'] for s in segments).strip()
                         total_server_processing_time_s = round(time.time() - start_time_total_request_processing, 3)
 
+                        # OpenAI Whisper `verbose_json` compatible shape, plus
+                        # our own extension fields (strategy, *_seconds, csv/srt).
                         final_response_content = {
+                            "task": "transcribe",
+                            "language": "en",
+                            "duration": round(total_audio_duration_s, 3),
                             "text": full_transcribed_text,
                             "segments": segments,
-                            "language": "en",
+                            # Extensions (non-Whisper):
                             "strategy": resolved_strategy.value,
                             "transcription_time_seconds": round(asr_processing_time_s, 3),
                             "total_request_time_server_seconds": total_server_processing_time_s,
+                            "audio_duration_seconds": round(total_audio_duration_s, 3),
                             "csv_content": generate_csv_content(segments),
                             "srt_content": generate_srt_content(segments),
-                            "audio_duration_seconds": round(total_audio_duration_s, 3)
                         }
                         response_status_code = 200
                         logger.info(
@@ -3168,45 +1603,18 @@ async def _ws_accumulate_then_process(
 
     try:
         if resolved_strategy == ProcessingStrategy.FULL:
-            segments, asr_t = await _transcribe_full_v2(
+            segments, asr_t = await _transcribe_full(
                 waveform=waveform,
                 audio_duration_s=audio_duration_s,
                 request_id=f"WS-{session_id}",
             )
-        elif resolved_strategy == ProcessingStrategy.CHUNKED_V2:
-            segments, asr_t = await _transcribe_chunked_v2(
+        else:  # CHUNKED
+            segments, asr_t = await _transcribe_chunked(
                 waveform=waveform,
                 audio_duration_s=audio_duration_s,
                 client_config=client_config,
                 request_id=f"WS-{session_id}",
             )
-        else:  # CHUNKED
-            if _should_use_stateful_engine(audio_duration_s, session_id):
-                # Stateful engine has no per-batch hook: it computes the whole
-                # thing in one transcribe() call. No intermediate segments_batch.
-                segments, asr_t = await _transcribe_chunked_stateful(
-                    waveform=waveform,
-                    audio_duration_s=audio_duration_s,
-                    client_config=client_config,
-                    request_id=f"WS-{session_id}",
-                )
-            else:
-                # Legacy: emit segments_batch as each independent-chunk batch completes.
-                async def _on_batch(batch_segs: List[dict], batch_num: int) -> bool:
-                    if websocket.application_state != WebSocketState.CONNECTED:
-                        return False
-                    try:
-                        await websocket.send_json({"type": "segments_batch", "segments": batch_segs})
-                    except Exception as e_send:
-                        logger.warning(f"({session_id}) {log_prefix}: send segments_batch failed: {e_send}")
-                        return False
-                    return True
-                segments, asr_t = await _transcribe_chunked_waveform(
-                    waveform=waveform,
-                    client_config=client_config,
-                    request_id=f"WS-{session_id}",
-                    on_batch_segments=_on_batch,
-                )
     finally:
         # Revert under the lock owner's lifecycle (we are still inside the lock).
         await _revert_model_to_global_original_state(
@@ -3222,8 +1630,13 @@ async def _ws_accumulate_then_process(
     text = " ".join(s.get('text', '') for s in segments).strip()
     return {
         "type": "final_transcription",
-        "text": text,
+        # Whisper-compatible fields
+        "task": "transcribe",
         "language": "en",
+        "duration": round(audio_duration_s, 3),
+        "text": text,
+        "segments": segments,
+        # Extensions (non-Whisper):
         "strategy": resolved_strategy.value,
         "transcription_time_seconds": round(asr_t, 3),
         "total_segments": len(segments),
@@ -3287,15 +1700,10 @@ async def _ws_handle_unified(
         )
         logger.info(f"({session_id}) {log_prefix}: resolved strategy = {resolved.value}.")
 
-        if resolved in (ProcessingStrategy.PROGRESSIVE, ProcessingStrategy.PROGRESSIVE_V2):
-            # Streaming pipeline: ffmpeg producer/consumer. handle_streaming_pcm
-            # does its own _apply / _revert via the legacy pattern here, since
-            # for streaming we don't know duration upfront and use chunk_length
-            # as the proxy.
-            # Stash the resolved strategy into client_config so the consumer
-            # can pick the right engine (legacy StreamingTdtEngine vs new
-            # StreamingPrevBatchedEngine).
-            client_config = {**client_config, "_resolved_strategy": resolved.value}
+        if resolved == ProcessingStrategy.PROGRESSIVE:
+            # Streaming pipeline: ffmpeg producer/consumer feeding the v2 engine.
+            # We don't know audio duration upfront in streaming; use chunk_length
+            # as the proxy for the long-audio attention decision.
             long_audio_active = False
             async with model_access_lock:
                 try:
@@ -3385,15 +1793,14 @@ async def websocket_transcribe_unified(websocket: WebSocket):
     Unified WebSocket endpoint. Client sends a JSON config first frame; server
     resolves the processing strategy and dispatches:
 
-      - strategy=full            → accumulate-then-process, single transcribe call.
-      - strategy=chunked          → accumulate-then-process, legacy BatchedFrameASRTDT.
-      - strategy=chunked_v2       → accumulate-then-process, NVIDIA-blessed v2 engine.
-      - strategy=progressive      → ffmpeg streaming pipeline, legacy engine.
-      - strategy=progressive_v2   → ffmpeg streaming pipeline, NVIDIA-blessed v2 engine.
-      - strategy=auto (default)   → progressive_v2 for WS, chunked_v2 for REST.
+      - strategy=full         → accumulate-then-process, single-pass via encoder + decoding_computer.
+      - strategy=chunked      → accumulate-then-process, StreamingPrevBatchedEngine.
+      - strategy=progressive  → ffmpeg streaming pipeline, same engine driven live.
+      - strategy=auto         → progressive for WS connections, chunked for REST.
 
     Legacy aliases /ws_upload and /ws_stream forward here with strategy
-    forced to chunked and progressive respectively.
+    forced to chunked and progressive respectively. Client strings
+    chunked_v2 / progressive_v2 are accepted and map to chunked / progressive.
     """
     await _ws_handle_unified(websocket, strategy_override=None, log_prefix="WS")
 

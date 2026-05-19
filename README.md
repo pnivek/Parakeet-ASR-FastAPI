@@ -1,16 +1,20 @@
 # Parakeet ASR
 
-High-performance Automatic Speech Recognition (ASR) server built on NVIDIA's NeMo Parakeet-TDT-0.6B-v2. REST and WebSocket APIs, an interactive web UI, and a stateful streaming pipeline that carries decoder state across chunk boundaries.
+A FastAPI wrapper around NVIDIA's `parakeet-tdt-0.6b-v2` covering three workloads — short-batch, long-batch, and buffered-streaming WebSocket — behind one strategy dispatcher.
+
+> ### A note on "streaming"
+> `parakeet-tdt-0.6b-v2` is an **offline** model. NVIDIA trained it with full attention for a 24-minute single-pass ceiling — it is not a cache-aware streaming model. Riva does not offer this model as a streaming endpoint ([NVIDIA forum](https://forums.developer.nvidia.com/t/support-parakeet-tdt-0-6b-v2-en/337223)). What this project calls `progressive` is **buffered streaming with a ~4–15 s emission lag** (the model needs right context before committing tokens). If you need true low-latency live ASR, switch checkpoints to a cache-aware streaming variant such as [`parakeet_realtime_eou_120m-v1`](https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1) or [`nemotron-speech-streaming-en-0.6b`](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b). For everything else — batch transcription, near-real-time captioning, multi-hour archives — this server covers it.
 
 ## Features
 
-- **State-of-the-art ASR** — `nvidia/parakeet-tdt-0.6b-v2` (Token-and-Duration Transducer).
+- **State-of-the-art offline ASR** — `nvidia/parakeet-tdt-0.6b-v2` (Token-and-Duration Transducer).
 - **Three processing strategies** behind one dispatcher:
   - `full` — single transcribe pass, best quality, up to `MAX_FULL_WAVEFORM_S` (default 24 min).
   - `chunked` — stateful sliding-window via `BatchedFrameASRTDT`. Decoder state carries across chunks, eliminating boundary duplication/drop artifacts. Falls back to a legacy independent-chunk path above `STATEFUL_MAX_DURATION_S` (~4× faster for very long files).
-  - `progressive` — live WebSocket streaming. Drives the same `BatchedFrameASRTDT` engine chunk-by-chunk over an ffmpeg PCM stream, emitting sentence-bounded partials as the middle-token merge commits them.
-- **Per-token timestamps** recovered from the stateful TDT merge — segment starts/ends align with the `full` strategy within ~40ms.
-- **Optional end-of-stream refinement** — `progressive_refinement` runs a single FULL pass over the accumulated PCM at EOF and replaces the streamed segments with offline-quality output.
+  - `progressive` — **buffered** WebSocket streaming. Drives the same `BatchedFrameASRTDT` engine chunk-by-chunk over an ffmpeg PCM stream, emitting sentence-bounded partials as the middle-token merge commits them. Emission lag ≈ `(total_buffer − chunk) / 2` seconds: ~7.5 s with the offline-like preset, ~6 s with the live preset.
+- **Per-token timestamps** recovered from the stateful TDT merge — segment starts/ends align with the `full` strategy within ~40 ms.
+- **Optional end-of-stream refinement** — `progressive_refinement` runs a single FULL pass over the accumulated PCM at EOF and replaces the streamed segments with offline-quality output (when audio ≤ `MAX_FULL_WAVEFORM_S`).
+- **Verified at scale** — 3 h files complete cleanly through `progressive` with 100% audio coverage (~205 s ASR time on a DGX Spark, 1121 segments).
 - **Versatile output** — plain text, segment list (with start/end), CSV, SRT.
 - **Interactive Web UI** — file upload, strategy selector, segment playback, downloads.
 - **Health probes** — `/health` for liveness + introspection, `/readyz` for readiness gating.
@@ -80,7 +84,7 @@ Configure via environment variables or `app/.env`.
 | `STREAMING_LEFT_CONTEXT_S` | Left context for the offline-like 10-10-5 preset | 10 |
 | `STREAMING_CHUNK_S` | Chunk length for the offline-like preset | 10 |
 | `STREAMING_RIGHT_CONTEXT_S` | Right context for the offline-like preset | 5 |
-| `STREAMING_LIVE_CHUNK_S` | Chunk length when client opts into `live_latency` (10-2-2 preset, ~4s latency) | 2 |
+| `STREAMING_LIVE_CHUNK_S` | Chunk length when client opts into `live_latency` (10-2-2 preset, ~6 s emission lag) | 2 |
 | `STREAMING_LIVE_RIGHT_CONTEXT_S` | Right context for the live preset | 2 |
 
 Measured wall-clock on a DGX Spark (single-stream):
@@ -201,10 +205,20 @@ GET /readyz
 | File ≤ 24 min, want best quality | `full` |
 | File 24 min – 30 min, want best chunked quality | `chunked` (stateful) |
 | File > 30 min | `chunked` (auto-falls-back to legacy above `STATEFUL_MAX_DURATION_S`) |
-| Live audio, low latency more important than chunk-boundary quality | `progressive` + `live_latency: true` |
-| Live audio, want offline-quality output after EOF | `progressive` + `progressive_refinement: true` (default) |
+| Streaming audio, ~6 s emission lag acceptable, prefer fewer/cleaner emissions | `progressive` + `live_latency: true` (10-2-2 preset) |
+| Streaming audio, ~7.5 s emission lag acceptable, prefer best chunk-boundary quality | `progressive` + `live_latency: false` (10-10-5 preset, default) |
+| Streaming audio, want offline-quality replacement at EOF | `progressive` + `progressive_refinement: true` (default) |
 
-The 10-10-5 and 10-2-2 presets come from NVIDIA's TDT streaming benchmarks; 10-10-5 yields "results similar to offline," 10-2-2 yields ~4 s live latency at slightly lower quality.
+### About the latency numbers
+
+The 10-10-5 and 10-2-2 presets come from NVIDIA's TDT streaming benchmarks. Both deliver *buffered* streaming: the engine emits tokens for an audio window only after it has heard `right_context_s` seconds beyond that window. With `total_buffer = left + chunk + right`, the emission lag is roughly `(total_buffer − chunk) / 2`:
+
+| Preset | Lag | Note |
+|--------|-----|------|
+| 10-10-5 (offline-like) | ~7.5 s | NVIDIA's "results similar to offline" recommendation |
+| 10-2-2 (live) | ~6 s | NVIDIA's "live" preset for this model |
+
+If you need sub-second emission, you need a cache-aware streaming checkpoint (see the [streaming note](#a-note-on-streaming) at the top). This model can't deliver lower latency than its right-context requirement.
 
 ## Web Interface
 

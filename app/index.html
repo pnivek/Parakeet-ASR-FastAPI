@@ -338,9 +338,9 @@
               <option value="auto" selected>auto (server picks based on duration / stream state)</option>
               <option value="full">full (single transcribe pass, best quality, &le; MAX_FULL_WAVEFORM_S)</option>
               <option value="chunked">chunked (BatchedFrameASRTDT stateful; legacy fallback above STATEFUL_MAX_DURATION_S)</option>
-              <option value="progressive">progressive (streaming partials; live-only)</option>
+              <option value="progressive">progressive (buffered streaming via WS; partials emit with right-context lag)</option>
             </select>
-            <span class="description">Server-side dispatch. "auto" honors DEFAULT_STRATEGY from .env.</span>
+            <span class="description">Server-side dispatch. "auto" honors DEFAULT_STRATEGY from .env. Note: progressive is <em>buffered</em> streaming — this model isn't cache-aware, so partials emit ~6–7.5 s behind real time.</span>
           </div>
           <div class="setting-group">
             <input type="checkbox" id="progressiveRefinement" />
@@ -350,7 +350,7 @@
           <div class="setting-group">
             <input type="checkbox" id="liveLatency" />
             <label for="liveLatency">live_latency</label>
-            <span class="description">Use the 10-2-2 streaming preset (~4s latency) instead of 10-10-5 (offline-like quality).</span>
+            <span class="description">Use the 10-2-2 preset (~6 s emission lag, smaller chunks) instead of 10-10-5 (~7.5 s lag, offline-like quality). Neither is "real-time" — for sub-second latency, switch to a cache-aware streaming checkpoint.</span>
           </div>
         </div>
         <!-- Global ASR Configuration -->

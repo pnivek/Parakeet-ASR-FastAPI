@@ -171,7 +171,7 @@ if not os.path.exists(static_dir): # Ensure static directory exists
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 def _collect_health_info() -> dict:
-    """Snapshot of model load + decoding/runtime config for /health and /v1/debug/state."""
+    """Snapshot of model load + decoding/runtime config for /health."""
     info: dict = {
         "model_loaded": asr_model is not None,
         "model_name": ASR_MODEL_NAME,
@@ -232,12 +232,6 @@ async def readyz():
     if asr_model is None:
         return JSONResponse(status_code=503, content={"status": "not_ready", "model_loaded": False})
     return {"status": "ready", "model_loaded": True}
-
-
-@app.get("/v1/debug/state", include_in_schema=False)
-async def debug_state():
-    """Back-compat alias — same payload as /health for the test/debug scripts that already query it."""
-    return _collect_health_info()
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -1932,6 +1926,13 @@ def _extract_tdt_token_times(
     The "middle token" slice picks frames in the centre of the buffer, so
     using the absolute frame index naturally produces the right time even
     though the slice does not start at the chunk's nominal beginning.
+
+    NOTE: this helper is used only by the OFFLINE _stateful_chunked_sync
+    path now (one-shot, no O(N²) risk). The live streaming path runs an
+    incremental version of the same merge inside StreamingTdtEngine. Both
+    will be retired when we migrate to NVIDIA's StreamingBatchedAudioBuffer
+    + prev_batched_state pattern (see
+    .claude/plans/option-c-prev-batched-state.md).
     """
     all_alignments = frame_asr.all_alignments[0]
     signal_end_idx = frame_asr.frame_bufferer.signal_end_index[0]
@@ -2062,11 +2063,34 @@ class StreamingTdtEngine:
     runs encoder+decoder over the current buffer state via `_get_batch_preds`.
     Each step appends one entry to `frame_asr.all_alignments[0]`.
 
-    `pop_committed_segments()` re-walks the accumulated alignments via the
-    same middle-token merge used in the offline path (`_extract_tdt_token_times`),
-    diffs against the previously-emitted token tail, and emits any newly
-    completed sentence-bounded segments. In-progress (no terminal '.!?') token
-    runs are held in `_sentence_buffer_*` until the sentence closes.
+    `pop_committed_segments()` applies the middle-token merge incrementally
+    on chunks since the last call (NOT a global re-walk — that previously
+    caused O(N²) work and an event-loop stall around chunk ~700 in long
+    streams, which the WS keepalive task interpreted as a dead client and
+    closed with code 1011; see commit 4744180 for the fix). Emitted token
+    runs end at sentence boundaries ('.', '!', '?'); in-progress sentences
+    are held in `_sentence_buffer_*` until the terminal punctuation arrives.
+
+    --- LOAD-BEARING NEMO PRIVATE API ----------------------------------------
+    `BatchedFrameASRTDT` is designed for offline one-shot use (set the frame
+    reader, call transcribe(), get merged text). To drive it incrementally
+    from a live stream we reach into several leading-underscore internals:
+
+      - frame_bufferer._update_feature_buffer(features, idx)
+      - frame_bufferer.normalize_frame_buffers(buffers, (mean, std))
+      - frame_bufferer.signal_end[idx], signal_end_index[idx]
+      - frame_asr._get_batch_preds()
+      - frame_asr.all_alignments[idx], all_preds[idx], all_timestamps[idx]
+      - frame_asr.tdt_search_boundary, blank_id, data_layer[idx].set_signal
+
+    Any of these can rename or change semantics on a NeMo upgrade. When
+    bumping NeMo: re-read this class against the new
+    nemo/collections/asr/parts/utils/streaming_utils.py and confirm the
+    method signatures still hold. The planned migration target is the
+    cleaner `StreamingBatchedAudioBuffer + decoding_computer + prev_batched_state`
+    pattern NVIDIA introduced in NeMo PR #9106 — see
+    `.claude/plans/option-c-prev-batched-state.md`.
+    -------------------------------------------------------------------------
 
     The engine assumes the model's decoding strategy has already been switched
     to (`greedy`, `preserve_alignments=True`, `fused_batch_size=-1`) by the

@@ -309,19 +309,24 @@ class StreamingPrevBatchedEngine:
             else:
                 self.current_batched_hyps.merge_(chunk_hyps)
 
-            # Map per-chunk token timestamps → global audio seconds.
+            # Map token timestamps → global audio seconds.
+            #
+            # IMPORTANT: chunk_hyps.timestamps is NOT chunk-local. When
+            # prev_batched_state is non-None, decoding_computer's
+            # _fix_timestamps_for_iterative_decoding (tdt_label_looping.py:1360)
+            # shifts the timestamps by prev_batched_state.decoded_lengths —
+            # i.e., the returned values are CUMULATIVE encoder frame indices
+            # from the start of the stream. For chunk 0 there's no shift, so
+            # the same formula `frame * stride_s` gives chunk-local audio time
+            # (which equals stream-time-from-zero for chunk 0). Use the
+            # cumulative interpretation uniformly.
             n_new = int(chunk_hyps.current_lengths[0].item())
             if n_new > 0:
-                # transcript[0, :n_new] are token ids; timestamps[0, :n_new] are
-                # encoder-frame indices RELATIVE to the chunk's encoder output
-                # (i.e., starting at 0 for the chunk's first frame after the
-                # left-context strip).
                 new_ids = chunk_hyps.transcript[0, :n_new].detach().cpu().tolist()
                 new_frame_idx = chunk_hyps.timestamps[0, :n_new].detach().cpu().tolist()
-                chunk_audio_start_s = self._chunk_index * self.chunk_secs
                 stride_s = self.encoder_stride_s
                 for tid, f in zip(new_ids, new_frame_idx):
-                    t_s = chunk_audio_start_s + float(f) * stride_s
+                    t_s = float(f) * stride_s
                     if t_s < 0.0:
                         t_s = 0.0
                     self._committed_token_times.append((int(tid), t_s))

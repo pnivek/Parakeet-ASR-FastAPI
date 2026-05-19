@@ -991,11 +991,20 @@ def resolve_strategy(
     """
     Resolve the processing strategy for a request.
 
-    Explicit non-AUTO strategies from client_config win. Otherwise:
-    - Streaming with unknown or live duration -> PROGRESSIVE.
-    - Known duration <= MAX_FULL_WAVEFORM_S -> FULL (_apply_model_settings_for_session
-      will engage local attention past LONG_AUDIO_THRESHOLD_S as needed).
-    - Otherwise -> CHUNKED.
+    Explicit non-AUTO strategies from client_config win. Otherwise AUTO routes
+    to the v2 engines (NVIDIA-blessed `StreamingBatchedAudioBuffer` +
+    `decoding_computer` + `prev_batched_state` pattern):
+
+    - Streaming  -> PROGRESSIVE_V2
+    - Otherwise  -> CHUNKED_V2 (handles any duration without fallback).
+
+    AUTO used to route short audio to FULL (NeMo's high-level `transcribe()`),
+    but harness testing on the LibriSpeech test-clean 2620-utterance set
+    showed that path produces 23 % empty / 35 % catastrophically wrong
+    output on audio under ~5 s — consistent with a CUDA-graph shape-capture
+    issue in `transcribe()`. The v2 engines bypass `transcribe()` entirely
+    via `decoding_computer` and don't exhibit this regression. `FULL` /
+    `CHUNKED` / `PROGRESSIVE` remain explicit-only.
     """
     requested = client_config.get("strategy", ProcessingStrategy.AUTO)
     if isinstance(requested, str):
@@ -1005,15 +1014,9 @@ def resolve_strategy(
         return requested
 
     if is_streaming:
-        return ProcessingStrategy.PROGRESSIVE
+        return ProcessingStrategy.PROGRESSIVE_V2
 
-    if audio_duration_s is None:
-        return ProcessingStrategy.FULL
-
-    if audio_duration_s <= MAX_FULL_WAVEFORM_S:
-        return ProcessingStrategy.FULL
-
-    return ProcessingStrategy.CHUNKED
+    return ProcessingStrategy.CHUNKED_V2
 
 
 def parse_websocket_config(client_cfg: dict) -> dict:
@@ -2825,7 +2828,7 @@ async def transcribe_endpoint_rest(
     chunk_overlap: Optional[float] = Query(None, description="Overlap between audio chunks in seconds. Uses server default if not set."),
     batch_size: Optional[int] = Query(None, description="Batch size for ASR model processing. Uses server default if not set."),
     long_audio_threshold: Optional[float] = Query(None, description="Threshold in seconds to apply long audio model settings. Uses server default if not set."),
-    strategy: Optional[str] = Query(None, description="Processing strategy: auto (default), full, chunked. Auto picks based on audio duration vs MAX_FULL_WAVEFORM_S."),
+    strategy: Optional[str] = Query(None, description="Processing strategy: auto (default) → chunked_v2. Explicit values: full | chunked | chunked_v2 | progressive | progressive_v2."),
 ):
     """
     Handles REST API requests for audio transcription of a single uploaded file.
@@ -3322,10 +3325,12 @@ async def websocket_transcribe_unified(websocket: WebSocket):
     Unified WebSocket endpoint. Client sends a JSON config first frame; server
     resolves the processing strategy and dispatches:
 
-      - strategy=full      → accumulate-then-process, single transcribe call.
-      - strategy=chunked   → accumulate-then-process, sliding-window batched.
-      - strategy=progressive → ffmpeg streaming pipeline with intermediate sends.
-      - strategy=auto (default for WS) → progressive.
+      - strategy=full            → accumulate-then-process, single transcribe call.
+      - strategy=chunked          → accumulate-then-process, legacy BatchedFrameASRTDT.
+      - strategy=chunked_v2       → accumulate-then-process, NVIDIA-blessed v2 engine.
+      - strategy=progressive      → ffmpeg streaming pipeline, legacy engine.
+      - strategy=progressive_v2   → ffmpeg streaming pipeline, NVIDIA-blessed v2 engine.
+      - strategy=auto (default)   → progressive_v2 for WS, chunked_v2 for REST.
 
     Legacy aliases /ws_upload and /ws_stream forward here with strategy
     forced to chunked and progressive respectively.

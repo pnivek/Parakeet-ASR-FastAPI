@@ -2079,9 +2079,20 @@ class StreamingTdtEngine:
             pad = np.zeros((features.shape[0], n_frame_len - features.shape[1]), dtype=features.dtype)
             features = np.concatenate([features, pad], axis=1)
 
-        # FIFO slide + insert at the right end; returns a list-of-list-of-buffers
-        # because BatchedFrameASR expects the data_layer interface to consume it.
-        frame_buffers = self.frame_asr.frame_bufferer.get_frame_buffers([features])
+        # NeMo's get_buffers_batch() does THREE things per chunk: (1) slide
+        # the FIFO buffer and insert the new features, (2) update a *separate*
+        # feature_buffer used to compute per-chunk normalization stats, and
+        # (3) z-normalize the just-built buffer. Steps (2) and (3) are
+        # mandatory — without them the encoder sees unnormalized features and
+        # the decoder emits no tokens. Replicate all three here since we're
+        # bypassing the frame_reader path.
+        bufferer = self.frame_asr.frame_bufferer
+        frame_buffers = bufferer.get_frame_buffers([features])
+        bufferer._update_feature_buffer(features, 0)
+        mean = np.mean(bufferer.feature_buffer, axis=2, keepdims=True)
+        std = np.std(bufferer.feature_buffer, axis=2, keepdims=True)
+        bufferer.normalize_frame_buffers(frame_buffers, (mean, std))
+
         self.frame_asr.data_layer[0].set_signal(frame_buffers[0][:])
         self.frame_asr.frame_bufferer.signal_end[0] = False
         with torch.inference_mode(), torch.amp.autocast(self._device_type, dtype=self._model_dtype):

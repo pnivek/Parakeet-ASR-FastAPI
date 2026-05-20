@@ -17,6 +17,10 @@ export default function App() {
   const [peaks, setPeaks] = useState<number[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  /** True while we're receiving partials (mid-stream). False on final result
+   * or no result. Drives the word-by-word reveal animation in the
+   * transcript view — static results should not animate. */
+  const [live, setLive] = useState(false)
 
   // Hidden host for the singleton <audio>.
   const audioMountRef = useRef<HTMLDivElement>(null)
@@ -39,6 +43,7 @@ export default function App() {
     setLoaded(l)
     setResult(r)
     setError(null)
+    setLive(false) // finalized — drop the streaming reveal
     if (l.kind === 'file') {
       setAudioFile(l.file)
       computePeaksFor(l.file)
@@ -52,10 +57,12 @@ export default function App() {
   const handlePartial = (r: TranscriptionResponse) => {
     setResult(r)
     setError(null)
+    setLive(true)
   }
 
   const handleError = (msg: string) => {
     setError(msg)
+    setLive(false)
   }
 
   useEffect(() => {
@@ -87,6 +94,7 @@ export default function App() {
             result={result}
             filename={loaded?.title ?? 'transcript'}
             currentTime={currentTime}
+            live={live}
           />
         </div>
         <aside className="shell__side">

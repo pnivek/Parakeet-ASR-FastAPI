@@ -8,6 +8,10 @@ interface Props {
   result: TranscriptionResponse | null
   filename: string
   currentTime: number
+  /** True while partials are still arriving (live mic / progressive WS). Drives
+   * the smoothstep fade-in reveal. For a finalized result we just colour
+   * words by playback position — no fade. */
+  live: boolean
 }
 
 type View = 'text' | 'segments' | 'words' | 'raw'
@@ -22,7 +26,7 @@ const NULL_TIPS: Record<string, string> = {
   seek: 'Not populated for now.',
 }
 
-export function TranscriptSection({ result, filename, currentTime }: Props) {
+export function TranscriptSection({ result, filename, currentTime, live }: Props) {
   const [view, setView] = useState<View>('text')
 
   if (!result) {
@@ -69,7 +73,15 @@ export function TranscriptSection({ result, filename, currentTime }: Props) {
         {result.format === 'text' && <div className="editorial-body">{result.body}</div>}
         {result.format === 'srt' && <Code text={result.body} filename={filename} />}
         {result.format === 'vtt' && <Code text={result.body} filename={filename} />}
-        {isVerbose && <VerboseBody body={result.body} view={view} currentTime={currentTime} filename={filename} />}
+        {isVerbose && (
+          <VerboseBody
+            body={result.body}
+            view={view}
+            currentTime={currentTime}
+            filename={filename}
+            live={live}
+          />
+        )}
       </div>
     </section>
   )
@@ -80,11 +92,13 @@ function VerboseBody({
   view,
   currentTime,
   filename,
+  live,
 }: {
   body: VerboseJsonResponse
   view: View
   currentTime: number
   filename: string
+  live: boolean
 }) {
   const activeWordIdx = useMemo(() => {
     if (!body.words) return -1
@@ -95,7 +109,10 @@ function VerboseBody({
     [body.segments, currentTime],
   )
 
-  if (view === 'text') return <PlainText body={body} currentTime={currentTime} activeWordIdx={activeWordIdx} />
+  if (view === 'text')
+    return (
+      <PlainText body={body} currentTime={currentTime} activeWordIdx={activeWordIdx} live={live} />
+    )
   if (view === 'segments') return <SegmentRows segments={body.segments} activeIdx={activeSegIdx} />
   if (view === 'words') return <WordsGrid body={body} activeIdx={activeWordIdx} />
   return <Code text={JSON.stringify(body, null, 2)} filename={filename} syntaxColor />
@@ -109,22 +126,27 @@ function PlainText({
   body,
   currentTime,
   activeWordIdx,
+  live,
 }: {
   body: VerboseJsonResponse
   currentTime: number
   activeWordIdx: number
+  /** True only while transcripts are arriving mid-stream — drives the
+   * smoothstep fade-in. False for finalized file/URL results. */
+  live: boolean
 }) {
-  if (body.words && body.words.length > 0) {
-    return (
-      <div className="editorial-body">
-        {body.words.map((w, i) => {
-          const reveal = w.start - REVEAL_LEAD
-          const dt = currentTime - reveal
-          const raw = dt <= 0 ? 0 : dt >= REVEAL_FADE ? 1 : dt / REVEAL_FADE
-          const eased = raw * raw * (3 - 2 * raw) // smoothstep
-          const active = i === activeWordIdx
-          const past = i < activeWordIdx
-          const color = active ? 'var(--accent)' : past ? 'var(--fg)' : 'var(--muted)'
+  if (!body.words || body.words.length === 0) {
+    return <div className="editorial-body">{body.text}</div>
+  }
+  return (
+    <div className="editorial-body">
+      {body.words.map((w, i) => {
+        const active = i === activeWordIdx
+        const past = i < activeWordIdx
+        const color = active ? 'var(--accent)' : past ? 'var(--fg)' : 'var(--muted)'
+
+        // Static result — no reveal; just colour by playback position.
+        if (!live) {
           return (
             <Fragment key={`${i}-${w.start}`}>
               <span
@@ -133,13 +155,7 @@ function PlainText({
                   seek(w.start)
                   play()
                 }}
-                style={{
-                  color,
-                  opacity: eased,
-                  filter: eased < 1 ? `blur(${(1 - eased) * 2.2}px)` : 'none',
-                  transform: eased < 1 ? `translateY(${(1 - eased) * 3}px)` : 'none',
-                  willChange: eased < 1 ? 'opacity, filter, transform' : 'auto',
-                }}
+                style={{ color }}
               >
                 {w.word}
                 {active && <span className="editorial-word__under" />}
@@ -147,11 +163,40 @@ function PlainText({
               {i < body.words!.length - 1 && ' '}
             </Fragment>
           )
-        })}
-      </div>
-    )
-  }
-  return <div className="editorial-body">{body.text}</div>
+        }
+
+        // Live / streaming — smoothstep fade-in starting `REVEAL_LEAD` before
+        // the word's start time, over `REVEAL_FADE` seconds. Tiny upward
+        // translate + blur dropoff while fading.
+        const reveal = w.start - REVEAL_LEAD
+        const dt = currentTime - reveal
+        const raw = dt <= 0 ? 0 : dt >= REVEAL_FADE ? 1 : dt / REVEAL_FADE
+        const eased = raw * raw * (3 - 2 * raw)
+        return (
+          <Fragment key={`${i}-${w.start}`}>
+            <span
+              className="editorial-word"
+              onClick={() => {
+                seek(w.start)
+                play()
+              }}
+              style={{
+                color,
+                opacity: eased,
+                filter: eased < 1 ? `blur(${(1 - eased) * 2.2}px)` : 'none',
+                transform: eased < 1 ? `translateY(${(1 - eased) * 3}px)` : 'none',
+                willChange: eased < 1 ? 'opacity, filter, transform' : 'auto',
+              }}
+            >
+              {w.word}
+              {active && <span className="editorial-word__under" />}
+            </span>
+            {i < body.words!.length - 1 && ' '}
+          </Fragment>
+        )
+      })}
+    </div>
+  )
 }
 
 // ── Segments with single-line timestamps + compact metadata ─────

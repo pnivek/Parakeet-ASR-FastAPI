@@ -25,12 +25,17 @@ export function Header() {
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
           <span className="header__name">Parakeet</span>
           <span className="header__sub">playground</span>
-          <span className="header__chip">v5 · maison</span>
         </div>
       </div>
       <div className="header__right">
-        <a className="ma-link header__link" href="#docs">Documentation</a>
-        <a className="ma-link header__link" href="#pricing">Pricing</a>
+        <a
+          className="ma-link header__link"
+          href="https://github.com/pnivek/Parakeet-ASR-FastAPI#readme"
+          target="_blank"
+          rel="noreferrer"
+        >
+          Documentation
+        </a>
         <button
           type="button"
           className="header__api pk-glow-btn"

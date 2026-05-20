@@ -56,7 +56,7 @@ export function HeroRow({ loaded, peaks, state, language = 'en' }: Props) {
 
   return (
     <section className="hero spin-in" key={loaded?.title ?? 'empty'}>
-      <div>
+      <div className="hero__id">
         <div className="hero__eyebrow-row">
           <span className="label-eyebrow">NOW PLAYING</span>
           <span

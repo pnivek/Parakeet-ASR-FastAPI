@@ -63,6 +63,25 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   const [busy, setBusy] = useState(false)
   const [progress, setProgress] = useState<number | null>(null)
 
+  // When leaving Live mic, `progressive` is no longer a valid choice for
+  // REST. Slide it back to 'auto' silently so the next Transcribe doesn't
+  // 400.
+  useEffect(() => {
+    if (mode !== 'mic' && s.strategy === 'progressive') {
+      s.set('strategy', 'auto')
+    }
+    // intentionally only react to mode flips
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode])
+
+  /**
+   * For REST modes, never let `progressive` reach the server. Map it to
+   * `chunked` (the engine the backend uses for chunked REST). For Live mic
+   * we keep whatever the user picked.
+   */
+  const restStrategy = (): Strategy =>
+    mode === 'mic' ? s.strategy : s.strategy === 'progressive' ? 'chunked' : s.strategy
+
   const setBusyAll = useCallback(
     (b: boolean) => {
       setBusy(b)
@@ -229,7 +248,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           {
             response_format: s.responseFormat,
             timestamp_granularities: s.timestampGranularities,
-            strategy: s.strategy,
+            strategy: restStrategy(),
             chunk_length: s.chunkLength ?? undefined,
             chunk_overlap: s.chunkOverlap ?? undefined,
             batch_size: s.batchSize ?? undefined,
@@ -259,7 +278,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         const r = await postTranscriptionUrl(urlInput.trim(), {
           response_format: s.responseFormat,
           timestamp_granularities: s.timestampGranularities,
-          strategy: s.strategy,
+          strategy: restStrategy(),
           chunk_length: s.chunkLength ?? undefined,
           chunk_overlap: s.chunkOverlap ?? undefined,
           batch_size: s.batchSize ?? undefined,

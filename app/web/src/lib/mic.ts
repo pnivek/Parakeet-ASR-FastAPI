@@ -82,15 +82,38 @@ export function useMic({ onChunk, onStop, onError }: UseMicOptions): UseMicResul
     setError(null)
     setState('starting')
     try {
+      // navigator.mediaDevices is only exposed in a secure context
+      // (HTTPS or localhost). On plain HTTP over a LAN address the API is
+      // undefined and there's no client-side workaround — explain it.
+      if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+        const insecure = typeof window !== 'undefined' && !window.isSecureContext
+        throw new Error(
+          insecure
+            ? `Microphone access requires HTTPS or localhost. This page is being served over plain HTTP (${window.location.host}). Open it via https:// or http://localhost:<port> to enable recording.`
+            : 'Microphone API not available in this browser.',
+        )
+      }
       if (!window.MediaRecorder || !MediaRecorder.isTypeSupported(MIC_MIME_TYPE)) {
         throw new Error(
           `Browser does not support ${MIC_MIME_TYPE}. ` +
             `Try Chrome, Firefox, or another Chromium-based browser.`,
         )
       }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-      })
+      let stream: MediaStream
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        })
+      } catch (e) {
+        const err = e as DOMException
+        if (err?.name === 'NotAllowedError') {
+          throw new Error('Microphone permission denied. Allow access in the browser site settings and retry.')
+        }
+        if (err?.name === 'NotFoundError') {
+          throw new Error('No microphone detected. Plug one in (or check system input settings) and retry.')
+        }
+        throw new Error(`Microphone access failed: ${err?.message || String(e)}`)
+      }
       streamRef.current = stream
 
       const recorder = new MediaRecorder(stream, { mimeType: MIC_MIME_TYPE })

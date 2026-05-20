@@ -97,6 +97,14 @@ export function useMic({
    * runtime changes without being torn down. */
   const optsRef = useRef({ vad, vadThreshold, vadHangoverMs })
   optsRef.current = { vad, vadThreshold, vadHangoverMs }
+  /** Chunks forwarded so far this session. The first N are always
+   * forwarded regardless of VAD: MediaRecorder's WebM/Opus stream is
+   * stateful — the very first blob carries the EBML init segment +
+   * codec private data, without which ffmpeg can't decode ANY
+   * subsequent blob. Dropping early "silent" chunks breaks the whole
+   * container. */
+  const forwardedCountRef = useRef<number>(0)
+  const BOOTSTRAP_CHUNKS = 3
 
   const cleanup = useCallback(() => {
     if (rafRef.current !== null) {
@@ -119,6 +127,7 @@ export function useMic({
     lastLevelRef.current = 0
     lastVoiceTsRef.current = 0
     voiceActiveRef.current = false
+    forwardedCountRef.current = 0
     setLevel(0)
     setVoiceActive(false)
   }, [])
@@ -167,10 +176,16 @@ export function useMic({
 
       recorder.ondataavailable = (ev) => {
         if (!ev.data || ev.data.size === 0) return
-        // VAD gate. If disabled, forward everything. If enabled, only
-        // forward when we observed speech recently (current frame OR
-        // within hangover window).
         const o = optsRef.current
+        // ALWAYS forward the first BOOTSTRAP_CHUNKS regardless of VAD —
+        // they carry the WebM EBML init / Opus codec private data that
+        // ffmpeg needs to parse anything that follows. If we drop them,
+        // every later chunk fails with "Invalid data" on the server.
+        if (forwardedCountRef.current < BOOTSTRAP_CHUNKS) {
+          forwardedCountRef.current++
+          onChunk(ev.data)
+          return
+        }
         if (!o.vad) {
           onChunk(ev.data)
           return

@@ -387,11 +387,20 @@ class StreamingPrevBatchedEngine:
             self._step_one_chunk(chunk, is_last_chunk=False)
 
     def flush(self) -> None:
-        """Drain any residual PCM as the LAST chunk so the right context closes out."""
+        """Drain any residual PCM as the LAST chunk so the right context closes out.
+
+        Defensive: if no PCM ever made it through (e.g. ffmpeg failed to
+        decode the incoming WebM, or the client sent an empty stream),
+        skip the final encoder pass — NeMo's preemphasis filter crashes
+        on x[:, 0] when x has 0 samples.
+        """
         if self._eof_flushed:
             return
         residual = self._pcm_buffer
         self._pcm_buffer = torch.zeros(0, dtype=torch.float32, device=self._device)
+        if residual.numel() == 0:
+            self._eof_flushed = True
+            return
         self._step_one_chunk(residual, is_last_chunk=True)
         self._eof_flushed = True
 

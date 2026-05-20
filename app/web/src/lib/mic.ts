@@ -2,12 +2,16 @@
  * Microphone capture for the live transcription panel.
  *
  * Wraps `getUserMedia` + `MediaRecorder(audio/webm;codecs=opus)` in a small
- * React hook. The recorder emits a Blob every `timeslice` ms (≈ 1s), which
- * the caller forwards to the WS as a binary frame. ffmpeg in the backend
- * image decodes webm/opus to 16 kHz mono PCM.
+ * React hook. The recorder emits a Blob every `timeslice` ms; the caller
+ * forwards it to the WS as a binary frame. ffmpeg decodes webm/opus →
+ * 16 kHz mono PCM in the backend.
  *
- * Also exposes an AnalyserNode-derived level (0..1) for a VU-style meter,
- * sampled via requestAnimationFrame inside the hook.
+ * Server owns voice activity detection now (Silero VAD on the decoded
+ * PCM); this module stays a dumb capture pipeline so the WebM container
+ * stays intact end-to-end.
+ *
+ * Exposes an AnalyserNode-derived level (0..1) for the meter, sampled
+ * via requestAnimationFrame.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 
@@ -22,41 +26,26 @@ export const MIC_FORMAT_HINT = 'webm'
  * How often MediaRecorder emits a Blob (ms). 250 ms gives the server data
  * to chew on much sooner — the first chunk leaves the browser within a
  * quarter-second of pressing Record instead of waiting a full second.
- * The server's chunk_queue handles the smaller-but-more-frequent frames
- * fine; ffmpeg sees the same bytestream either way.
  */
 export const MIC_TIMESLICE_MS = 250
 
 export interface UseMicOptions {
-  /** Called once per MediaRecorder timeslice when audio is forwarded. */
+  /** Called once per MediaRecorder timeslice with the recorded blob. */
   onChunk: (blob: Blob) => void
   /** Called after the final blob has been emitted following stop(). */
   onStop?: () => void
   /** Called on any unrecoverable error during start/record. */
   onError?: (err: Error) => void
-  /**
-   * Voice-activity detection. When true (default), silent chunks are
-   * dropped before being forwarded to the WS — keeps the server's
-   * inference queue drained so speech gets processed immediately
-   * instead of behind silent windows.
-   */
-  vad?: boolean
-  /** RMS threshold in [0..1] above which audio is considered speech. */
-  vadThreshold?: number
-  /** Once speech is detected, keep forwarding chunks for this many ms
-   * after the last "loud" sample. Avoids clipping trailing words. */
-  vadHangoverMs?: number
+  /** Forwarded to `getUserMedia({ audio: { noiseSuppression: ... } })`. */
+  noiseSuppression?: boolean
 }
 
 export interface UseMicResult {
   state: MicState
   /** Last error message, cleared on successful start. */
   error: string | null
-  /** Live mic level, 0..1. Updated each animation frame while recording. */
+  /** Live mic level, 0..1. Updated while recording, coalesced per rAF. */
   level: number
-  /** True when VAD currently classifies the input as speech (or during
-   * the hangover window). Drives the recording indicator. */
-  voiceActive: boolean
   start: () => Promise<void>
   stop: () => void
 }
@@ -70,14 +59,11 @@ export function useMic({
   onChunk,
   onStop,
   onError,
-  vad = true,
-  vadThreshold = 0.04,
-  vadHangoverMs = 800,
+  noiseSuppression = true,
 }: UseMicOptions): UseMicResult {
   const [state, setState] = useState<MicState>('idle')
   const [error, setError] = useState<string | null>(null)
   const [level, setLevel] = useState(0)
-  const [voiceActive, setVoiceActive] = useState(false)
 
   const streamRef = useRef<MediaStream | null>(null)
   const recorderRef = useRef<MediaRecorder | null>(null)
@@ -87,24 +73,6 @@ export function useMic({
   /** Last setLevel value — used to coalesce rAF updates that don't move the
    * peak meaningfully. Cuts the re-render rate of the sidebar by ~5×. */
   const lastLevelRef = useRef<number>(0)
-  /** Last performance.now() at which we observed speech (RMS above
-   * vadThreshold). Used for hangover-based VAD gating. */
-  const lastVoiceTsRef = useRef<number>(0)
-  /** Mirror of voiceActive in a ref so ondataavailable (a stale closure)
-   * can read the latest value without re-binding the listener. */
-  const voiceActiveRef = useRef<boolean>(false)
-  /** Mirror of the latest options so the recorder listener picks up
-   * runtime changes without being torn down. */
-  const optsRef = useRef({ vad, vadThreshold, vadHangoverMs })
-  optsRef.current = { vad, vadThreshold, vadHangoverMs }
-  /** Chunks forwarded so far this session. The first N are always
-   * forwarded regardless of VAD: MediaRecorder's WebM/Opus stream is
-   * stateful — the very first blob carries the EBML init segment +
-   * codec private data, without which ffmpeg can't decode ANY
-   * subsequent blob. Dropping early "silent" chunks breaks the whole
-   * container. */
-  const forwardedCountRef = useRef<number>(0)
-  const BOOTSTRAP_CHUNKS = 3
 
   const cleanup = useCallback(() => {
     if (rafRef.current !== null) {
@@ -125,11 +93,7 @@ export function useMic({
     }
     recorderRef.current = null
     lastLevelRef.current = 0
-    lastVoiceTsRef.current = 0
-    voiceActiveRef.current = false
-    forwardedCountRef.current = 0
     setLevel(0)
-    setVoiceActive(false)
   }, [])
 
   const start = useCallback(async () => {
@@ -157,7 +121,11 @@ export function useMic({
       let stream: MediaStream
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression,
+          },
         })
       } catch (e) {
         const err = e as DOMException
@@ -175,26 +143,7 @@ export function useMic({
       recorderRef.current = recorder
 
       recorder.ondataavailable = (ev) => {
-        if (!ev.data || ev.data.size === 0) return
-        const o = optsRef.current
-        // ALWAYS forward the first BOOTSTRAP_CHUNKS regardless of VAD —
-        // they carry the WebM EBML init / Opus codec private data that
-        // ffmpeg needs to parse anything that follows. If we drop them,
-        // every later chunk fails with "Invalid data" on the server.
-        if (forwardedCountRef.current < BOOTSTRAP_CHUNKS) {
-          forwardedCountRef.current++
-          onChunk(ev.data)
-          return
-        }
-        if (!o.vad) {
-          onChunk(ev.data)
-          return
-        }
-        const now = performance.now()
-        const inHangover = now - lastVoiceTsRef.current <= o.vadHangoverMs
-        if (inHangover) onChunk(ev.data)
-        // else: silent chunk — drop it. The server engine doesn't know
-        // about the gap; it'll see a contiguous (speech-only) stream.
+        if (ev.data && ev.data.size > 0) onChunk(ev.data)
       }
       recorder.onstop = () => {
         onStop?.()
@@ -228,35 +177,13 @@ export function useMic({
         // Cast: lib.dom.d.ts in TS6 narrowed this to ArrayBuffer-only views.
         analyserRef.current.getByteTimeDomainData(buf as unknown as Uint8Array<ArrayBuffer>)
         let peak = 0
-        let sumSq = 0
         for (let i = 0; i < buf.length; i++) {
-          const v = (buf[i] - 128) / 128
-          const a = Math.abs(v)
-          if (a > peak) peak = a
-          sumSq += v * v
+          const v = Math.abs(buf[i] - 128) / 128
+          if (v > peak) peak = v
         }
         if (Math.abs(peak - lastLevelRef.current) >= LEVEL_THRESHOLD) {
           lastLevelRef.current = peak
           setLevel(peak)
-        }
-        // VAD: use RMS energy (less spiky than peak). If above threshold,
-        // refresh the lastVoice timestamp. The ondataavailable handler
-        // reads this + the hangover window to gate forwarding.
-        const rms = Math.sqrt(sumSq / buf.length)
-        const o = optsRef.current
-        if (rms >= o.vadThreshold) {
-          lastVoiceTsRef.current = performance.now()
-          if (!voiceActiveRef.current) {
-            voiceActiveRef.current = true
-            setVoiceActive(true)
-          }
-        } else if (voiceActiveRef.current) {
-          // Inside hangover → still "active"; outside → flip off.
-          const inHang = performance.now() - lastVoiceTsRef.current <= o.vadHangoverMs
-          if (!inHang) {
-            voiceActiveRef.current = false
-            setVoiceActive(false)
-          }
         }
         rafRef.current = requestAnimationFrame(tick)
       }
@@ -270,7 +197,7 @@ export function useMic({
       cleanup()
       setState('error')
     }
-  }, [state, onChunk, onStop, onError, cleanup])
+  }, [state, onChunk, onStop, onError, noiseSuppression, cleanup])
 
   const stop = useCallback(() => {
     const rec = recorderRef.current
@@ -297,5 +224,5 @@ export function useMic({
     [cleanup],
   )
 
-  return { state, error, level, voiceActive, start, stop }
+  return { state, error, level, start, stop }
 }

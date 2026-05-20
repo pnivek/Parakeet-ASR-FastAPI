@@ -8,3 +8,4 @@ torch==2.7.0
 torchaudio==2.7.0
 python-multipart==0.0.20
 python-dotenv==1.1.0
+silero-vad==5.1.2

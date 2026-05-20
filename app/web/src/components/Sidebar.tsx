@@ -115,6 +115,17 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   const restStrategy = (): Strategy =>
     s.strategy === 'progressive' ? 'chunked' : s.strategy
 
+  /** Shared VAD + HPF config block for any WS config first frame. */
+  const vadConfig = () => ({
+    vad_enabled: s.vadEnabled,
+    vad_threshold: s.vadThreshold,
+    vad_consecutive: s.vadConsecutive,
+    vad_hangover_ms: s.vadHangoverMs,
+    vad_pad_min_gap_ms: s.vadPadMinGapMs,
+    vad_pad_duration_ms: s.vadPadDurationMs,
+    hpf_hz: s.hpfHz,
+  })
+
   // ── WS message → result/partial dispatch ─────────────────────────
   const handleMessage = useCallback(
     (msg: WSMessage) => {
@@ -206,7 +217,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       wsRef.current?.abort()
       wsRef.current = null
     },
-    vad: s.vad,
+    noiseSuppression: s.noiseSuppression,
   })
 
   const recording = mic.state === 'recording'
@@ -247,6 +258,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         chunk_overlap: s.chunkOverlap ?? undefined,
         batch_size: s.batchSize ?? undefined,
         long_audio_threshold: s.longAudioThreshold ?? undefined,
+        ...vadConfig(),
       },
       {
         onMessage: handleMessage,
@@ -307,6 +319,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
               chunk_overlap: s.chunkOverlap ?? undefined,
               batch_size: s.batchSize ?? undefined,
               long_audio_threshold: s.longAudioThreshold ?? undefined,
+              ...vadConfig(),
             },
             {
               onMessage: (msg) => {
@@ -508,7 +521,6 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             micBusy={micBusy}
             recordElapsed={recordElapsed}
             startMic={startMic}
-            vadEnabled={s.vad}
           />
         )}
         {tab === 'output' && (
@@ -532,13 +544,27 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             chunkLength={s.chunkLength}
             liveLatency={s.liveLatency}
             progressiveRefinement={s.progressiveRefinement}
-            vad={s.vad}
+            vadEnabled={s.vadEnabled}
+            vadThreshold={s.vadThreshold}
+            vadConsecutive={s.vadConsecutive}
+            vadHangoverMs={s.vadHangoverMs}
+            vadPadMinGapMs={s.vadPadMinGapMs}
+            vadPadDurationMs={s.vadPadDurationMs}
+            hpfHz={s.hpfHz}
+            noiseSuppression={s.noiseSuppression}
             setLong={(v) => s.set('longAudioThreshold', v)}
             setBatch={(v) => s.set('batchSize', v)}
             setChunkLen={(v) => s.set('chunkLength', v)}
             setLiveLatency={(v) => s.set('liveLatency', v)}
             setProgRefine={(v) => s.set('progressiveRefinement', v)}
-            setVad={(v) => s.set('vad', v)}
+            setVadEnabled={(v) => s.set('vadEnabled', v)}
+            setVadThreshold={(v) => s.set('vadThreshold', v ?? 0.5)}
+            setVadConsecutive={(v) => s.set('vadConsecutive', v ?? 3)}
+            setVadHangoverMs={(v) => s.set('vadHangoverMs', v ?? 500)}
+            setVadPadMinGap={(v) => s.set('vadPadMinGapMs', v ?? 400)}
+            setVadPadDuration={(v) => s.set('vadPadDurationMs', v ?? 250)}
+            setHpfHz={(v) => s.set('hpfHz', v ?? 100)}
+            setNoiseSuppression={(v) => s.set('noiseSuppression', v)}
             ChevIcon={ChevIcon}
           />
         )}
@@ -596,7 +622,6 @@ function SourcePane({
   micBusy,
   recordElapsed,
   startMic,
-  vadEnabled,
 }: {
   mode: InputMode
   onModeChange: (m: InputMode) => void
@@ -613,7 +638,6 @@ function SourcePane({
   micBusy: boolean
   recordElapsed: number
   startMic: () => Promise<void>
-  vadEnabled: boolean
 }) {
   return (
     <div>
@@ -695,8 +719,7 @@ function SourcePane({
             <span className="mic__status">
               {mic.state === 'idle' && 'READY'}
               {mic.state === 'starting' && 'CONNECTING'}
-              {mic.state === 'recording' &&
-                (vadEnabled ? (mic.voiceActive ? 'SPEAKING' : 'LISTENING') : 'RECORDING')}
+              {mic.state === 'recording' && 'RECORDING'}
               {mic.state === 'stopping' && 'FINALIZING'}
               {mic.state === 'error' && 'ERROR'}
             </span>
@@ -823,13 +846,27 @@ function EnginePane({
   chunkLength,
   liveLatency,
   progressiveRefinement,
-  vad,
+  vadEnabled,
+  vadThreshold,
+  vadConsecutive,
+  vadHangoverMs,
+  vadPadMinGapMs,
+  vadPadDurationMs,
+  hpfHz,
+  noiseSuppression,
   setLong,
   setBatch,
   setChunkLen,
   setLiveLatency,
   setProgRefine,
-  setVad,
+  setVadEnabled,
+  setVadThreshold,
+  setVadConsecutive,
+  setVadHangoverMs,
+  setVadPadMinGap,
+  setVadPadDuration,
+  setHpfHz,
+  setNoiseSuppression,
   ChevIcon,
 }: {
   strategy: Strategy
@@ -842,13 +879,27 @@ function EnginePane({
   chunkLength: number | null
   liveLatency: boolean
   progressiveRefinement: boolean
-  vad: boolean
+  vadEnabled: boolean
+  vadThreshold: number | null
+  vadConsecutive: number | null
+  vadHangoverMs: number | null
+  vadPadMinGapMs: number | null
+  vadPadDurationMs: number | null
+  hpfHz: number | null
+  noiseSuppression: boolean
   setLong: (v: number | null) => void
   setBatch: (v: number | null) => void
   setChunkLen: (v: number | null) => void
   setLiveLatency: (v: boolean) => void
   setProgRefine: (v: boolean) => void
-  setVad: (v: boolean) => void
+  setVadEnabled: (v: boolean) => void
+  setVadThreshold: (v: number | null) => void
+  setVadConsecutive: (v: number | null) => void
+  setVadHangoverMs: (v: number | null) => void
+  setVadPadMinGap: (v: number | null) => void
+  setVadPadDuration: (v: number | null) => void
+  setHpfHz: (v: number | null) => void
+  setNoiseSuppression: (v: boolean) => void
   ChevIcon: React.FC<{ up: boolean }>
 }) {
   return (
@@ -892,7 +943,17 @@ function EnginePane({
             <NumKv k="chunk_length" v={chunkLength} placeholder={30} suffix="s" onSet={setChunkLen} />
             <ToggleKv k="live_latency" v={liveLatency} onSet={setLiveLatency} />
             <ToggleKv k="progressive_refinement" v={progressiveRefinement} onSet={setProgRefine} />
-            <ToggleKv k="vad (mic only)" v={vad} onSet={setVad} />
+
+            <div className="sb__adv-divider" />
+
+            <ToggleKv k="vad_enabled" v={vadEnabled} onSet={setVadEnabled} />
+            <NumKv k="vad_threshold" v={vadThreshold} placeholder={0.5} step={0.05} onSet={setVadThreshold} />
+            <NumKv k="vad_consecutive" v={vadConsecutive} placeholder={3} onSet={setVadConsecutive} />
+            <NumKv k="vad_hangover_ms" v={vadHangoverMs} placeholder={500} suffix="ms" onSet={setVadHangoverMs} />
+            <NumKv k="vad_pad_min_gap_ms" v={vadPadMinGapMs} placeholder={400} suffix="ms" onSet={setVadPadMinGap} />
+            <NumKv k="vad_pad_duration_ms" v={vadPadDurationMs} placeholder={250} suffix="ms" onSet={setVadPadDuration} />
+            <NumKv k="hpf_hz" v={hpfHz} placeholder={100} suffix="Hz" onSet={setHpfHz} />
+            <ToggleKv k="noise_suppression (browser)" v={noiseSuppression} onSet={setNoiseSuppression} />
           </div>
         )}
       </div>
@@ -905,12 +966,14 @@ function NumKv({
   v,
   placeholder,
   suffix,
+  step,
   onSet,
 }: {
   k: string
   v: number | null
   placeholder: number
   suffix?: string
+  step?: number
   onSet: (v: number | null) => void
 }) {
   return (
@@ -920,6 +983,7 @@ function NumKv({
         type="number"
         value={v ?? ''}
         placeholder={`${placeholder}${suffix ?? ''}`}
+        step={step ?? 1}
         onChange={(e) => onSet(e.target.value === '' ? null : Number(e.target.value))}
         className="sb__kv-v"
         style={{ background: 'transparent' }}

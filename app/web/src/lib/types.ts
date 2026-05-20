@@ -85,6 +85,16 @@ export interface WSConfig {
   live_latency?: boolean
   progressive_refinement?: boolean
   early_buffer_target_s?: number
+
+  // VAD + noise knobs (server falls back to env defaults if absent).
+  vad_enabled?: boolean
+  vad_threshold?: number
+  vad_consecutive?: number
+  vad_hangover_ms?: number
+  vad_pad_min_gap_ms?: number
+  vad_pad_duration_ms?: number
+  /** ffmpeg `highpass=f=N`. 0 = disabled. */
+  hpf_hz?: number
 }
 
 /** Mid-stream batch of newly committed segments. Words for just those

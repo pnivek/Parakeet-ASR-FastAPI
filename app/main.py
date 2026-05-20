@@ -346,6 +346,23 @@ except Exception as e:
         exc_info=True
     )
 
+# Silero VAD — loaded once at module init. Used by handle_streaming_pcm to
+# drop silent windows before they hit the engine queue. The model is a small
+# stateful PyTorch jit; we call .reset_states() per WS session. Failure to
+# load is non-fatal — VAD just stays off and the pipeline behaves like
+# pre-VAD.
+silero_vad_model: Optional[object] = None
+try:
+    from silero_vad import load_silero_vad  # type: ignore[import-untyped]
+    silero_vad_model = load_silero_vad(onnx=False)
+    logger.info("Silero VAD model loaded successfully (PyTorch jit, runs CPU).")
+except Exception as e_vad_load:
+    silero_vad_model = None
+    logger.warning(
+        f"Silero VAD unavailable ({e_vad_load!r}); streaming pipeline will not "
+        f"gate silence. Set vad_enabled=false on the client to suppress the warning per request."
+    )
+
 # Asynchronous lock to ensure exclusive access to the ASR model during transcription calls.
 # This prevents concurrent modifications to model state (e.g., device, dtype, attention settings).
 model_access_lock = asyncio.Lock()
@@ -719,6 +736,31 @@ def parse_websocket_config(client_cfg: dict) -> dict:
     # sample_rate and bytes_per_sample are noted but primarily used by ffmpeg or initial processing;
     # the ASR model itself expects MODEL_SAMPLE_RATE mono.
 
+    # VAD + HPF knobs (range validation; types already coerced by the
+    # generic forwarder above). Use sentinel `_UNSET` so callers omitting
+    # a field fall through to defaults inside _build_vad_state.
+    if 'vad_threshold' in asr_config:
+        v = float(asr_config['vad_threshold'])
+        if not (0.0 <= v <= 1.0):
+            raise ValueError('vad_threshold must be in [0, 1].')
+        asr_config['vad_threshold'] = v
+    if 'vad_consecutive' in asr_config:
+        v_int = int(asr_config['vad_consecutive'])
+        if not (1 <= v_int <= 32):
+            raise ValueError('vad_consecutive must be in [1, 32].')
+        asr_config['vad_consecutive'] = v_int
+    for k in ('vad_hangover_ms', 'vad_pad_min_gap_ms', 'vad_pad_duration_ms'):
+        if k in asr_config:
+            v = float(asr_config[k])
+            if not (0 <= v <= 10_000):
+                raise ValueError(f'{k} must be in [0, 10000] ms.')
+            asr_config[k] = v
+    if 'hpf_hz' in asr_config:
+        v = float(asr_config['hpf_hz'])
+        if not (0 <= v <= 1000):
+            raise ValueError('hpf_hz must be in [0, 1000].')
+        asr_config['hpf_hz'] = v
+
     return asr_config
 
 
@@ -755,6 +797,149 @@ def _segments_to_words(segments: List[dict]) -> List[dict]:
     return out
 
 
+# Silero VAD operates on 32 ms (512-sample) frames at 16 kHz mono s16le.
+_VAD_FRAME_SAMPLES = 512
+_VAD_FRAME_BYTES = _VAD_FRAME_SAMPLES * 2  # int16 LE
+_VAD_FRAME_MS = 32.0
+_VAD_NOISE_AMPLITUDE = 1e-3  # ~-60 dBFS gaussian; protects TDT decoder timing
+
+
+def _build_vad_state(client_config: dict) -> dict:
+    """Build the per-session VAD state + config. If Silero is unavailable
+    or the client opted out, returns a state dict with `enabled=False` so
+    the producer can fast-path through it."""
+    enabled = bool(client_config.get('vad_enabled', True)) and silero_vad_model is not None
+    if enabled:
+        try:
+            silero_vad_model.reset_states()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    return {
+        'enabled': enabled,
+        'model': silero_vad_model,
+        'threshold': float(client_config.get('vad_threshold', 0.5)),
+        'consecutive': max(1, int(client_config.get('vad_consecutive', 3))),
+        'hangover_ms': float(client_config.get('vad_hangover_ms', 500)),
+        'pad_min_gap_ms': float(client_config.get('vad_pad_min_gap_ms', 400)),
+        'pad_duration_ms': float(client_config.get('vad_pad_duration_ms', 250)),
+        # Mutable state
+        'mode': 'silent',           # 'silent' | 'speech'
+        'consec': 0,                # consecutive loud frames toward N-of-consecutive
+        'pending': bytearray(),     # candidate frames pre-confirmation
+        'silent_run_ms': 0.0,       # ms of pure silent since last speech
+        'last_speech_ms': 0.0,      # cumulative engine ms at last loud frame (hangover)
+        'engine_ms': 0.0,           # engine-clock ms (only counts forwarded audio)
+        'in_buf': bytearray(),      # incoming bytes pending 32 ms frame alignment
+        # Stats for end-of-session logging
+        'dropped_frames': 0,
+        'speech_frames': 0,
+        'padded_ms': 0.0,
+    }
+
+
+def _vad_filter(pcm_bytes: bytes, st: dict) -> bytes:
+    """Run Silero on incoming PCM, return the speech-only subset.
+
+    Maintains a small state machine across frames:
+      - silent → speech requires N consecutive frames above threshold
+        (defeats single-frame spikes — car horns, taps, plosives).
+      - Pending frames are buffered during the wait and flushed once
+        confirmed, so the first 96 ms of an utterance isn't dropped.
+      - In speech mode, every below-threshold frame extends the hangover
+        window. Once `engine_ms - last_speech_ms > hangover_ms`, drop to
+        silent.
+      - When silent→speech confirms and the prior silent run exceeded
+        `pad_min_gap_ms`, inject `pad_duration_ms` of low-noise PCM so the
+        TDT decoder doesn't see an instant cliff into speech.
+
+    Bytes returned should be appended to the engine's PCM accumulator.
+    Timestamps emitted by the engine are on the speech-only timeline; we
+    do not currently translate back to wall-clock (the FULL refinement
+    pass at EOF carries authoritative timings for the refined output).
+    """
+    if not st['enabled']:
+        st['engine_ms'] += (len(pcm_bytes) / 2) / 16.0  # 16 samples/ms @ 16 kHz
+        return pcm_bytes
+
+    st['in_buf'].extend(pcm_bytes)
+    out = bytearray()
+    model = st['model']
+    threshold = st['threshold']
+    consec_target = st['consecutive']
+    hangover_ms = st['hangover_ms']
+    pad_min = st['pad_min_gap_ms']
+    pad_dur = st['pad_duration_ms']
+
+    while len(st['in_buf']) >= _VAD_FRAME_BYTES:
+        frame_bytes = bytes(st['in_buf'][:_VAD_FRAME_BYTES])
+        del st['in_buf'][:_VAD_FRAME_BYTES]
+
+        samples_np = np.frombuffer(frame_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        samples_t = torch.from_numpy(samples_np)
+        try:
+            with torch.no_grad():
+                prob = float(model(samples_t, 16000).item())  # type: ignore[misc]
+        except Exception:
+            # If VAD inference fails on any frame, fall back to forwarding it.
+            out.extend(frame_bytes)
+            st['engine_ms'] += _VAD_FRAME_MS
+            continue
+        is_loud = prob >= threshold
+
+        if st['mode'] == 'silent':
+            if is_loud:
+                st['consec'] += 1
+                st['pending'].extend(frame_bytes)
+                if st['consec'] >= consec_target:
+                    # Confirmed speech. Optionally pre-pad if the prior gap
+                    # was long enough; protects the TDT decoder's blank-
+                    # token timing assumptions.
+                    if st['silent_run_ms'] >= pad_min and pad_dur > 0:
+                        pad_n = int(pad_dur * 16)  # 16 samples/ms @ 16 kHz
+                        pad_pcm = (
+                            np.random.randn(pad_n) * _VAD_NOISE_AMPLITUDE * 32768.0
+                        ).astype(np.int16).tobytes()
+                        out.extend(pad_pcm)
+                        st['engine_ms'] += pad_dur
+                        st['padded_ms'] += pad_dur
+                    # Flush the pending speech frames.
+                    pending_ms = (len(st['pending']) / 2) / 16.0
+                    out.extend(st['pending'])
+                    st['engine_ms'] += pending_ms
+                    st['pending'].clear()
+                    st['mode'] = 'speech'
+                    st['consec'] = 0
+                    st['silent_run_ms'] = 0.0
+                    st['last_speech_ms'] = st['engine_ms']
+                    st['speech_frames'] += 1
+                else:
+                    # Still pending. Frame stays buffered, gap clock advances
+                    # (treated as silent until confirmed).
+                    st['silent_run_ms'] += _VAD_FRAME_MS
+                    st['dropped_frames'] += 1
+            else:
+                # Real silent frame.
+                st['consec'] = 0
+                st['pending'].clear()
+                st['silent_run_ms'] += _VAD_FRAME_MS
+                st['dropped_frames'] += 1
+        else:  # mode == 'speech'
+            # Always forward in speech mode. Hangover decides when to flip
+            # back to silent.
+            out.extend(frame_bytes)
+            st['engine_ms'] += _VAD_FRAME_MS
+            st['speech_frames'] += 1
+            if is_loud:
+                st['last_speech_ms'] = st['engine_ms']
+            elif st['engine_ms'] - st['last_speech_ms'] > hangover_ms:
+                # Drop back to silent — done with this utterance.
+                st['mode'] = 'silent'
+                st['consec'] = 0
+                st['silent_run_ms'] = 0.0
+
+    return bytes(out)
+
+
 async def handle_streaming_pcm(
     websocket: WebSocket,
     session_id: str,
@@ -784,6 +969,20 @@ async def handle_streaming_pcm(
                        chunk_length, overlap, batch_size, format, etc.
     """
     sent_segments_pcm: List[dict] = []  # all segments sent to client, for final aggregation
+
+    # Per-session VAD state. Disabled gracefully if Silero isn't loaded or
+    # the client opted out. See _vad_filter for the actual gating logic.
+    vad_state = _build_vad_state(client_config)
+    if vad_state['enabled']:
+        logger.info(
+            f"({session_id}) Stream: VAD enabled "
+            f"(threshold={vad_state['threshold']:.2f}, "
+            f"consec={vad_state['consecutive']}, "
+            f"hangover={vad_state['hangover_ms']:g}ms, "
+            f"pad>{vad_state['pad_min_gap_ms']:g}ms→{vad_state['pad_duration_ms']:g}ms)."
+        )
+    else:
+        logger.info(f"({session_id}) Stream: VAD disabled.")
 
     live_latency = bool(client_config.get("live_latency", False))
 
@@ -859,9 +1058,16 @@ async def handle_streaming_pcm(
         # -acodec pcm_s16le : Output codec: PCM s16le
         # pipe:1 : Write output to stdout
         # -hide_banner -loglevel error : Reduce ffmpeg's console noise
+        # Optional high-pass filter to cut rumble/hum/DC before VAD + ASR see
+        # the signal. Pulled from client config; 0 (or unset) disables.
+        hpf_hz = float(client_config.get('hpf_hz', 0) or 0)
+        af_args: List[str] = []
+        if hpf_hz > 0:
+            af_args = ['-af', f'highpass=f={hpf_hz:g}']
         ffmpeg_command = [
             'ffmpeg', '-hide_banner', '-loglevel', 'error',
             '-i', 'pipe:0',  # Input from stdin
+            *af_args,        # Optional audio filter chain (e.g. highpass)
             '-f', 's16le',   # Output format: signed 16-bit PCM
             '-ac', '1',      # Output channels: mono
             '-ar', str(MODEL_SAMPLE_RATE), # Output sample rate
@@ -963,10 +1169,18 @@ async def handle_streaming_pcm(
                         logger.info(f"({session_id}) Read ffmpeg: EOF received from ffmpeg stdout. Stream finished.")
                         break # ffmpeg closed its stdout, indicating end of conversion
                     
-                    pcm_buffer_for_asr_chunks.extend(pcm_data_from_ffmpeg)
-                    temp_total_pcm_bytes_read_from_ffmpeg += len(pcm_data_from_ffmpeg)
+                    # refinement_pcm_accumulator keeps the ORIGINAL ffmpeg
+                    # output (with silence) so the final FULL pass at EOF can
+                    # produce authoritative wall-clock timestamps.
                     if refinement_pcm_accumulator is not None:
                         refinement_pcm_accumulator.extend(pcm_data_from_ffmpeg)
+
+                    # Run VAD layer (no-op when disabled). Returns only
+                    # speech-confirmed bytes; silent windows are dropped so
+                    # the engine queue stays drained.
+                    speech_only_pcm = _vad_filter(pcm_data_from_ffmpeg, vad_state)
+                    pcm_buffer_for_asr_chunks.extend(speech_only_pcm)
+                    temp_total_pcm_bytes_read_from_ffmpeg += len(speech_only_pcm)
                     
                     chunks_created_this_read_cycle = 0
                     # Create as many full ASR chunks as possible from the current buffer
@@ -1016,6 +1230,17 @@ async def handle_streaming_pcm(
                                                            (target_pcm_sample_rate * target_pcm_bytes_per_sample)
                 logger.info(f"({session_id}) Read ffmpeg: Total raw PCM bytes read from ffmpeg: {temp_total_pcm_bytes_read_from_ffmpeg}B "
                             f"({total_duration_processed_seconds_for_asr:.2f}s of audio).")
+                if vad_state['enabled']:
+                    total_frames = vad_state['speech_frames'] + vad_state['dropped_frames']
+                    if total_frames > 0:
+                        speech_pct = 100.0 * vad_state['speech_frames'] / total_frames
+                        logger.info(
+                            f"({session_id}) Stream: VAD summary — "
+                            f"{vad_state['speech_frames']}/{total_frames} frames forwarded "
+                            f"({speech_pct:.1f}% speech, "
+                            f"{vad_state['dropped_frames'] * _VAD_FRAME_MS / 1000:.2f}s of silence dropped, "
+                            f"{vad_state['padded_ms'] / 1000:.2f}s of low-noise padding injected)."
+                        )
         try:
             # Run stdin feeder and stdout reader concurrently
             feed_task = asyncio.create_task(feed_ffmpeg_stdin())

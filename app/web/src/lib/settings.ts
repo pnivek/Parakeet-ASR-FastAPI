@@ -2,8 +2,9 @@
  * Persisted client settings. Zustand store + the `persist` middleware writes
  * to localStorage so user choices survive reloads.
  *
- * Keep all knobs the server accepts in one place — keys match the server
- * field names verbatim so `settings → PostParams` is a trivial spread.
+ * Keep all knobs the server accepts in one place — keys map to the server's
+ * WS / REST field names verbatim so `settings → PostParams / WSConfig` is a
+ * trivial spread.
  */
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
@@ -16,7 +17,7 @@ export interface Settings {
   responseFormat: ResponseFormat
   timestampGranularities: TimestampGranularity[]
 
-  // Server-extension knobs (query string)
+  // Server-extension knobs (REST query string / WS config field)
   strategy: Strategy
   chunkLength: number | null
   chunkOverlap: number | null
@@ -26,10 +27,23 @@ export interface Settings {
   // Progressive (WS) knobs
   liveLatency: boolean
   progressiveRefinement: boolean
-  /** Client-side voice activity detection on the mic capture pipeline.
-   * When true, silent chunks aren't forwarded to the server, keeping the
-   * engine queue drained so real speech is processed immediately. */
-  vad: boolean
+
+  // Voice activity detection + noise (mic / WS path)
+  vadEnabled: boolean
+  /** Silero probability cutoff (0..1). Higher = pickier. */
+  vadThreshold: number
+  /** Frames of sustained speech required to flip silent → speech. */
+  vadConsecutive: number
+  /** Hangover (ms) — keep forwarding for this long after last loud frame. */
+  vadHangoverMs: number
+  /** Pre-utterance padding fires only when prior silence exceeded this. */
+  vadPadMinGapMs: number
+  /** Length of the low-noise padding injected at speech onset. */
+  vadPadDurationMs: number
+  /** ffmpeg `highpass=f=N`. Set 0 to disable. */
+  hpfHz: number
+  /** Forwarded to `getUserMedia({ audio: { noiseSuppression } })`. */
+  noiseSuppression: boolean
 
   // UI
   theme: ThemeMode
@@ -47,16 +61,18 @@ const DEFAULTS: Omit<Settings, 'set' | 'reset'> = {
   chunkOverlap: null,
   batchSize: null,
   longAudioThreshold: null,
-  // Use the 10-2-2 streaming preset by default — ~6 s emission lag vs
-  // ~7.5 s for 10-10-5. The quality regression at chunk boundaries is
-  // small enough that the snappier default is the right tradeoff for an
-  // interactive playground.
   liveLatency: true,
-  vad: true,
-  // Default off — refinement runs an extra FULL pass at EOF which adds
-  // latency on long recordings. Users who want offline-quality final
-  // output can opt in.
   progressiveRefinement: false,
+
+  vadEnabled: true,
+  vadThreshold: 0.5,
+  vadConsecutive: 3,
+  vadHangoverMs: 500,
+  vadPadMinGapMs: 400,
+  vadPadDurationMs: 250,
+  hpfHz: 100,
+  noiseSuppression: true,
+
   theme: 'system',
 }
 
@@ -67,6 +83,12 @@ export const useSettings = create<Settings>()(
       set: (key, value) => set({ [key]: value } as Partial<Settings>),
       reset: () => set(DEFAULTS),
     }),
-    { name: 'parakeet-settings' },
+    {
+      name: 'parakeet-settings',
+      // When the persisted shape lacks newly-added fields (e.g. user
+      // hasn't reset since we added vadThreshold), merge DEFAULTS in so
+      // those knobs get sensible values without forcing a reset.
+      merge: (persisted, current) => ({ ...current, ...(persisted as Partial<Settings>) }),
+    },
   ),
 )

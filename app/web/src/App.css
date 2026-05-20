@@ -889,6 +889,11 @@ body {
   flex-direction: column;
   gap: 9px;
 }
+.sb__adv-divider {
+  height: 1px;
+  background: var(--rule);
+  margin: 4px 0 2px;
+}
 .sb__kv {
   display: grid;
   grid-template-columns: 1fr auto;

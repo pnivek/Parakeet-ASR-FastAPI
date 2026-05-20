@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, Fragment } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import type { TranscriptionResponse } from '../lib/api'
 import type { VerboseJsonResponse, WhisperSegment } from '../lib/types'
 import { play, seek } from '../lib/playback'
@@ -145,6 +145,103 @@ function VerboseBody({
 
 // ── Plain text view with reveal animation ─────────────────────────
 const WORD_FADE_MS = 380
+/**
+ * Only the trailing N words run the arrival reveal animation. Earlier
+ * words go straight to the static "color by playback position" render
+ * path — which is what they'd land on anyway after their fade completes.
+ * Capping the animated window keeps the re-render hot loop O(N), not
+ * O(total words).
+ */
+const ANIMATED_TAIL = 40
+
+/** Static (or finished-fading) word. Memoized: only re-renders when its
+ * own props change. The Map of arrivals reference doesn't matter here
+ * because static words never read it. */
+const StaticWord = memo(function StaticWord({
+  word,
+  start,
+  active,
+  past,
+  isLast,
+}: {
+  word: string
+  start: number
+  active: boolean
+  past: boolean
+  isLast: boolean
+}) {
+  const color = active ? 'var(--accent)' : past ? 'var(--fg)' : 'var(--muted)'
+  return (
+    <>
+      <span
+        className="editorial-word"
+        onClick={() => {
+          seek(start)
+          play()
+        }}
+        style={{ color }}
+      >
+        {word}
+        {active && <span className="editorial-word__under" />}
+      </span>
+      {!isLast && ' '}
+    </>
+  )
+})
+
+/** Word that's currently mid-fade. Reads `now` so it re-renders each rAF
+ * tick — but only the last ANIMATED_TAIL of them ever take this path. */
+function AnimatingWord({
+  word,
+  start,
+  active,
+  past,
+  arrivedAt,
+  now,
+  isLast,
+}: {
+  word: string
+  start: number
+  active: boolean
+  past: boolean
+  arrivedAt: number | undefined
+  now: number
+  isLast: boolean
+}) {
+  const color = active ? 'var(--accent)' : past ? 'var(--fg)' : 'var(--muted)'
+  let revealStyle: React.CSSProperties = { color }
+  if (arrivedAt !== undefined) {
+    const raw = Math.max(0, Math.min(1, (now - arrivedAt) / WORD_FADE_MS))
+    const eased = raw * raw * (3 - 2 * raw)
+    if (eased < 1) {
+      revealStyle = {
+        color,
+        opacity: eased,
+        filter: `blur(${(1 - eased) * 2.2}px)`,
+        transform: `translateY(${(1 - eased) * 3}px)`,
+        willChange: 'opacity, filter, transform',
+      }
+    }
+  } else {
+    revealStyle = { ...revealStyle, opacity: 0 }
+  }
+  return (
+    <>
+      <span
+        className="editorial-word"
+        onClick={() => {
+          seek(start)
+          play()
+        }}
+        style={revealStyle}
+      >
+        {word}
+        {active && <span className="editorial-word__under" />}
+      </span>
+      {!isLast && ' '}
+    </>
+  )
+}
 
 function PlainText({
   body,
@@ -162,8 +259,11 @@ function PlainText({
   /** Per-word-index arrival timestamps for the live reveal. */
   wordArrivals: Map<number, number>
 }) {
-  const [now, setNow] = useState(() => (typeof performance !== 'undefined' ? performance.now() : 0))
-  // While anything is still mid-fade, drive a rAF tick to advance it.
+  const [now, setNow] = useState(() =>
+    typeof performance !== 'undefined' ? performance.now() : 0,
+  )
+  // rAF tick to advance the fade — only spins while at least one word is
+  // mid-fade. Stops itself once everything is settled.
   useEffect(() => {
     if (!live) return
     let raf = 0
@@ -186,71 +286,40 @@ function PlainText({
   if (!body.words || body.words.length === 0) {
     return <div className="editorial-body">{body.text}</div>
   }
+  const words = body.words
+  const total = words.length
+  // Cap the animation window: only the last ANIMATED_TAIL words can be
+  // mid-fade. Anything older is rendered statically + memoized.
+  const tailStart = live ? Math.max(0, total - ANIMATED_TAIL) : total
   return (
     <div className="editorial-body">
-      {body.words.map((w, i) => {
+      {words.map((w, i) => {
         const active = i === activeWordIdx
         const past = i < activeWordIdx
-        const color = active ? 'var(--accent)' : past ? 'var(--fg)' : 'var(--muted)'
-
-        // Static result — no reveal; just colour by playback position.
-        if (!live) {
+        const isLast = i === total - 1
+        if (i < tailStart) {
           return (
-            <Fragment key={`${i}-${w.start}`}>
-              <span
-                className="editorial-word"
-                onClick={() => {
-                  seek(w.start)
-                  play()
-                }}
-                style={{ color }}
-              >
-                {w.word}
-                {active && <span className="editorial-word__under" />}
-              </span>
-              {i < body.words!.length - 1 && ' '}
-            </Fragment>
+            <StaticWord
+              key={`${i}-${w.start}`}
+              word={w.word}
+              start={w.start}
+              active={active}
+              past={past}
+              isLast={isLast}
+            />
           )
         }
-
-        // Live / streaming — arrival-based smoothstep fade. The word
-        // becomes visible WHEN IT'S RECEIVED, not when the audio crosses
-        // its start time. This matters for live mic (audio not playing) +
-        // file-progressive (audio may not be playing yet).
-        const arrivedAt = wordArrivals.get(i)
-        let revealStyle: React.CSSProperties = { color }
-        if (arrivedAt !== undefined) {
-          const raw = Math.max(0, Math.min(1, (now - arrivedAt) / WORD_FADE_MS))
-          const eased = raw * raw * (3 - 2 * raw)
-          if (eased < 1) {
-            revealStyle = {
-              color,
-              opacity: eased,
-              filter: `blur(${(1 - eased) * 2.2}px)`,
-              transform: `translateY(${(1 - eased) * 3}px)`,
-              willChange: 'opacity, filter, transform',
-            }
-          }
-        } else {
-          // No arrival yet — keep invisible (shouldn't happen in practice
-          // since handlePartial stamps every word on observation).
-          revealStyle = { ...revealStyle, opacity: 0 }
-        }
         return (
-          <Fragment key={`${i}-${w.start}`}>
-            <span
-              className="editorial-word"
-              onClick={() => {
-                seek(w.start)
-                play()
-              }}
-              style={revealStyle}
-            >
-              {w.word}
-              {active && <span className="editorial-word__under" />}
-            </span>
-            {i < body.words!.length - 1 && ' '}
-          </Fragment>
+          <AnimatingWord
+            key={`${i}-${w.start}`}
+            word={w.word}
+            start={w.start}
+            active={active}
+            past={past}
+            arrivedAt={wordArrivals.get(i)}
+            now={now}
+            isLast={isLast}
+          />
         )
       })}
     </div>

@@ -3,17 +3,26 @@
  * the right. Theme switching isn't here in Maison — the warm graphite
  * palette is the only look.
  */
-const ParakeetLogo = () => (
-  <svg viewBox="0 0 32 32" width={22} height={22} fill="none" aria-hidden>
+
+const MicLogo = ({ size = 34 }: { size?: number }) => (
+  <svg viewBox="0 0 32 32" width={size} height={size} fill="none" aria-hidden>
     <defs>
       <linearGradient id="pk-logo-grad" x1="0" y1="0" x2="1" y2="1">
         <stop offset="0%" stopColor="oklch(0.78 0.13 55)" />
         <stop offset="100%" stopColor="oklch(0.8 0.085 80)" />
       </linearGradient>
     </defs>
-    <circle cx="16" cy="16" r="14" fill="url(#pk-logo-grad)" />
-    <circle cx="16" cy="16" r="3.5" fill="white" />
-    <circle cx="16" cy="16" r="1.4" fill="oklch(0.13 0.012 60)" />
+    {/* Pill background with the brand gradient */}
+    <rect x="0" y="0" width="32" height="32" rx="9" fill="url(#pk-logo-grad)" />
+    {/* Subtle inner highlight along the top edge */}
+    <rect x="0.5" y="0.5" width="31" height="31" rx="8.5" fill="none" stroke="rgba(255,255,255,0.25)" />
+    {/* Microphone glyph, rendered in the page bg color so it pops on the gradient */}
+    <g stroke="oklch(0.13 0.012 60)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" fill="none">
+      <rect x="12.5" y="7" width="7" height="11" rx="3.5" fill="oklch(0.13 0.012 60)" stroke="none" />
+      <path d="M9 14.5 a7 7 0 0 0 14 0" />
+      <line x1="16" y1="21.5" x2="16" y2="25" />
+      <line x1="12.5" y1="25" x2="19.5" y2="25" />
+    </g>
   </svg>
 )
 
@@ -21,8 +30,8 @@ export function Header() {
   return (
     <header className="header">
       <div className="header__brand">
-        <ParakeetLogo />
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+        <MicLogo />
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
           <span className="header__name">Parakeet</span>
           <span className="header__sub">playground</span>
         </div>

@@ -205,19 +205,19 @@ body {
 .header__brand {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 16px;
   min-width: 0;
 }
 .header__name {
   font-weight: 500;
-  font-size: 14px;
-  letter-spacing: 0.4px;
+  font-size: 17px;
+  letter-spacing: 0.5px;
   text-transform: uppercase;
 }
 .header__sub {
   font-family: var(--font-serif);
   font-style: italic;
-  font-size: 16px;
+  font-size: 22px;
   color: var(--muted);
 }
 .header__chip {

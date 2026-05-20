@@ -131,19 +131,35 @@ The cost of doing it right is throughput: ~65× RTFx for chunked vs. ~170× RTFx
 
 ---
 
-## Local attention above 8 minutes — off-spec but supported
+## Local attention above 8 minutes — where this comes from
 
 Between 8 and 24 minutes, before we run FULL, the server calls:
 
 ```python
 asr_model.change_attention_model("rel_pos_local_attn", [256, 256], True)
+asr_model.change_subsampling_conv_chunking_factor(1)
 ```
 
-That switches the encoder from `rel_pos` (full attention) to `rel_pos_local_attn` with 256-frame left and right context (256 × 80 ms ≈ 20.5 s on each side). This is a NeMo runtime feature, not part of the model's training regime. The threshold is configurable via `LONG_AUDIO_THRESHOLD` (env, default 480 s).
+That switches the encoder from `rel_pos` (full attention) to `rel_pos_local_attn` with a 256-frame left and right context window (256 × 80 ms ≈ 20.5 s on each side).
 
-**This is unofficial.** NVIDIA's model card does not mention local attention; the model was trained with full attention only. We use it because it lets FULL keep working between 8 and 24 minutes without OOMs on long buffers, and it's what NVIDIA's own HF Space does. Expect a small but real quality regression vs. true full attention on the same audio.
+**Origin**: this is a direct mirror of NVIDIA's official HuggingFace Space for the same model. Their [`app.py`](https://huggingface.co/spaces/nvidia/parakeet-tdt-0.6b-v2/blob/main/app.py) contains the exact same threshold and arguments:
 
-`chunked` and `progressive` also use this switch internally for their per-chunk encoder calls when the *original* file duration exceeds the threshold — same reasoning.
+```python
+# NVIDIA's app.py
+if duration_sec > 480 : # 8 minutes
+    gr.Info("Audio longer than 8 minutes. Applying optimized settings for long transcription.")
+    model.change_attention_model("rel_pos_local_attn", [256,256])
+    model.change_subsampling_conv_chunking_factor(1)  # 1 = auto select
+```
+
+**Is it strictly required?** No. The model still runs with full attention until either (a) you exceed the 24-min trained ceiling, or (b) the encoder OOMs on your GPU. The 480 s threshold is a conservative safety margin NVIDIA chose for their reference demo. They don't document why; the inline comment is the only justification (`# 8 minutes`).
+
+**Why this matters practically**: 480 s is **GPU-dependent**. On modest GPUs the encoder will OOM somewhere between 8 and 24 minutes of audio if you don't switch to local attention. On an H100 or A100 80 GB you could probably run FULL on the entire 24-min window without issue. We expose `LONG_AUDIO_THRESHOLD` as an env var so deployments can tune the cutoff to their hardware — NVIDIA hard-codes 480 because their Space doesn't know what's hosting it.
+
+**Caveats**:
+- The model card doesn't mention local attention at all — the model was *trained* with full attention only. Local attention is a NeMo runtime feature inherited from FastConformer.
+- Expect a small but real quality regression on the local-attention portion of the audio vs. true full attention.
+- `chunked` and `progressive` also call this switch when the *original* file duration exceeds the threshold — their per-chunk encoder calls inherit the long-audio attention mode for the whole session.
 
 ---
 
@@ -183,7 +199,7 @@ All optional. Defaults shown.
 |---|---:|---|
 | `DEFAULT_STRATEGY` | `auto` | What `?strategy=auto` resolves to. |
 | `MAX_FULL_WAVEFORM_S` | `1440` (24 min) | Hard cap for `full`. Above this, `full` errors or auto-falls-back to `chunked`. |
-| `LONG_AUDIO_THRESHOLD` | `480` (8 min) | Above this duration, the encoder is switched to `rel_pos_local_attn` for the session. |
+| `LONG_AUDIO_THRESHOLD` | `480` (8 min) | Above this duration, the encoder is switched to `rel_pos_local_attn` for the session. **GPU-dependent**: NVIDIA's value chosen to be safe across hardware; raise on big-memory GPUs, lower on small ones. See [Local attention above 8 minutes](#local-attention-above-8-minutes--where-this-comes-from). |
 | `STREAMING_LEFT_CONTEXT_S` | `10` | Left context for the offline-like preset. |
 | `STREAMING_CHUNK_S` | `10` | Chunk length for the offline-like preset. |
 | `STREAMING_RIGHT_CONTEXT_S` | `5` | Right context for the offline-like preset. |
@@ -263,6 +279,9 @@ Statistical noise. We're at the model's accuracy floor on a small test set; the 
 **My audio is 30 minutes. What happens?**
 `auto` → `chunked` handles it. `full` would error (above the 24-min cap). The server logs the dispatch decision with the resolved strategy.
 
+**Why does the long-audio switch fire at 8 minutes? Is that a model requirement?**
+No — it's NVIDIA's chosen safety margin in their reference demo. We copied the threshold and the `[256, 256]` context window from their HuggingFace Space verbatim. The exact value isn't sacred; it's "low enough to keep most GPUs from OOMing in the FULL pass." On a beefy GPU (A100/H100 80 GB) you can comfortably raise it; on a smaller GPU you may need to lower it. Tune via the `LONG_AUDIO_THRESHOLD` env var.
+
 **What if I want sub-second latency?**
 You need a different checkpoint. The architectural floor for `parakeet-tdt-0.6b-v2` is ~6 s with the 10-2-2 preset. Look at [`parakeet_realtime_eou_120m-v1`](https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1) or [`nemotron-speech-streaming-en-0.6b`](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b).
 
@@ -271,6 +290,7 @@ You need a different checkpoint. The architectural floor for `parakeet-tdt-0.6b-
 ## References
 
 - [Parakeet TDT 0.6B V2 model card (NVIDIA)](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2)
+- [NVIDIA's official HuggingFace Space](https://huggingface.co/spaces/nvidia/parakeet-tdt-0.6b-v2) — source for the 480 s / `[256, 256]` long-audio pattern
 - [Parakeet docs in HuggingFace Transformers](https://huggingface.co/docs/transformers/en/model_doc/parakeet)
 - [NVIDIA NeMo](https://github.com/NVIDIA/NeMo) — the upstream library
 - [FastConformer paper](https://huggingface.co/papers/2305.05084)

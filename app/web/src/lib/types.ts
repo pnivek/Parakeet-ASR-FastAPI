@@ -87,16 +87,21 @@ export interface WSConfig {
   early_buffer_target_s?: number
 }
 
-/** Mid-stream batch of newly committed segments. */
+/** Mid-stream batch of newly committed segments. Words for just those
+ * segments are included (server-side interpolated from per-segment tokens). */
 export interface WSSegmentsBatch {
   type: 'segments_batch'
   segments: WhisperSegment[]
+  /** Word-level timestamps for the segments in this batch. */
+  words?: Word[]
 }
 
 /** Optional post-EOF full-pass replacement segments. */
 export interface WSRefinedTranscription {
   type: 'refined_transcription'
   segments: WhisperSegment[]
+  /** Word-level timestamps for the refined segments. */
+  words?: Word[]
   text: string
   transcription_time: number
   audio_duration_seconds: number
@@ -110,6 +115,8 @@ export interface WSFinalTranscription {
   duration: number
   text: string
   segments: WhisperSegment[]
+  /** Word-level timestamps across the whole stream. */
+  words?: Word[]
   strategy: Strategy
   transcription_time: number
   total_segments: number

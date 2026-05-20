@@ -281,6 +281,62 @@ export function connectLiveWS(config: WSConfig, callbacks: WSCallbacks): LiveWSH
   }
 }
 
+/**
+ * Stream a File over the unified WebSocket endpoint so the user gets
+ * partial transcriptions in real time, the same way `progressive` works
+ * for live mic. Chunks the file into ~64 KB binary frames and sends EOF
+ * (empty binary) when done. Returns a handle the caller can `abort()`.
+ */
+export function streamFileViaWS(
+  file: File,
+  config: WSConfig,
+  callbacks: WSCallbacks,
+): LiveWSHandle {
+  const handle = connectLiveWS(config, {
+    onMessage: callbacks.onMessage,
+    onError: callbacks.onError,
+    onClose: callbacks.onClose,
+    onOpen: () => {
+      callbacks.onOpen?.()
+      void pumpFile()
+    },
+  })
+  let aborted = false
+
+  async function pumpFile() {
+    const CHUNK_SIZE = 64 * 1024
+    const stream = file.stream()
+    const reader = stream.getReader()
+    try {
+      while (!aborted) {
+        const { value, done } = await reader.read()
+        if (done) break
+        // value is a Uint8Array; slice into CHUNK_SIZE pieces so individual
+        // WebSocket frames stay small enough to flush smoothly.
+        for (let i = 0; i < value.byteLength; i += CHUNK_SIZE) {
+          if (aborted) return
+          const slice = value.slice(i, Math.min(i + CHUNK_SIZE, value.byteLength))
+          handle.sendBinary(slice.buffer as ArrayBuffer)
+        }
+      }
+      if (!aborted) handle.finish()
+    } catch (err) {
+      console.warn('streamFileViaWS pump error:', err)
+      handle.abort()
+    } finally {
+      reader.releaseLock()
+    }
+  }
+
+  return {
+    ...handle,
+    abort() {
+      aborted = true
+      handle.abort()
+    },
+  }
+}
+
 /** Optional convenience for the health pane. */
 export async function fetchHealth(): Promise<HealthResponse> {
   const r = await fetch('/health')

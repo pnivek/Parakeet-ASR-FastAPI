@@ -15,6 +15,8 @@ interface Props {
   /** Map of segment.id → performance.now() at first observation. Drives the
    * fade-in of newly arrived segments during live streaming. */
   segmentArrivals: Map<number, number>
+  /** Map of word-index → arrival ms. Drives the text view's word reveal. */
+  wordArrivals: Map<number, number>
 }
 
 type View = 'text' | 'segments' | 'words' | 'raw'
@@ -29,7 +31,7 @@ const NULL_TIPS: Record<string, string> = {
   seek: 'Not populated for now.',
 }
 
-export function TranscriptSection({ result, filename, currentTime, live, segmentArrivals }: Props) {
+export function TranscriptSection({ result, filename, currentTime, live, segmentArrivals, wordArrivals }: Props) {
   const [view, setView] = useState<View>('text')
 
   if (!result) {
@@ -84,6 +86,7 @@ export function TranscriptSection({ result, filename, currentTime, live, segment
             filename={filename}
             live={live}
             segmentArrivals={segmentArrivals}
+            wordArrivals={wordArrivals}
           />
         )}
       </div>
@@ -98,6 +101,7 @@ function VerboseBody({
   filename,
   live,
   segmentArrivals,
+  wordArrivals,
 }: {
   body: VerboseJsonResponse
   view: View
@@ -105,6 +109,7 @@ function VerboseBody({
   filename: string
   live: boolean
   segmentArrivals: Map<number, number>
+  wordArrivals: Map<number, number>
 }) {
   const activeWordIdx = useMemo(() => {
     if (!body.words) return -1
@@ -117,7 +122,13 @@ function VerboseBody({
 
   if (view === 'text')
     return (
-      <PlainText body={body} currentTime={currentTime} activeWordIdx={activeWordIdx} live={live} />
+      <PlainText
+        body={body}
+        currentTime={currentTime}
+        activeWordIdx={activeWordIdx}
+        live={live}
+        wordArrivals={wordArrivals}
+      />
     )
   if (view === 'segments')
     return (
@@ -133,22 +144,45 @@ function VerboseBody({
 }
 
 // ── Plain text view with reveal animation ─────────────────────────
-const REVEAL_LEAD = 0.18 // start fading in this much before w.start (s)
-const REVEAL_FADE = 0.36 // fade duration (s)
+const WORD_FADE_MS = 380
 
 function PlainText({
   body,
-  currentTime,
+  currentTime: _currentTime,
   activeWordIdx,
   live,
+  wordArrivals,
 }: {
   body: VerboseJsonResponse
   currentTime: number
   activeWordIdx: number
   /** True only while transcripts are arriving mid-stream — drives the
-   * smoothstep fade-in. False for finalized file/URL results. */
+   * arrival-based fade-in. False for finalized results. */
   live: boolean
+  /** Per-word-index arrival timestamps for the live reveal. */
+  wordArrivals: Map<number, number>
 }) {
+  const [now, setNow] = useState(() => (typeof performance !== 'undefined' ? performance.now() : 0))
+  // While anything is still mid-fade, drive a rAF tick to advance it.
+  useEffect(() => {
+    if (!live) return
+    let raf = 0
+    const tick = () => {
+      const cur = performance.now()
+      setNow(cur)
+      let anim = false
+      for (const [, arrivedAt] of wordArrivals) {
+        if (cur - arrivedAt < WORD_FADE_MS) {
+          anim = true
+          break
+        }
+      }
+      if (anim) raf = requestAnimationFrame(tick)
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+  }, [live, wordArrivals, body.words?.length])
+
   if (!body.words || body.words.length === 0) {
     return <div className="editorial-body">{body.text}</div>
   }
@@ -179,13 +213,29 @@ function PlainText({
           )
         }
 
-        // Live / streaming — smoothstep fade-in starting `REVEAL_LEAD` before
-        // the word's start time, over `REVEAL_FADE` seconds. Tiny upward
-        // translate + blur dropoff while fading.
-        const reveal = w.start - REVEAL_LEAD
-        const dt = currentTime - reveal
-        const raw = dt <= 0 ? 0 : dt >= REVEAL_FADE ? 1 : dt / REVEAL_FADE
-        const eased = raw * raw * (3 - 2 * raw)
+        // Live / streaming — arrival-based smoothstep fade. The word
+        // becomes visible WHEN IT'S RECEIVED, not when the audio crosses
+        // its start time. This matters for live mic (audio not playing) +
+        // file-progressive (audio may not be playing yet).
+        const arrivedAt = wordArrivals.get(i)
+        let revealStyle: React.CSSProperties = { color }
+        if (arrivedAt !== undefined) {
+          const raw = Math.max(0, Math.min(1, (now - arrivedAt) / WORD_FADE_MS))
+          const eased = raw * raw * (3 - 2 * raw)
+          if (eased < 1) {
+            revealStyle = {
+              color,
+              opacity: eased,
+              filter: `blur(${(1 - eased) * 2.2}px)`,
+              transform: `translateY(${(1 - eased) * 3}px)`,
+              willChange: 'opacity, filter, transform',
+            }
+          }
+        } else {
+          // No arrival yet — keep invisible (shouldn't happen in practice
+          // since handlePartial stamps every word on observation).
+          revealStyle = { ...revealStyle, opacity: 0 }
+        }
         return (
           <Fragment key={`${i}-${w.start}`}>
             <span
@@ -194,13 +244,7 @@ function PlainText({
                 seek(w.start)
                 play()
               }}
-              style={{
-                color,
-                opacity: eased,
-                filter: eased < 1 ? `blur(${(1 - eased) * 2.2}px)` : 'none',
-                transform: eased < 1 ? `translateY(${(1 - eased) * 3}px)` : 'none',
-                willChange: eased < 1 ? 'opacity, filter, transform' : 'auto',
-              }}
+              style={revealStyle}
             >
               {w.word}
               {active && <span className="editorial-word__under" />}

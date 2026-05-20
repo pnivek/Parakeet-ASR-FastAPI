@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   postTranscription,
   postTranscriptionUrl,
+  streamFileViaWS,
   type TranscriptionResponse,
   connectLiveWS,
   type LiveWSHandle,
@@ -9,7 +10,7 @@ import {
 import { useSettings } from '../lib/settings'
 import { MIC_FORMAT_HINT, MIC_SAMPLE_RATE, MIC_MIME_TYPE, useMic } from '../lib/mic'
 import { formatBytes, formatTime } from '../lib/format'
-import type { ResponseFormat, Strategy, TimestampGranularity, WhisperSegment, WSMessage } from '../lib/types'
+import type { ResponseFormat, Strategy, TimestampGranularity, WhisperSegment, Word, WSMessage } from '../lib/types'
 import type { LoadedAudio } from '../lib/download'
 
 export type InputMode = 'file' | 'mic' | 'url'
@@ -26,6 +27,9 @@ interface Props {
   /** Called right before a new mic recording starts. Use to clear prior
    * result/loaded/peaks so the UI doesn't show the previous session. */
   onSessionStart?: () => void
+  /** Called early in a streaming session to wire the audio source without
+   * setting the final result (so the user can scrub/play during streaming). */
+  onAudioReady?: (loaded: LoadedAudio) => void
 }
 
 const FORMATS: { id: ResponseFormat; label: string }[] = [
@@ -61,7 +65,7 @@ const MicIcon = ({ size = 22 }: { size?: number }) => (
   </svg>
 )
 
-export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBusyChange, onSessionStart }: Props) {
+export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBusyChange, onSessionStart, onAudioReady }: Props) {
   const s = useSettings()
   const [tab, setTab] = useState<SidebarTab>('source')
   const [advOpen, setAdvOpen] = useState(false)
@@ -91,19 +95,25 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   // Mic state — live capture
   const wsRef = useRef<LiveWSHandle | null>(null)
   const segmentsRef = useRef<WhisperSegment[]>([])
+  const wordsRef = useRef<Word[]>([])
   const chunksRef = useRef<Blob[]>([])
   const recordStartRef = useRef<number>(0)
   const [recordElapsed, setRecordElapsed] = useState(0)
 
-  // ── Auto-drop progressive when mode leaves mic ───────────────────
+  // ── Auto-drop progressive when mode is URL ───────────────────
+  // progressive is available for mic (WS) and file (WS-stream). URL mode
+  // uses server-side fetch over REST, so progressive isn't supported.
   useEffect(() => {
-    if (mode !== 'mic' && s.strategy === 'progressive') {
+    if (mode === 'url' && s.strategy === 'progressive') {
       s.set('strategy', 'auto')
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode])
+  // Strategy actually sent over REST (file-non-progressive / URL). If the
+  // user has progressive selected but we're falling back to REST (URL
+  // mode), map to chunked so the backend doesn't 400.
   const restStrategy = (): Strategy =>
-    mode === 'mic' ? s.strategy : s.strategy === 'progressive' ? 'chunked' : s.strategy
+    s.strategy === 'progressive' ? 'chunked' : s.strategy
 
   // ── WS message → result/partial dispatch ─────────────────────────
   const handleMessage = useCallback(
@@ -111,6 +121,9 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       switch (msg.type) {
         case 'segments_batch': {
           segmentsRef.current = [...segmentsRef.current, ...msg.segments]
+          if (msg.words && msg.words.length > 0) {
+            wordsRef.current = [...wordsRef.current, ...msg.words]
+          }
           const wall = (Date.now() - recordStartRef.current) / 1000
           onPartial({
             format: 'verbose_json',
@@ -120,6 +133,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
               duration: segmentsRef.current[segmentsRef.current.length - 1]?.end ?? 0,
               text: segmentsRef.current.map((x) => x.text).join(' ').trim(),
               segments: segmentsRef.current,
+              words: wordsRef.current.length > 0 ? wordsRef.current : undefined,
               strategy: 'progressive',
               transcription_time_seconds: wall,
             },
@@ -128,6 +142,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         }
         case 'refined_transcription':
           segmentsRef.current = msg.segments
+          if (msg.words) wordsRef.current = msg.words
           onPartial({
             format: 'verbose_json',
             body: {
@@ -136,6 +151,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
               duration: msg.audio_duration_seconds,
               text: msg.text,
               segments: msg.segments,
+              words: msg.words,
               strategy: 'progressive',
               transcription_time_seconds: msg.transcription_time,
             },
@@ -159,6 +175,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
                 duration: msg.duration,
                 text: msg.text,
                 segments: msg.segments,
+                words: msg.words,
                 strategy: msg.strategy,
                 transcription_time_seconds: msg.transcription_time,
                 csv_content: msg.csv_content,
@@ -207,16 +224,22 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   const startMic = useCallback(async () => {
     onSessionStart?.()
     segmentsRef.current = []
+    wordsRef.current = []
     chunksRef.current = []
     recordStartRef.current = Date.now()
     setRecordElapsed(0)
+    // Honor the user's strategy choice. Live mic + chunked/full just means
+    // "accumulate then process" — no partials, slow. progressive is the
+    // real-time path. auto routes to progressive over WS.
+    const wsStrategy: Strategy =
+      s.strategy === 'auto' || s.strategy === 'progressive' ? 'progressive' : s.strategy
     const ws = connectLiveWS(
       {
         sample_rate: MIC_SAMPLE_RATE,
         channels: 1,
         bytes_per_sample: 2,
         format: MIC_FORMAT_HINT,
-        strategy: 'progressive',
+        strategy: wsStrategy,
         live_latency: s.liveLatency,
         progressive_refinement: s.progressiveRefinement,
         chunk_length: s.chunkLength ?? undefined,
@@ -240,11 +263,126 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   }, [s, handleMessage, mic, onError, onSessionStart])
 
   // Drive the bottom Transcribe button. In mic mode it doubles as
-  // record/stop. In file/url mode it kicks off the REST upload.
+  // record/stop. In file mode + progressive, stream the bytes over the WS
+  // for real-time partials. Otherwise REST.
   const transcribe = useCallback(async () => {
     if (mode === 'file') {
       if (!pickedFile) return
       onSessionStart?.()
+
+      // File + progressive → stream over WebSocket for live partials.
+      // The audio player gets the file immediately so the user can scrub
+      // / play while transcription streams in.
+      if (s.strategy === 'progressive') {
+        segmentsRef.current = []
+        wordsRef.current = []
+        chunksRef.current = []
+        recordStartRef.current = Date.now()
+        const loaded: LoadedAudio = {
+          kind: 'file',
+          title: pickedFile.name.replace(/\.[^.]+$/, ''),
+          source: `${formatBytes(pickedFile.size)} · ${pickedFile.type || 'audio'}`,
+          file: pickedFile,
+        }
+        // Wire the audio source NOW so the user can scrub / play while
+        // transcription streams. The transcript will fill in via partials,
+        // and onResult fires when final_transcription arrives.
+        onAudioReady?.(loaded)
+
+        setBusyAll(true)
+        try {
+          const fileExt = pickedFile.name.split('.').pop()?.toLowerCase() || 'wav'
+          const ws = streamFileViaWS(
+            pickedFile,
+            {
+              sample_rate: 16000,
+              channels: 1,
+              bytes_per_sample: 2,
+              format: fileExt,
+              strategy: 'progressive',
+              live_latency: s.liveLatency,
+              progressive_refinement: s.progressiveRefinement,
+              chunk_length: s.chunkLength ?? undefined,
+              chunk_overlap: s.chunkOverlap ?? undefined,
+              batch_size: s.batchSize ?? undefined,
+              long_audio_threshold: s.longAudioThreshold ?? undefined,
+            },
+            {
+              onMessage: (msg) => {
+                // Same as mic — accumulate segments + words, surface partials.
+                if (msg.type === 'segments_batch') {
+                  segmentsRef.current = [...segmentsRef.current, ...msg.segments]
+                  if (msg.words && msg.words.length > 0)
+                    wordsRef.current = [...wordsRef.current, ...msg.words]
+                  const wall = (Date.now() - recordStartRef.current) / 1000
+                  onPartial({
+                    format: 'verbose_json',
+                    body: {
+                      task: 'transcribe',
+                      language: 'en',
+                      duration: segmentsRef.current[segmentsRef.current.length - 1]?.end ?? 0,
+                      text: segmentsRef.current.map((x) => x.text).join(' ').trim(),
+                      segments: segmentsRef.current,
+                      words: wordsRef.current.length > 0 ? wordsRef.current : undefined,
+                      strategy: 'progressive',
+                      transcription_time_seconds: wall,
+                    },
+                  })
+                } else if (msg.type === 'refined_transcription') {
+                  segmentsRef.current = msg.segments
+                  if (msg.words) wordsRef.current = msg.words
+                  onPartial({
+                    format: 'verbose_json',
+                    body: {
+                      task: 'transcribe',
+                      language: 'en',
+                      duration: msg.audio_duration_seconds,
+                      text: msg.text,
+                      segments: msg.segments,
+                      words: msg.words,
+                      strategy: 'progressive',
+                      transcription_time_seconds: msg.transcription_time,
+                    },
+                  })
+                } else if (msg.type === 'final_transcription') {
+                  onResult(loaded, {
+                    format: 'verbose_json',
+                    body: {
+                      task: 'transcribe',
+                      language: msg.language,
+                      duration: msg.duration,
+                      text: msg.text,
+                      segments: msg.segments,
+                      words: msg.words,
+                      strategy: msg.strategy,
+                      transcription_time_seconds: msg.transcription_time,
+                      csv_content: msg.csv_content,
+                      srt_content: msg.srt_content,
+                    },
+                  })
+                } else if (msg.type === 'error') {
+                  onError(msg.error)
+                }
+              },
+              onError: () => onError('WebSocket error during file streaming.'),
+              onClose: (code, reason) => {
+                if (code !== 1000 && code !== 1005) {
+                  onError(`WebSocket closed: code=${code} reason=${reason || 'no reason'}`)
+                }
+                wsRef.current = null
+                setBusyAll(false)
+              },
+            },
+          )
+          wsRef.current = ws
+        } catch (e) {
+          onError(e instanceof Error ? e.message : String(e))
+          setBusyAll(false)
+        }
+        return
+      }
+
+      // File + chunked/full/auto → standard REST upload.
       setBusyAll(true)
       setProgress(0)
       try {
@@ -307,7 +445,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       if (recording) mic.stop()
       else startMic().catch((e) => onError(e instanceof Error ? e.message : String(e)))
     }
-  }, [mode, pickedFile, urlInput, s, recording, mic, startMic, onResult, onError, setBusyAll, onSessionStart])
+  }, [mode, pickedFile, urlInput, s, recording, mic, startMic, onResult, onPartial, onError, setBusyAll, onSessionStart, onAudioReady])
 
   const transcribeLabel = (() => {
     if (busy) return 'Working…'
@@ -707,13 +845,15 @@ function EnginePane({
       <SBLabel>Strategy</SBLabel>
       <div className="ma-cluster">
         {STRATEGIES.map((id) => {
-          const disabled = id === 'progressive' && mode !== 'mic'
+          // progressive: allowed for file (we stream over WS) and mic.
+          // Not available for url (server fetches the audio — no WS path).
+          const disabled = id === 'progressive' && mode === 'url'
           return (
             <button
               key={id}
               type="button"
               disabled={disabled}
-              title={disabled ? 'progressive requires Live mic (WebSocket)' : undefined}
+              title={disabled ? 'progressive isn’t available for URL ingest' : undefined}
               className={strategy === id ? 'ma-pill ma-pill--active' : 'ma-pill'}
               onClick={() => !disabled && setStrategy(id)}
             >
@@ -722,8 +862,11 @@ function EnginePane({
           )
         })}
       </div>
-      {strategy === 'progressive' && mode !== 'mic' && (
-        <div className="sb__hint">progressive requires Live mic — REST uploads use chunked.</div>
+      {strategy === 'progressive' && mode === 'url' && (
+        <div className="sb__hint">progressive isn’t available for URL ingest — falling back to chunked.</div>
+      )}
+      {strategy === 'progressive' && mode === 'file' && (
+        <div className="sb__hint">file + progressive streams the audio over a WebSocket so partials arrive live.</div>
       )}
 
       <div style={{ marginTop: 22 }}>

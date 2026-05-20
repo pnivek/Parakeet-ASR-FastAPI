@@ -37,14 +37,17 @@ export interface Settings {
 
 const DEFAULTS: Omit<Settings, 'set' | 'reset'> = {
   responseFormat: 'verbose_json',
-  timestampGranularities: ['segment'],
+  timestampGranularities: ['segment', 'word'],
   strategy: 'auto',
   chunkLength: null,
   chunkOverlap: null,
   batchSize: null,
   longAudioThreshold: null,
   liveLatency: false,
-  progressiveRefinement: true,
+  // Default off — refinement runs an extra FULL pass at EOF which adds
+  // latency on long recordings. Users who want offline-quality final
+  // output can opt in.
+  progressiveRefinement: false,
   theme: 'system',
 }
 

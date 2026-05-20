@@ -27,6 +27,9 @@ export default function App() {
    * handleSessionStart and on handleResult.
    */
   const arrivalRef = useRef<Map<number, number>>(new Map())
+  /** Per-word-index arrival timestamps, same idea — drives the streaming
+   * word reveal in the text view. */
+  const wordArrivalRef = useRef<Map<number, number>>(new Map())
 
   // Hidden host for the singleton <audio>.
   const audioMountRef = useRef<HTMLDivElement>(null)
@@ -51,6 +54,7 @@ export default function App() {
     setError(null)
     setLive(false) // finalized — drop the streaming reveal
     arrivalRef.current = new Map() // settled results don't need arrival fades
+    wordArrivalRef.current = new Map()
     if (l.kind === 'file') {
       setAudioFile(l.file)
       computePeaksFor(l.file)
@@ -62,13 +66,21 @@ export default function App() {
   }
 
   const handlePartial = (r: TranscriptionResponse) => {
-    // Stamp any newly-seen segments with their arrival time. Existing ids
-    // keep their original arrival timestamp so they don't re-animate.
+    // Stamp any newly-seen segments + words with their arrival time.
+    // Existing ids/indices keep their original timestamp so they don't
+    // re-animate on each partial.
     if (r.format === 'verbose_json') {
       const now = performance.now()
       for (const s of r.body.segments) {
         if (!arrivalRef.current.has(s.id)) {
           arrivalRef.current.set(s.id, now)
+        }
+      }
+      if (r.body.words) {
+        for (let i = 0; i < r.body.words.length; i++) {
+          if (!wordArrivalRef.current.has(i)) {
+            wordArrivalRef.current.set(i, now)
+          }
         }
       }
     }
@@ -90,6 +102,22 @@ export default function App() {
     setError(null)
     setLive(false)
     arrivalRef.current = new Map()
+    wordArrivalRef.current = new Map()
+  }
+
+  /**
+   * Wire the picked file into the audio player + peak waveform early in a
+   * streaming session (e.g. file + progressive over WS), so the user can
+   * scrub and play while transcription is still arriving. Does NOT set
+   * `result` — partials drive the transcript view; final result comes
+   * through `handleResult`.
+   */
+  const handleAudioReady = (l: LoadedAudio) => {
+    setLoaded(l)
+    if (l.kind === 'file') {
+      setAudioFile(l.file)
+      computePeaksFor(l.file)
+    }
   }
 
   useEffect(() => {
@@ -123,6 +151,7 @@ export default function App() {
             currentTime={currentTime}
             live={live}
             segmentArrivals={arrivalRef.current}
+            wordArrivals={wordArrivalRef.current}
           />
         </div>
         <aside className="shell__side">
@@ -134,6 +163,7 @@ export default function App() {
             onError={handleError}
             onBusyChange={setBusy}
             onSessionStart={handleSessionStart}
+            onAudioReady={handleAudioReady}
           />
         </aside>
       </main>

@@ -722,6 +722,39 @@ def parse_websocket_config(client_cfg: dict) -> dict:
     return asr_config
 
 
+def _segments_to_words(segments: List[dict]) -> List[dict]:
+    """Compute word-level entries from a batch of segments for the WS stream.
+
+    Each segment carries token IDs but not per-token timestamps; we interpolate
+    them uniformly across the segment's start/end. The boundary tokens hit
+    start/end exactly, which is what most consumers care about.
+
+    Returns the flattened list across all input segments in order.
+    """
+    if asr_model is None:
+        return []
+    out: List[dict] = []
+    for seg in segments:
+        seg_tokens = seg.get("tokens") or []
+        if not seg_tokens:
+            continue
+        seg_start = float(seg.get("start", 0.0))
+        seg_end = float(seg.get("end", seg_start))
+        n = len(seg_tokens)
+        if n == 1:
+            times = [seg_start]
+        else:
+            span = max(seg_end - seg_start, 0.0)
+            times = [seg_start + (i / (n - 1)) * span for i in range(n)]
+        try:
+            out.extend(tokens_to_words(seg_tokens, times, asr_model.tokenizer))
+        except Exception:
+            # Defensive — if the tokenizer chokes on a particular batch we'd
+            # rather emit segments without words than drop the whole frame.
+            continue
+    return out
+
+
 async def handle_streaming_pcm(
     websocket: WebSocket,
     session_id: str,
@@ -1070,7 +1103,12 @@ async def handle_streaming_pcm(
                 new_segs = engine.pop_committed_segments()
                 if new_segs and websocket.application_state == WebSocketState.CONNECTED:
                     try:
-                        await websocket.send_json({"type": "segments_batch", "segments": new_segs})
+                        new_words = _segments_to_words(new_segs)
+                        await websocket.send_json({
+                            "type": "segments_batch",
+                            "segments": new_segs,
+                            "words": new_words,
+                        })
                         sent_segments_pcm.extend(new_segs)
                     except Exception as e_send:
                         logger.warning(f"({session_id}) Stream: segment send failed: {e_send}")
@@ -1080,7 +1118,12 @@ async def handle_streaming_pcm(
             final_partials = engine.pop_final_segments()
             if final_partials and websocket.application_state == WebSocketState.CONNECTED:
                 try:
-                    await websocket.send_json({"type": "segments_batch", "segments": final_partials})
+                    final_words = _segments_to_words(final_partials)
+                    await websocket.send_json({
+                        "type": "segments_batch",
+                        "segments": final_partials,
+                        "words": final_words,
+                    })
                     sent_segments_pcm.extend(final_partials)
                 except Exception as e_send:
                     logger.warning(f"({session_id}) Stream: final segment send failed: {e_send}")
@@ -1138,6 +1181,7 @@ async def handle_streaming_pcm(
                         await websocket.send_json({
                             "type": "refined_transcription",
                             "segments": refined_segments,
+                            "words": _segments_to_words(refined_segments) if refined_segments else [],
                             "text": refined_text,
                             "transcription_time": round(refinement_asr_t, 3),
                             "audio_duration_seconds": round(full_audio_duration_s, 3),
@@ -1168,6 +1212,7 @@ async def handle_streaming_pcm(
                 "duration": round(total_duration_processed_seconds_for_asr, 3),
                 "text": final_text_for_payload,
                 "segments": final_segments_for_payload,
+                "words": _segments_to_words(final_segments_for_payload),
                 # Extensions:
                 "transcription_time": round(final_total_asr_t, 3),
                 "total_segments": len(final_segments_for_payload),

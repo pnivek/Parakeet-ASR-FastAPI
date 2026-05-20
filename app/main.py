@@ -1118,8 +1118,17 @@ async def handle_streaming_pcm(
                             process.stdin.close()
                         break # End of stream signaled by client
                     
-                    if 'bytes' in message and message['bytes']:
+                    if 'bytes' in message:
                         chunk_data = message['bytes']
+                        # An empty binary frame is the documented EOF signal
+                        # (alongside the text "END"). Honor it immediately so
+                        # the trailing segment lands within ~1s of client Stop
+                        # instead of after the 30s receive timeout above.
+                        if not chunk_data:
+                            logger.info(f"({session_id}) Feed ffmpeg: empty binary frame (EOF). Closing ffmpeg stdin.")
+                            if process.stdin and not process.stdin.is_closing():
+                                process.stdin.close()
+                            break
                         if process.stdin and not process.stdin.is_closing():
                             try:
                                 process.stdin.write(chunk_data)

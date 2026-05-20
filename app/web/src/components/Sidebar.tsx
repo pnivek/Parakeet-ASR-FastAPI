@@ -94,6 +94,9 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
 
   // Mic state — live capture
   const wsRef = useRef<LiveWSHandle | null>(null)
+  // AbortController for the in-flight REST upload (file/url, non-progressive).
+  // Held in a ref because we need to reach in from the Stop button click.
+  const restAbortRef = useRef<AbortController | null>(null)
   const segmentsRef = useRef<WhisperSegment[]>([])
   const wordsRef = useRef<Word[]>([])
   const chunksRef = useRef<Blob[]>([])
@@ -405,6 +408,8 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       // File + chunked/full/auto → standard REST upload.
       setBusyAll(true)
       setProgress(0)
+      const ac = new AbortController()
+      restAbortRef.current = ac
       try {
         const r = await postTranscription(
           pickedFile,
@@ -417,7 +422,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             batch_size: s.batchSize ?? undefined,
             long_audio_threshold: s.longAudioThreshold ?? undefined,
           },
-          { onProgress: (loaded, total) => setProgress(loaded / total) },
+          { onProgress: (loaded, total) => setProgress(loaded / total), signal: ac.signal },
         )
         onResult(
           {
@@ -429,8 +434,11 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           r,
         )
       } catch (e) {
+        // User-initiated cancel — silent return, partials (if any) stay.
+        if (e instanceof DOMException && e.name === 'AbortError') return
         onError(e instanceof Error ? e.message : String(e))
       } finally {
+        if (restAbortRef.current === ac) restAbortRef.current = null
         setBusyAll(false)
         setProgress(null)
       }
@@ -438,16 +446,22 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       if (!urlInput.trim() || urlInput === 'https://') return
       onSessionStart?.()
       setBusyAll(true)
+      const ac = new AbortController()
+      restAbortRef.current = ac
       try {
-        const r = await postTranscriptionUrl(urlInput.trim(), {
-          response_format: s.responseFormat,
-          timestamp_granularities: s.timestampGranularities,
-          strategy: restStrategy(),
-          chunk_length: s.chunkLength ?? undefined,
-          chunk_overlap: s.chunkOverlap ?? undefined,
-          batch_size: s.batchSize ?? undefined,
-          long_audio_threshold: s.longAudioThreshold ?? undefined,
-        })
+        const r = await postTranscriptionUrl(
+          urlInput.trim(),
+          {
+            response_format: s.responseFormat,
+            timestamp_granularities: s.timestampGranularities,
+            strategy: restStrategy(),
+            chunk_length: s.chunkLength ?? undefined,
+            chunk_overlap: s.chunkOverlap ?? undefined,
+            batch_size: s.batchSize ?? undefined,
+            long_audio_threshold: s.longAudioThreshold ?? undefined,
+          },
+          { signal: ac.signal },
+        )
         let name = urlInput
         try {
           const u = new URL(urlInput)
@@ -457,8 +471,10 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         }
         onResult({ kind: 'url', title: name, source: 'via URL', url: urlInput.trim() }, r)
       } catch (e) {
+        if (e instanceof DOMException && e.name === 'AbortError') return
         onError(e instanceof Error ? e.message : String(e))
       } finally {
+        if (restAbortRef.current === ac) restAbortRef.current = null
         setBusyAll(false)
       }
     } else if (mode === 'mic') {
@@ -467,13 +483,36 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
     }
   }, [mode, pickedFile, urlInput, s, recording, mic, startMic, onResult, onPartial, onError, setBusyAll, onSessionStart, onAudioReady])
 
+  // Tear down whatever's in flight for file/url. Mic uses its own
+  // record/stop path via mic.stop() — handled inside transcribe().
+  const cancelInFlight = useCallback(() => {
+    if (wsRef.current && mode !== 'mic') {
+      // file + progressive — closes WS with code 1000; onClose resets busy.
+      wsRef.current.abort()
+      wsRef.current = null
+    }
+    if (restAbortRef.current) {
+      // file/url REST — XHR.abort() rejects with AbortError; finally clears busy.
+      restAbortRef.current.abort()
+      restAbortRef.current = null
+    }
+  }, [mode])
+
   const transcribeLabel = (() => {
-    if (busy) return 'Working…'
+    if (busy) return mode === 'mic' ? 'Working…' : 'Stop ▣'
     if (mode === 'mic') return recording ? 'Stop ▣' : 'Record ●'
     return 'Transcribe →'
   })()
+  const onCommitClick = () => {
+    if (busy && mode !== 'mic') {
+      cancelInFlight()
+      return
+    }
+    void transcribe()
+  }
   const transcribeDisabled = (() => {
-    if (busy) return true
+    // While busy on file/url, keep the button enabled so it can act as Stop.
+    if (busy) return mode === 'mic'
     if (mode === 'file') return !pickedFile
     if (mode === 'url') return !urlInput.trim() || urlInput === 'https://'
     if (mode === 'mic') return micBusy
@@ -589,7 +628,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         <button
           type="button"
           className="ma-pill ma-pill--primary"
-          onClick={transcribe}
+          onClick={onCommitClick}
           disabled={transcribeDisabled}
         >
           {transcribeLabel}

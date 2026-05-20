@@ -1,5 +1,5 @@
 import { useCallback, useMemo } from 'react'
-import { seek } from '../lib/playback'
+import { play, seek } from '../lib/playback'
 
 interface Props {
   peaks: number[] | null
@@ -40,6 +40,7 @@ export function Waveform({
       const r = e.currentTarget.getBoundingClientRect()
       const ratio = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width))
       seek(ratio * duration)
+      play()
     },
     [duration],
   )

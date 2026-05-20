@@ -618,29 +618,31 @@ body {
 }
 .segs-row {
   display: grid;
-  grid-template-columns: 76px 1fr;
-  gap: 24px;
-  padding: 16px 0;
+  grid-template-columns: 56px 56px 1fr;
+  column-gap: 18px;
+  align-items: baseline;
+  padding: 14px 0;
   cursor: pointer;
   border-top: 1px solid var(--rule);
+  transition: color 0.15s;
 }
 .segs-row:first-child {
   border-top: none;
 }
-.segs-row__time {
+.segs-row__t {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   font-size: 11px;
   color: var(--muted-deep);
   letter-spacing: 0.4px;
-  padding-top: 2px;
-  line-height: 1.4;
+  white-space: nowrap;
 }
-.segs-row__time-end {
-  color: var(--muted-deep);
-  font-size: 10px;
+.segs-row__t--end {
+  font-size: 11px;
+  color: var(--muted);
 }
-.segs-row--active .segs-row__time {
+.segs-row--active .segs-row__t,
+.segs-row--active .segs-row__t--end {
   color: var(--accent);
 }
 .segs-row__text {
@@ -653,27 +655,34 @@ body {
 .segs-row--active .segs-row__text {
   color: var(--fg);
 }
+
+/* Compact two-column definition-list for segment metadata. Fixed key
+   width keeps the values aligned regardless of label length, and the
+   inline-flex layout stays tight rather than stretching to fill. */
 .segs-detail {
+  grid-column: 3 / 4;
+  margin-top: 8px;
+  padding-bottom: 4px;
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 8px;
-  padding: 4px 0 6px 100px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 32px;
+  row-gap: 4px;
+  max-width: 520px;
 }
 @media (max-width: 720px) {
   .segs-detail {
     grid-template-columns: 1fr;
-    padding-left: 0;
+    column-gap: 0;
   }
 }
 .kv {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  align-items: baseline;
   font-family: var(--font-mono);
-  font-size: 10.5px;
-  padding: 6px 0;
-  border-bottom: 1px dashed var(--rule);
+  font-size: 11px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--rule);
 }
 .kv__k {
   color: var(--muted-deep);
@@ -682,6 +691,7 @@ body {
 .kv__v {
   color: var(--fg-dim);
   font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 .kv--null {
   cursor: help;

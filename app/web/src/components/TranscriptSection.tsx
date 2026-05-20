@@ -1,7 +1,7 @@
 import { useMemo, useState, Fragment } from 'react'
 import type { TranscriptionResponse } from '../lib/api'
 import type { VerboseJsonResponse, WhisperSegment } from '../lib/types'
-import { seek } from '../lib/playback'
+import { play, seek } from '../lib/playback'
 import { formatTime } from '../lib/format'
 import { downloadResult } from '../lib/download'
 
@@ -147,7 +147,7 @@ function PlainText({ body, activeWordIdx }: { body: VerboseJsonResponse; activeW
           else if (i > activeWordIdx + 6 && activeWordIdx >= 0) cls += ' editorial-word--upcoming'
           return (
             <Fragment key={`${i}-${w.start}`}>
-              <span className={cls} onClick={() => seek(w.start)}>
+              <span className={cls} onClick={() => { seek(w.start); play() }}>
                 {w.word}
               </span>
               {i < body.words!.length - 1 && ' '}
@@ -163,6 +163,11 @@ function PlainText({ body, activeWordIdx }: { body: VerboseJsonResponse; activeW
 function SegmentRows({ segments, activeIdx }: { segments: WhisperSegment[]; activeIdx: number }) {
   const [openId, setOpenId] = useState<number | null>(null)
   if (segments.length === 0) return <div className="empty">No segments.</div>
+  const goTo = (start: number, segId: number) => {
+    setOpenId((cur) => (cur === segId ? null : segId))
+    seek(start)
+    play()
+  }
   return (
     <div className="segs-list">
       {segments.map((s, i) => {
@@ -172,36 +177,30 @@ function SegmentRows({ segments, activeIdx }: { segments: WhisperSegment[]; acti
           <Fragment key={s.id}>
             <div
               className={active ? 'segs-row segs-row--active' : 'segs-row'}
-              onClick={() => {
-                setOpenId(open ? null : s.id)
-                seek(s.start)
-              }}
+              onClick={() => goTo(s.start, s.id)}
               role="button"
               tabIndex={0}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
-                  setOpenId(open ? null : s.id)
-                  seek(s.start)
+                  e.preventDefault()
+                  goTo(s.start, s.id)
                 }
               }}
             >
-              <div className="segs-row__time num">
-                {formatTime(s.start)}
-                <br />
-                <span className="segs-row__time-end">→ {formatTime(s.end)}</span>
-              </div>
-              <div className="segs-row__text">{s.text}</div>
+              <span className="segs-row__t">{formatTime(s.start)}</span>
+              <span className="segs-row__t segs-row__t--end">{formatTime(s.end)}</span>
+              <span className="segs-row__text">{s.text}</span>
+              {open && (
+                <div className="segs-detail" onClick={(e) => e.stopPropagation()}>
+                  <Kv k="id" v={s.id} />
+                  <Kv k="seek" v={s.seek} />
+                  <Kv k="temperature" v={s.temperature} />
+                  <Kv k="avg_logprob" v={s.avg_logprob} />
+                  <Kv k="compression_ratio" v={s.compression_ratio} />
+                  <Kv k="no_speech_prob" v={s.no_speech_prob} />
+                </div>
+              )}
             </div>
-            {open && (
-              <div className="segs-detail">
-                <Kv k="id" v={s.id} />
-                <Kv k="seek" v={s.seek} />
-                <Kv k="temperature" v={s.temperature} />
-                <Kv k="avg_logprob" v={s.avg_logprob} />
-                <Kv k="compression_ratio" v={s.compression_ratio} />
-                <Kv k="no_speech_prob" v={s.no_speech_prob} />
-              </div>
-            )}
           </Fragment>
         )
       })}
@@ -235,7 +234,7 @@ function WordsGrid({ body, activeIdx }: { body: VerboseJsonResponse; activeIdx: 
           key={`${i}-${w.start}`}
           type="button"
           className={i === activeIdx ? 'words-cell words-cell--active' : 'words-cell'}
-          onClick={() => seek(w.start)}
+          onClick={() => { seek(w.start); play() }}
         >
           <span className="words-cell__word">{w.word}</span>
           <span className="words-cell__t num">

@@ -57,11 +57,19 @@ test('Maison v6 UI — boots, tabs switch, modes switch, strategy gate enforced'
   await expect(page.getByRole('button', { name: /^auto$/ })).toBeVisible()
   await expect(page.getByRole('button', { name: /^chunked$/ })).toBeVisible()
 
-  // Strategy gate: progressive should be disabled while mode != mic.
+  // Strategy gate: progressive is now valid for file (streams over WS) +
+  // mic; only disabled in URL mode (server-side fetch is REST-only).
   await sourceTab.click()
   await page.getByRole('button', { name: /^file$/ }).click()
   await engineTab.click()
-  const progressiveBtn = page.getByRole('button', { name: /^progressive$/ })
+  let progressiveBtn = page.getByRole('button', { name: /^progressive$/ })
+  await expect(progressiveBtn).toBeEnabled()
+
+  // URL mode — progressive should now be disabled.
+  await sourceTab.click()
+  await page.getByRole('button', { name: /^url$/ }).click()
+  await engineTab.click()
+  progressiveBtn = page.getByRole('button', { name: /^progressive$/ })
   await expect(progressiveBtn).toBeDisabled()
 
   // Footer rail metric labels present.

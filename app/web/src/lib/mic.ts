@@ -28,12 +28,24 @@ export const MIC_FORMAT_HINT = 'webm'
 export const MIC_TIMESLICE_MS = 250
 
 export interface UseMicOptions {
-  /** Called once per MediaRecorder timeslice. Forward the blob to the WS. */
+  /** Called once per MediaRecorder timeslice when audio is forwarded. */
   onChunk: (blob: Blob) => void
   /** Called after the final blob has been emitted following stop(). */
   onStop?: () => void
   /** Called on any unrecoverable error during start/record. */
   onError?: (err: Error) => void
+  /**
+   * Voice-activity detection. When true (default), silent chunks are
+   * dropped before being forwarded to the WS — keeps the server's
+   * inference queue drained so speech gets processed immediately
+   * instead of behind silent windows.
+   */
+  vad?: boolean
+  /** RMS threshold in [0..1] above which audio is considered speech. */
+  vadThreshold?: number
+  /** Once speech is detected, keep forwarding chunks for this many ms
+   * after the last "loud" sample. Avoids clipping trailing words. */
+  vadHangoverMs?: number
 }
 
 export interface UseMicResult {
@@ -42,6 +54,9 @@ export interface UseMicResult {
   error: string | null
   /** Live mic level, 0..1. Updated each animation frame while recording. */
   level: number
+  /** True when VAD currently classifies the input as speech (or during
+   * the hangover window). Drives the recording indicator. */
+  voiceActive: boolean
   start: () => Promise<void>
   stop: () => void
 }
@@ -51,10 +66,18 @@ export interface UseMicResult {
  * StrictMode double-invocations — the actual stream is keyed by an internal
  * ref, not by state.
  */
-export function useMic({ onChunk, onStop, onError }: UseMicOptions): UseMicResult {
+export function useMic({
+  onChunk,
+  onStop,
+  onError,
+  vad = true,
+  vadThreshold = 0.04,
+  vadHangoverMs = 800,
+}: UseMicOptions): UseMicResult {
   const [state, setState] = useState<MicState>('idle')
   const [error, setError] = useState<string | null>(null)
   const [level, setLevel] = useState(0)
+  const [voiceActive, setVoiceActive] = useState(false)
 
   const streamRef = useRef<MediaStream | null>(null)
   const recorderRef = useRef<MediaRecorder | null>(null)
@@ -64,6 +87,16 @@ export function useMic({ onChunk, onStop, onError }: UseMicOptions): UseMicResul
   /** Last setLevel value — used to coalesce rAF updates that don't move the
    * peak meaningfully. Cuts the re-render rate of the sidebar by ~5×. */
   const lastLevelRef = useRef<number>(0)
+  /** Last performance.now() at which we observed speech (RMS above
+   * vadThreshold). Used for hangover-based VAD gating. */
+  const lastVoiceTsRef = useRef<number>(0)
+  /** Mirror of voiceActive in a ref so ondataavailable (a stale closure)
+   * can read the latest value without re-binding the listener. */
+  const voiceActiveRef = useRef<boolean>(false)
+  /** Mirror of the latest options so the recorder listener picks up
+   * runtime changes without being torn down. */
+  const optsRef = useRef({ vad, vadThreshold, vadHangoverMs })
+  optsRef.current = { vad, vadThreshold, vadHangoverMs }
 
   const cleanup = useCallback(() => {
     if (rafRef.current !== null) {
@@ -84,7 +117,10 @@ export function useMic({ onChunk, onStop, onError }: UseMicOptions): UseMicResul
     }
     recorderRef.current = null
     lastLevelRef.current = 0
+    lastVoiceTsRef.current = 0
+    voiceActiveRef.current = false
     setLevel(0)
+    setVoiceActive(false)
   }, [])
 
   const start = useCallback(async () => {
@@ -130,7 +166,20 @@ export function useMic({ onChunk, onStop, onError }: UseMicOptions): UseMicResul
       recorderRef.current = recorder
 
       recorder.ondataavailable = (ev) => {
-        if (ev.data && ev.data.size > 0) onChunk(ev.data)
+        if (!ev.data || ev.data.size === 0) return
+        // VAD gate. If disabled, forward everything. If enabled, only
+        // forward when we observed speech recently (current frame OR
+        // within hangover window).
+        const o = optsRef.current
+        if (!o.vad) {
+          onChunk(ev.data)
+          return
+        }
+        const now = performance.now()
+        const inHangover = now - lastVoiceTsRef.current <= o.vadHangoverMs
+        if (inHangover) onChunk(ev.data)
+        // else: silent chunk — drop it. The server engine doesn't know
+        // about the gap; it'll see a contiguous (speech-only) stream.
       }
       recorder.onstop = () => {
         onStop?.()
@@ -164,13 +213,35 @@ export function useMic({ onChunk, onStop, onError }: UseMicOptions): UseMicResul
         // Cast: lib.dom.d.ts in TS6 narrowed this to ArrayBuffer-only views.
         analyserRef.current.getByteTimeDomainData(buf as unknown as Uint8Array<ArrayBuffer>)
         let peak = 0
+        let sumSq = 0
         for (let i = 0; i < buf.length; i++) {
-          const v = Math.abs(buf[i] - 128) / 128
-          if (v > peak) peak = v
+          const v = (buf[i] - 128) / 128
+          const a = Math.abs(v)
+          if (a > peak) peak = a
+          sumSq += v * v
         }
         if (Math.abs(peak - lastLevelRef.current) >= LEVEL_THRESHOLD) {
           lastLevelRef.current = peak
           setLevel(peak)
+        }
+        // VAD: use RMS energy (less spiky than peak). If above threshold,
+        // refresh the lastVoice timestamp. The ondataavailable handler
+        // reads this + the hangover window to gate forwarding.
+        const rms = Math.sqrt(sumSq / buf.length)
+        const o = optsRef.current
+        if (rms >= o.vadThreshold) {
+          lastVoiceTsRef.current = performance.now()
+          if (!voiceActiveRef.current) {
+            voiceActiveRef.current = true
+            setVoiceActive(true)
+          }
+        } else if (voiceActiveRef.current) {
+          // Inside hangover → still "active"; outside → flip off.
+          const inHang = performance.now() - lastVoiceTsRef.current <= o.vadHangoverMs
+          if (!inHang) {
+            voiceActiveRef.current = false
+            setVoiceActive(false)
+          }
         }
         rafRef.current = requestAnimationFrame(tick)
       }
@@ -211,5 +282,5 @@ export function useMic({ onChunk, onStop, onError }: UseMicOptions): UseMicResul
     [cleanup],
   )
 
-  return { state, error, level, start, stop }
+  return { state, error, level, voiceActive, start, stop }
 }

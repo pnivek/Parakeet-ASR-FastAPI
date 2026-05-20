@@ -206,6 +206,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       wsRef.current?.abort()
       wsRef.current = null
     },
+    vad: s.vad,
   })
 
   const recording = mic.state === 'recording'
@@ -507,6 +508,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             micBusy={micBusy}
             recordElapsed={recordElapsed}
             startMic={startMic}
+            vadEnabled={s.vad}
           />
         )}
         {tab === 'output' && (
@@ -530,11 +532,13 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             chunkLength={s.chunkLength}
             liveLatency={s.liveLatency}
             progressiveRefinement={s.progressiveRefinement}
+            vad={s.vad}
             setLong={(v) => s.set('longAudioThreshold', v)}
             setBatch={(v) => s.set('batchSize', v)}
             setChunkLen={(v) => s.set('chunkLength', v)}
             setLiveLatency={(v) => s.set('liveLatency', v)}
             setProgRefine={(v) => s.set('progressiveRefinement', v)}
+            setVad={(v) => s.set('vad', v)}
             ChevIcon={ChevIcon}
           />
         )}
@@ -592,6 +596,7 @@ function SourcePane({
   micBusy,
   recordElapsed,
   startMic,
+  vadEnabled,
 }: {
   mode: InputMode
   onModeChange: (m: InputMode) => void
@@ -608,6 +613,7 @@ function SourcePane({
   micBusy: boolean
   recordElapsed: number
   startMic: () => Promise<void>
+  vadEnabled: boolean
 }) {
   return (
     <div>
@@ -689,7 +695,8 @@ function SourcePane({
             <span className="mic__status">
               {mic.state === 'idle' && 'READY'}
               {mic.state === 'starting' && 'CONNECTING'}
-              {mic.state === 'recording' && 'RECORDING'}
+              {mic.state === 'recording' &&
+                (vadEnabled ? (mic.voiceActive ? 'SPEAKING' : 'LISTENING') : 'RECORDING')}
               {mic.state === 'stopping' && 'FINALIZING'}
               {mic.state === 'error' && 'ERROR'}
             </span>
@@ -816,11 +823,13 @@ function EnginePane({
   chunkLength,
   liveLatency,
   progressiveRefinement,
+  vad,
   setLong,
   setBatch,
   setChunkLen,
   setLiveLatency,
   setProgRefine,
+  setVad,
   ChevIcon,
 }: {
   strategy: Strategy
@@ -833,11 +842,13 @@ function EnginePane({
   chunkLength: number | null
   liveLatency: boolean
   progressiveRefinement: boolean
+  vad: boolean
   setLong: (v: number | null) => void
   setBatch: (v: number | null) => void
   setChunkLen: (v: number | null) => void
   setLiveLatency: (v: boolean) => void
   setProgRefine: (v: boolean) => void
+  setVad: (v: boolean) => void
   ChevIcon: React.FC<{ up: boolean }>
 }) {
   return (
@@ -881,6 +892,7 @@ function EnginePane({
             <NumKv k="chunk_length" v={chunkLength} placeholder={30} suffix="s" onSet={setChunkLen} />
             <ToggleKv k="live_latency" v={liveLatency} onSet={setLiveLatency} />
             <ToggleKv k="progressive_refinement" v={progressiveRefinement} onSet={setProgRefine} />
+            <ToggleKv k="vad (mic only)" v={vad} onSet={setVad} />
           </div>
         )}
       </div>

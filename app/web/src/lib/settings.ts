@@ -26,6 +26,10 @@ export interface Settings {
   // Progressive (WS) knobs
   liveLatency: boolean
   progressiveRefinement: boolean
+  /** Client-side voice activity detection on the mic capture pipeline.
+   * When true, silent chunks aren't forwarded to the server, keeping the
+   * engine queue drained so real speech is processed immediately. */
+  vad: boolean
 
   // UI
   theme: ThemeMode
@@ -48,6 +52,7 @@ const DEFAULTS: Omit<Settings, 'set' | 'reset'> = {
   // small enough that the snappier default is the right tradeoff for an
   // interactive playground.
   liveLatency: true,
+  vad: true,
   // Default off — refinement runs an extra FULL pass at EOF which adds
   // latency on long recordings. Users who want offline-quality final
   // output can opt in.

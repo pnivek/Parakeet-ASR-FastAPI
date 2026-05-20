@@ -59,9 +59,12 @@ RUN pip install --no-cache-dir nemo_toolkit[asr]==2.7.3
 
 # Silero VAD — voice activity detection on the streaming PCM path. Used by
 # handle_streaming_pcm to gate silent windows out of the engine queue. The
-# package bundles the ONNX/jit model so no extra download is needed at
-# runtime.
-RUN pip install --no-cache-dir silero-vad==5.1.2
+# package bundles both the jit and ONNX model assets so no extra download
+# is needed at runtime. We pair it with onnxruntime so we can load the
+# ONNX variant (load_silero_vad(onnx=True)) — about 3x faster per 32ms
+# frame than the PyTorch jit on CPU, which matters because VAD runs
+# inline in the producer's hot read loop.
+RUN pip install --no-cache-dir silero-vad==5.1.2 onnxruntime>=1.16
 
 COPY app/ /app/
 # Strip the client source tree from the runtime image — it was already

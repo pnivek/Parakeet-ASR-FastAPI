@@ -347,15 +347,16 @@ except Exception as e:
     )
 
 # Silero VAD — loaded once at module init. Used by handle_streaming_pcm to
-# drop silent windows before they hit the engine queue. The model is a small
-# stateful PyTorch jit; we call .reset_states() per WS session. Failure to
-# load is non-fatal — VAD just stays off and the pipeline behaves like
-# pre-VAD.
+# drop silent windows before they hit the engine queue. We load the ONNX
+# variant (~3x faster per 32ms frame than the PyTorch jit on CPU) to keep
+# the producer's hot read loop from throttling chunk throughput on long
+# files. Failure to load is non-fatal — VAD stays off and the pipeline
+# behaves like pre-VAD.
 silero_vad_model: Optional[object] = None
 try:
     from silero_vad import load_silero_vad  # type: ignore[import-untyped]
-    silero_vad_model = load_silero_vad(onnx=False)
-    logger.info("Silero VAD model loaded successfully (PyTorch jit, runs CPU).")
+    silero_vad_model = load_silero_vad(onnx=True)
+    logger.info("Silero VAD model loaded successfully (ONNX, runs CPU).")
 except Exception as e_vad_load:
     silero_vad_model = None
     logger.warning(

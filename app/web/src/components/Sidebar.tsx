@@ -115,9 +115,15 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   const restStrategy = (): Strategy =>
     s.strategy === 'progressive' ? 'chunked' : s.strategy
 
-  /** Shared VAD + HPF config block for any WS config first frame. */
+  /** Shared VAD + HPF config block for any WS config first frame.
+   *
+   * VAD is only honored in mic mode: it exists to keep the engine queue
+   * drained when the producer is bandwidth-bound. File and URL paths
+   * stream data faster than realtime, so VAD adds per-frame CPU cost
+   * without any latency benefit there. Auto-disable it for non-mic
+   * modes regardless of the persisted toggle. */
   const vadConfig = () => ({
-    vad_enabled: s.vadEnabled,
+    vad_enabled: mode === 'mic' ? s.vadEnabled : false,
     vad_threshold: s.vadThreshold,
     vad_consecutive: s.vadConsecutive,
     vad_hangover_ms: s.vadHangoverMs,
@@ -947,6 +953,9 @@ function EnginePane({
             <div className="sb__adv-divider" />
 
             <ToggleKv k="vad_enabled" v={vadEnabled} onSet={setVadEnabled} />
+            {mode !== 'mic' && vadEnabled && (
+              <div className="sb__hint">Auto-disabled for File and URL modes — the engine queue isn’t bandwidth-limited there, so VAD only adds per-frame CPU cost.</div>
+            )}
             <NumKv k="vad_threshold" v={vadThreshold} placeholder={0.5} step={0.05} onSet={setVadThreshold} />
             <NumKv k="vad_consecutive" v={vadConsecutive} placeholder={3} onSet={setVadConsecutive} />
             <NumKv k="vad_hangover_ms" v={vadHangoverMs} placeholder={500} suffix="ms" onSet={setVadHangoverMs} />

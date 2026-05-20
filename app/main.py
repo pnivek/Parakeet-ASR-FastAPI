@@ -1,3 +1,4 @@
+import bisect
 import gc
 import os
 import io
@@ -768,9 +769,11 @@ def parse_websocket_config(client_cfg: dict) -> dict:
 def _segments_to_words(segments: List[dict]) -> List[dict]:
     """Compute word-level entries from a batch of segments for the WS stream.
 
-    Each segment carries token IDs but not per-token timestamps; we interpolate
-    them uniformly across the segment's start/end. The boundary tokens hit
-    start/end exactly, which is what most consumers care about.
+    Each segment may carry per-token timestamps in `token_times` (streaming
+    engine emits real values from the decoder; offline path likewise). When
+    present we use them directly so word boundaries land on the decoder's
+    actual emission times. When absent (older payloads or alternate code
+    paths) we fall back to uniform interpolation across the segment span.
 
     Returns the flattened list across all input segments in order.
     """
@@ -781,14 +784,18 @@ def _segments_to_words(segments: List[dict]) -> List[dict]:
         seg_tokens = seg.get("tokens") or []
         if not seg_tokens:
             continue
-        seg_start = float(seg.get("start", 0.0))
-        seg_end = float(seg.get("end", seg_start))
-        n = len(seg_tokens)
-        if n == 1:
-            times = [seg_start]
+        seg_token_times = seg.get("token_times")
+        if seg_token_times and len(seg_token_times) == len(seg_tokens):
+            times = [float(t) for t in seg_token_times]
         else:
-            span = max(seg_end - seg_start, 0.0)
-            times = [seg_start + (i / (n - 1)) * span for i in range(n)]
+            seg_start = float(seg.get("start", 0.0))
+            seg_end = float(seg.get("end", seg_start))
+            n = len(seg_tokens)
+            if n == 1:
+                times = [seg_start]
+            else:
+                span = max(seg_end - seg_start, 0.0)
+                times = [seg_start + (i / (n - 1)) * span for i in range(n)]
         try:
             out.extend(tokens_to_words(seg_tokens, times, asr_model.tokenizer))
         except Exception:
@@ -831,6 +838,26 @@ def _build_vad_state(client_config: dict) -> dict:
         'last_speech_ms': 0.0,      # cumulative engine ms at last loud frame (hangover)
         'engine_ms': 0.0,           # engine-clock ms (only counts forwarded audio)
         'in_buf': bytearray(),      # incoming bytes pending 32 ms frame alignment
+        # Speech-clock → wall-clock translation. The engine sees a
+        # contiguous "speech-only" stream when VAD drops silence; token
+        # timestamps it emits are on the engine clock. To map back to
+        # the wall-clock of the original recording (the audio player
+        # plays the untouched track) we track `wall_ms` independently:
+        # wall_ms increments by _VAD_FRAME_MS for every VAD frame the
+        # filter actually consumes, regardless of what's done with it.
+        # engine_ms already tracks what the engine has seen. The offset
+        # at any moment is `wall_ms - engine_ms`.
+        #
+        # The offset is piecewise-constant from the engine's POV — it
+        # only changes during silent/pending stretches (where engine_ms
+        # doesn't advance) and at silent→speech confirmation (where
+        # padding + pending flush advance engine_ms without advancing
+        # wall_ms). We append one breakpoint per confirmation. Lookup
+        # is bisect_right against time_map_keys; empty time_map ↔
+        # identity ↔ VAD off or no silence ever dropped.
+        'wall_ms': 0.0,
+        'time_map': [],             # list[(engine_t_s, wall_offset_s)]
+        'time_map_keys': [],        # parallel list of engine_t_s for bisect
         # Stats for end-of-session logging
         'dropped_frames': 0,
         'speech_frames': 0,
@@ -854,9 +881,12 @@ def _vad_filter(pcm_bytes: bytes, st: dict) -> bytes:
         TDT decoder doesn't see an instant cliff into speech.
 
     Bytes returned should be appended to the engine's PCM accumulator.
-    Timestamps emitted by the engine are on the speech-only timeline; we
-    do not currently translate back to wall-clock (the FULL refinement
-    pass at EOF carries authoritative timings for the refined output).
+
+    Timestamps emitted by the engine are on the speech-only "engine"
+    timeline. Callers should translate them back to wall-clock with
+    `_translate_segment_times(seg, vad_state)` before exposing them to
+    the client — the audio player plays the unfiltered wall-clock track
+    and word highlights need to match it.
     """
     if not st['enabled']:
         st['engine_ms'] += (len(pcm_bytes) / 2) / 16.0  # 16 samples/ms @ 16 kHz
@@ -874,6 +904,13 @@ def _vad_filter(pcm_bytes: bytes, st: dict) -> bytes:
     while len(st['in_buf']) >= _VAD_FRAME_BYTES:
         frame_bytes = bytes(st['in_buf'][:_VAD_FRAME_BYTES])
         del st['in_buf'][:_VAD_FRAME_BYTES]
+
+        # Every consumed VAD frame is 32ms of wall-clock — we always
+        # received it from the audio source. engine_ms ticks only when
+        # we forward bytes to the engine (below). The running difference
+        # wall_ms - engine_ms is the wall-clock offset we snapshot at
+        # each silent→speech confirmation.
+        st['wall_ms'] += _VAD_FRAME_MS
 
         samples_np = np.frombuffer(frame_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         samples_t = torch.from_numpy(samples_np)
@@ -913,20 +950,30 @@ def _vad_filter(pcm_bytes: bytes, st: dict) -> bytes:
                     st['silent_run_ms'] = 0.0
                     st['last_speech_ms'] = st['engine_ms']
                     st['speech_frames'] += 1
+                    # Record the new (engine_t, offset) breakpoint. Offset
+                    # is computed from the independently tracked wall/engine
+                    # clocks: any tokens emitted at engine_t >= this point
+                    # map back to wall_t = engine_t + offset.
+                    eng_s = st['engine_ms'] / 1000.0
+                    off_s = (st['wall_ms'] - st['engine_ms']) / 1000.0
+                    st['time_map'].append((eng_s, off_s))
+                    st['time_map_keys'].append(eng_s)
                 else:
-                    # Still pending. Frame stays buffered, gap clock advances
-                    # (treated as silent until confirmed).
+                    # Still pending. Frame stays buffered (wall already ticked
+                    # at top of loop; engine_ms unchanged).
                     st['silent_run_ms'] += _VAD_FRAME_MS
                     st['dropped_frames'] += 1
             else:
-                # Real silent frame.
+                # Real silent frame. wall already ticked; engine doesn't.
                 st['consec'] = 0
                 st['pending'].clear()
                 st['silent_run_ms'] += _VAD_FRAME_MS
                 st['dropped_frames'] += 1
         else:  # mode == 'speech'
-            # Always forward in speech mode. Hangover decides when to flip
-            # back to silent.
+            # Always forward in speech mode. wall and engine both tick by
+            # 32ms here, so the offset stays flat — no new breakpoint
+            # needed (the most recent breakpoint still describes the
+            # current segment of the timeline).
             out.extend(frame_bytes)
             st['engine_ms'] += _VAD_FRAME_MS
             st['speech_frames'] += 1
@@ -939,6 +986,44 @@ def _vad_filter(pcm_bytes: bytes, st: dict) -> bytes:
                 st['silent_run_ms'] = 0.0
 
     return bytes(out)
+
+
+def _wall_time_s(engine_t_s: float, vad_state: dict) -> float:
+    """Translate an engine-clock timestamp back to wall-clock seconds.
+
+    Identity when the time map is empty (VAD off, or VAD on but no silence
+    was ever dropped). Otherwise picks the offset from the most recent
+    breakpoint whose engine-time key is <= engine_t_s. Values before the
+    very first breakpoint use that first breakpoint's offset — they
+    correspond to anything emitted before the first silent→speech
+    confirmation, which in practice is rare but bounded.
+    """
+    time_map = vad_state.get('time_map') or []
+    if not time_map:
+        return float(engine_t_s)
+    keys = vad_state.get('time_map_keys') or [m[0] for m in time_map]
+    idx = bisect.bisect_right(keys, engine_t_s) - 1
+    if idx < 0:
+        return float(engine_t_s) + float(time_map[0][1])
+    return float(engine_t_s) + float(time_map[idx][1])
+
+
+def _translate_segment_times(segments: List[dict], vad_state: dict) -> None:
+    """In-place: rewrite each segment's start/end/token_times from engine
+    clock to wall clock using `vad_state`'s time map. No-op when time map
+    is empty (VAD off — engine and wall clocks coincide)."""
+    if not vad_state.get('time_map'):
+        return
+    for seg in segments:
+        if 'start' in seg:
+            seg['start'] = round(_wall_time_s(float(seg['start']), vad_state), 3)
+        if 'end' in seg:
+            seg['end'] = round(_wall_time_s(float(seg['end']), vad_state), 3)
+        token_times = seg.get('token_times')
+        if token_times:
+            seg['token_times'] = [
+                round(_wall_time_s(float(t), vad_state), 3) for t in token_times
+            ]
 
 
 async def handle_streaming_pcm(
@@ -1338,6 +1423,11 @@ async def handle_streaming_pcm(
                 new_segs = engine.pop_committed_segments()
                 if new_segs and websocket.application_state == WebSocketState.CONNECTED:
                     try:
+                        # When VAD is on, engine timestamps are speech-clock —
+                        # translate them back to the wall clock of the original
+                        # recording before the client sees them. No-op when VAD
+                        # is off (time_map is empty).
+                        _translate_segment_times(new_segs, vad_state)
                         new_words = _segments_to_words(new_segs)
                         await websocket.send_json({
                             "type": "segments_batch",
@@ -1353,6 +1443,7 @@ async def handle_streaming_pcm(
             final_partials = engine.pop_final_segments()
             if final_partials and websocket.application_state == WebSocketState.CONNECTED:
                 try:
+                    _translate_segment_times(final_partials, vad_state)
                     final_words = _segments_to_words(final_partials)
                     await websocket.send_json({
                         "type": "segments_batch",

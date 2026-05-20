@@ -84,11 +84,19 @@ def _whisper_segment(
     text: str,
     token_ids: List[int],
     avg_logprob: Optional[float] = None,
+    token_times: Optional[List[float]] = None,
 ) -> dict:
     """One segment in OpenAI Whisper's verbose_json shape.
 
     Populated (meaningful values):
       id, seek, start, end, text, tokens, temperature, compression_ratio
+
+    Extension fields (non-Whisper, additive):
+      token_times       — Per-token audio time in seconds, parallel to
+                          `tokens`. Carried so the server can later turn
+                          tokens into wall-clock-accurate words without
+                          re-interpolating across the segment span. Omitted
+                          when the producer didn't have them.
 
     Honestly null:
       avg_logprob       — NeMo 2.7.3's TDT label-loop CUDA graph
@@ -109,7 +117,7 @@ def _whisper_segment(
     Shape matches OpenAI's verbose_json so clients drop in cleanly; the
     nulls are deliberate, documented gaps rather than missing keys.
     """
-    return {
+    seg = {
         "id": seg_id,
         "seek": 0,
         "start": round(max(0.0, start), 3),
@@ -121,6 +129,9 @@ def _whisper_segment(
         "compression_ratio": _compression_ratio(text),
         "no_speech_prob": None,
     }
+    if token_times is not None:
+        seg["token_times"] = [round(max(0.0, t), 3) for t in token_times]
+    return seg
 
 
 def tokens_to_words(
@@ -209,6 +220,7 @@ def tokens_to_sentence_segments(
     segments: List[dict] = []
     buf_ids: List[int] = []
     buf_logprobs: List[Optional[float]] = []
+    buf_times: List[float] = []
     buf_start: Optional[float] = None
     buf_last_t: float = 0.0
     seg_id = start_seg_id
@@ -221,6 +233,7 @@ def tokens_to_sentence_segments(
             buf_start = t_s
         buf_ids.append(tid)
         buf_logprobs.append(lp)
+        buf_times.append(t_s)
         buf_last_t = t_s
         try:
             tok = tokenizer.ids_to_tokens([tid])[0]
@@ -232,10 +245,12 @@ def tokens_to_sentence_segments(
                 segments.append(_whisper_segment(
                     seg_id, buf_start, t_s, text, buf_ids,
                     avg_logprob=_avg_logprob(buf_logprobs) if token_logprobs is not None else None,
+                    token_times=buf_times,
                 ))
                 seg_id += 1
             buf_ids = []
             buf_logprobs = []
+            buf_times = []
             buf_start = None
     if buf_ids:
         text = tokenizer.ids_to_text(buf_ids).strip()
@@ -243,6 +258,7 @@ def tokens_to_sentence_segments(
             segments.append(_whisper_segment(
                 seg_id, buf_start or 0.0, buf_last_t, text, buf_ids,
                 avg_logprob=_avg_logprob(buf_logprobs) if token_logprobs is not None else None,
+                token_times=buf_times,
             ))
     return segments
 
@@ -330,6 +346,7 @@ class StreamingPrevBatchedEngine:
         self._next_seg_id: int = 0
         self._sentence_buffer_ids: List[int] = []
         self._sentence_buffer_logprobs: List[Optional[float]] = []
+        self._sentence_buffer_times: List[float] = []
         self._sentence_buffer_start: Optional[float] = None
         self._sentence_buffer_last_t: float = 0.0
 
@@ -426,10 +443,12 @@ class StreamingPrevBatchedEngine:
                     text,
                     self._sentence_buffer_ids,
                     avg_logprob=_avg_logprob(self._sentence_buffer_logprobs) if has_lps else None,
+                    token_times=self._sentence_buffer_times,
                 ))
                 self._next_seg_id += 1
             self._sentence_buffer_ids = []
             self._sentence_buffer_logprobs = []
+            self._sentence_buffer_times = []
             self._sentence_buffer_start = None
         return committed
 
@@ -443,6 +462,7 @@ class StreamingPrevBatchedEngine:
         self._next_seg_id = 0
         self._sentence_buffer_ids = []
         self._sentence_buffer_logprobs = []
+        self._sentence_buffer_times = []
         self._sentence_buffer_start = None
         self._sentence_buffer_last_t = 0.0
         self._tokens_emitted_through = 0
@@ -568,6 +588,7 @@ class StreamingPrevBatchedEngine:
                 self._sentence_buffer_start = t
             self._sentence_buffer_ids.append(tid)
             self._sentence_buffer_logprobs.append(lp)
+            self._sentence_buffer_times.append(t)
             self._sentence_buffer_last_t = t
             try:
                 tok = tokenizer.ids_to_tokens([tid])[0]
@@ -584,10 +605,12 @@ class StreamingPrevBatchedEngine:
                         text,
                         self._sentence_buffer_ids,
                         avg_logprob=_avg_logprob(self._sentence_buffer_logprobs) if has_lps else None,
+                        token_times=self._sentence_buffer_times,
                     ))
                     self._next_seg_id += 1
                 self._sentence_buffer_ids = []
                 self._sentence_buffer_logprobs = []
+                self._sentence_buffer_times = []
                 self._sentence_buffer_start = None
         if flush_partial and self._sentence_buffer_ids:
             text = tokenizer.ids_to_text(self._sentence_buffer_ids).strip()
@@ -600,9 +623,11 @@ class StreamingPrevBatchedEngine:
                     text,
                     self._sentence_buffer_ids,
                     avg_logprob=_avg_logprob(self._sentence_buffer_logprobs) if has_lps else None,
+                    token_times=self._sentence_buffer_times,
                 ))
                 self._next_seg_id += 1
             self._sentence_buffer_ids = []
             self._sentence_buffer_logprobs = []
+            self._sentence_buffer_times = []
             self._sentence_buffer_start = None
         return segments

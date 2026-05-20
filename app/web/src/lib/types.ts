@@ -31,6 +31,11 @@ export interface WhisperSegment {
   compression_ratio: number
   /** Always null — Parakeet TDT has no `<|nospeech|>` equivalent. */
   no_speech_prob: number | null
+  /** Per-token decoder times in seconds, parallel to `tokens`. Present
+   * on streaming + FULL paths; absent on response shapes that didn't
+   * carry it (e.g. older payloads). Wall-clock when VAD is on (server
+   * translates from engine clock before emit). */
+  token_times?: number[]
 }
 
 /** One word in the `words[]` array (when timestamp_granularities includes "word"). */

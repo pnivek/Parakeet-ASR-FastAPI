@@ -1,4 +1,4 @@
-import { useMemo, useState, Fragment } from 'react'
+import { useEffect, useMemo, useState, Fragment } from 'react'
 import type { TranscriptionResponse } from '../lib/api'
 import type { VerboseJsonResponse, WhisperSegment } from '../lib/types'
 import { play, seek } from '../lib/playback'
@@ -12,6 +12,9 @@ interface Props {
    * the smoothstep fade-in reveal. For a finalized result we just colour
    * words by playback position — no fade. */
   live: boolean
+  /** Map of segment.id → performance.now() at first observation. Drives the
+   * fade-in of newly arrived segments during live streaming. */
+  segmentArrivals: Map<number, number>
 }
 
 type View = 'text' | 'segments' | 'words' | 'raw'
@@ -26,7 +29,7 @@ const NULL_TIPS: Record<string, string> = {
   seek: 'Not populated for now.',
 }
 
-export function TranscriptSection({ result, filename, currentTime, live }: Props) {
+export function TranscriptSection({ result, filename, currentTime, live, segmentArrivals }: Props) {
   const [view, setView] = useState<View>('text')
 
   if (!result) {
@@ -80,6 +83,7 @@ export function TranscriptSection({ result, filename, currentTime, live }: Props
             currentTime={currentTime}
             filename={filename}
             live={live}
+            segmentArrivals={segmentArrivals}
           />
         )}
       </div>
@@ -93,12 +97,14 @@ function VerboseBody({
   currentTime,
   filename,
   live,
+  segmentArrivals,
 }: {
   body: VerboseJsonResponse
   view: View
   currentTime: number
   filename: string
   live: boolean
+  segmentArrivals: Map<number, number>
 }) {
   const activeWordIdx = useMemo(() => {
     if (!body.words) return -1
@@ -113,7 +119,15 @@ function VerboseBody({
     return (
       <PlainText body={body} currentTime={currentTime} activeWordIdx={activeWordIdx} live={live} />
     )
-  if (view === 'segments') return <SegmentRows segments={body.segments} activeIdx={activeSegIdx} />
+  if (view === 'segments')
+    return (
+      <SegmentRows
+        segments={body.segments}
+        activeIdx={activeSegIdx}
+        live={live}
+        segmentArrivals={segmentArrivals}
+      />
+    )
   if (view === 'words') return <WordsGrid body={body} activeIdx={activeWordIdx} />
   return <Code text={JSON.stringify(body, null, 2)} filename={filename} syntaxColor />
 }
@@ -200,23 +214,86 @@ function PlainText({
 }
 
 // ── Segments with single-line timestamps + compact metadata ─────
-function SegmentRows({ segments, activeIdx }: { segments: WhisperSegment[]; activeIdx: number }) {
+
+// Arrival animation: smoothstep over SEG_FADE_MS ms starting from
+// arrivalMs. While the row is fading in we apply a small upward translate
+// + opacity ramp + blur dropoff, mirroring the word reveal recipe.
+const SEG_FADE_MS = 380
+
+function SegmentRows({
+  segments,
+  activeIdx,
+  live,
+  segmentArrivals,
+}: {
+  segments: WhisperSegment[]
+  activeIdx: number
+  live: boolean
+  segmentArrivals: Map<number, number>
+}) {
   const [openId, setOpenId] = useState<number | null>(null)
-  if (segments.length === 0) return <div className="empty">No segments.</div>
+  const [now, setNow] = useState(() => (typeof performance !== 'undefined' ? performance.now() : 0))
+
+  // While we're animating new arrivals, drive a rAF tick so the fade
+  // completes smoothly. Stops as soon as every segment is settled.
+  useEffect(() => {
+    if (!live) return
+    let raf = 0
+    const tick = () => {
+      const cur = performance.now()
+      setNow(cur)
+      // continue if any segment is still inside its fade window
+      let stillAnimating = false
+      for (const [, arrivedAt] of segmentArrivals) {
+        if (cur - arrivedAt < SEG_FADE_MS) {
+          stillAnimating = true
+          break
+        }
+      }
+      if (stillAnimating) raf = requestAnimationFrame(tick)
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+  }, [live, segmentArrivals, segments.length])
+
+  if (segments.length === 0) {
+    return (
+      <div className="empty">{live ? 'Listening…' : 'No segments.'}</div>
+    )
+  }
+
   const goTo = (start: number, id: number) => {
     setOpenId((cur) => (cur === id ? null : id))
     seek(start)
     play()
   }
+
   return (
     <div className="segs-list">
       {segments.map((s, i) => {
         const active = i === activeIdx
         const open = openId === s.id
+        // Per-segment reveal — only when live AND we have an arrival stamp
+        // for this id. Static results render at full opacity.
+        let revealStyle: React.CSSProperties | undefined
+        if (live && segmentArrivals.has(s.id)) {
+          const arrivedAt = segmentArrivals.get(s.id)!
+          const raw = Math.max(0, Math.min(1, (now - arrivedAt) / SEG_FADE_MS))
+          const eased = raw * raw * (3 - 2 * raw)
+          if (eased < 1) {
+            revealStyle = {
+              opacity: eased,
+              filter: `blur(${(1 - eased) * 2}px)`,
+              transform: `translateY(${(1 - eased) * 4}px)`,
+              willChange: 'opacity, filter, transform',
+            }
+          }
+        }
         return (
           <div
             key={s.id}
             className={active ? 'segs-row segs-row--active' : 'segs-row'}
+            style={revealStyle}
             onClick={() => goTo(s.start, s.id)}
             role="button"
             tabIndex={0}

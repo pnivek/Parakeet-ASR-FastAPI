@@ -23,6 +23,9 @@ interface Props {
   onPartial: (result: TranscriptionResponse) => void
   onError: (message: string) => void
   onBusyChange: (busy: boolean) => void
+  /** Called right before a new mic recording starts. Use to clear prior
+   * result/loaded/peaks so the UI doesn't show the previous session. */
+  onSessionStart?: () => void
 }
 
 const FORMATS: { id: ResponseFormat; label: string }[] = [
@@ -58,7 +61,7 @@ const MicIcon = ({ size = 22 }: { size?: number }) => (
   </svg>
 )
 
-export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBusyChange }: Props) {
+export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBusyChange, onSessionStart }: Props) {
   const s = useSettings()
   const [tab, setTab] = useState<SidebarTab>('source')
   const [advOpen, setAdvOpen] = useState(false)
@@ -202,6 +205,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   }, [recording])
 
   const startMic = useCallback(async () => {
+    onSessionStart?.()
     segmentsRef.current = []
     chunksRef.current = []
     recordStartRef.current = Date.now()
@@ -233,13 +237,14 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
     )
     wsRef.current = ws
     await mic.start()
-  }, [s, handleMessage, mic, onError])
+  }, [s, handleMessage, mic, onError, onSessionStart])
 
   // Drive the bottom Transcribe button. In mic mode it doubles as
   // record/stop. In file/url mode it kicks off the REST upload.
   const transcribe = useCallback(async () => {
     if (mode === 'file') {
       if (!pickedFile) return
+      onSessionStart?.()
       setBusyAll(true)
       setProgress(0)
       try {
@@ -273,6 +278,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       }
     } else if (mode === 'url') {
       if (!urlInput.trim() || urlInput === 'https://') return
+      onSessionStart?.()
       setBusyAll(true)
       try {
         const r = await postTranscriptionUrl(urlInput.trim(), {
@@ -301,7 +307,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       if (recording) mic.stop()
       else startMic().catch((e) => onError(e instanceof Error ? e.message : String(e)))
     }
-  }, [mode, pickedFile, urlInput, s, recording, mic, startMic, onResult, onError, setBusyAll])
+  }, [mode, pickedFile, urlInput, s, recording, mic, startMic, onResult, onError, setBusyAll, onSessionStart])
 
   const transcribeLabel = (() => {
     if (busy) return 'Working…'

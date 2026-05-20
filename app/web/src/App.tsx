@@ -21,6 +21,12 @@ export default function App() {
    * or no result. Drives the word-by-word reveal animation in the
    * transcript view — static results should not animate. */
   const [live, setLive] = useState(false)
+  /**
+   * Per-segment arrival timestamp (`performance.now()` at first observation).
+   * Live segments fade in based on (now - arrivalMs). Reset on
+   * handleSessionStart and on handleResult.
+   */
+  const arrivalRef = useRef<Map<number, number>>(new Map())
 
   // Hidden host for the singleton <audio>.
   const audioMountRef = useRef<HTMLDivElement>(null)
@@ -44,6 +50,7 @@ export default function App() {
     setResult(r)
     setError(null)
     setLive(false) // finalized — drop the streaming reveal
+    arrivalRef.current = new Map() // settled results don't need arrival fades
     if (l.kind === 'file') {
       setAudioFile(l.file)
       computePeaksFor(l.file)
@@ -55,6 +62,16 @@ export default function App() {
   }
 
   const handlePartial = (r: TranscriptionResponse) => {
+    // Stamp any newly-seen segments with their arrival time. Existing ids
+    // keep their original arrival timestamp so they don't re-animate.
+    if (r.format === 'verbose_json') {
+      const now = performance.now()
+      for (const s of r.body.segments) {
+        if (!arrivalRef.current.has(s.id)) {
+          arrivalRef.current.set(s.id, now)
+        }
+      }
+    }
     setResult(r)
     setError(null)
     setLive(true)
@@ -63,6 +80,16 @@ export default function App() {
   const handleError = (msg: string) => {
     setError(msg)
     setLive(false)
+  }
+
+  /** Clear prior session state right before a new transcribe / record fires.
+   * Keeps the UI from flashing the previous transcript while the new one is
+   * in flight. */
+  const handleSessionStart = () => {
+    setResult(null)
+    setError(null)
+    setLive(false)
+    arrivalRef.current = new Map()
   }
 
   useEffect(() => {
@@ -95,6 +122,7 @@ export default function App() {
             filename={loaded?.title ?? 'transcript'}
             currentTime={currentTime}
             live={live}
+            segmentArrivals={arrivalRef.current}
           />
         </div>
         <aside className="shell__side">
@@ -105,6 +133,7 @@ export default function App() {
             onPartial={handlePartial}
             onError={handleError}
             onBusyChange={setBusy}
+            onSessionStart={handleSessionStart}
           />
         </aside>
       </main>

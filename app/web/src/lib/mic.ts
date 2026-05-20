@@ -38,6 +38,10 @@ export interface UseMicOptions {
   onError?: (err: Error) => void
   /** Forwarded to `getUserMedia({ audio: { noiseSuppression: ... } })`. */
   noiseSuppression?: boolean
+  /** Called at ~10 Hz with the analyser's current peak (0..1) while
+   * recording. Drives the hero waveform's live-growing bars without
+   * needing a round-trip to the server. */
+  onPeakSample?: (peak: number) => void
 }
 
 export interface UseMicResult {
@@ -60,6 +64,7 @@ export function useMic({
   onStop,
   onError,
   noiseSuppression = true,
+  onPeakSample,
 }: UseMicOptions): UseMicResult {
   const [state, setState] = useState<MicState>('idle')
   const [error, setError] = useState<string | null>(null)
@@ -172,6 +177,13 @@ export function useMic({
 
       const buf = new Uint8Array(analyser.fftSize)
       const LEVEL_THRESHOLD = 0.025 // coalesce sub-threshold rAF ticks
+      // Waveform sampling cadence — one bar per ~100ms gives a
+      // pleasantly smooth growing waveform (10 bars/s) without flooding
+      // React with per-frame state updates. Tracked between rAF ticks
+      // by holding the max peak we've seen since the last sample.
+      const PEAK_SAMPLE_INTERVAL_MS = 100
+      let lastPeakSampleMs = performance.now()
+      let runningPeakSinceLastSample = 0
       const tick = () => {
         if (!analyserRef.current) return
         // Cast: lib.dom.d.ts in TS6 narrowed this to ArrayBuffer-only views.
@@ -181,9 +193,20 @@ export function useMic({
           const v = Math.abs(buf[i] - 128) / 128
           if (v > peak) peak = v
         }
+        if (peak > runningPeakSinceLastSample) runningPeakSinceLastSample = peak
         if (Math.abs(peak - lastLevelRef.current) >= LEVEL_THRESHOLD) {
           lastLevelRef.current = peak
           setLevel(peak)
+        }
+        const now = performance.now()
+        if (now - lastPeakSampleMs >= PEAK_SAMPLE_INTERVAL_MS) {
+          // Modest gain so typical speech (peak ≈ 0.2–0.4 in the
+          // analyser's 0..1 range) lands as visible-but-not-clipped
+          // bars. clamp(0..1) keeps the renderer's geometry honest.
+          const sampled = Math.min(1, runningPeakSinceLastSample * 3)
+          onPeakSample?.(sampled)
+          runningPeakSinceLastSample = 0
+          lastPeakSampleMs = now
         }
         rafRef.current = requestAnimationFrame(tick)
       }
@@ -197,7 +220,7 @@ export function useMic({
       cleanup()
       setState('error')
     }
-  }, [state, onChunk, onStop, onError, noiseSuppression, cleanup])
+  }, [state, onChunk, onStop, onError, noiseSuppression, onPeakSample, cleanup])
 
   const stop = useCallback(() => {
     const rec = recorderRef.current

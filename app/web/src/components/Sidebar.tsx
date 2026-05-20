@@ -209,15 +209,16 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           )
           break
         }
-        case 'peaks':
-          onPeaks?.(msg.peaks, msg.cumulative)
-          break
+        // 'peaks' messages from the server are ignored here. Mic-mode
+        // peaks are driven from the local AnalyserNode via
+        // useMic({ onPeakSample }) — smoother + no round-trip. File mode
+        // gets peaks from a client-side decode of the Blob in App.tsx.
         case 'error':
           onError(msg.error)
           break
       }
     },
-    [onPartial, onResult, onError, onPeaks],
+    [onPartial, onResult, onError],
   )
 
   const mic = useMic({
@@ -234,6 +235,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       wsRef.current = null
     },
     noiseSuppression: s.noiseSuppression,
+    onPeakSample: (peak) => onPeaks?.([peak], false),
   })
 
   const recording = mic.state === 'recording'
@@ -390,11 +392,12 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
                       srt_content: msg.srt_content,
                     },
                   })
-                } else if (msg.type === 'peaks') {
-                  onPeaks?.(msg.peaks, msg.cumulative)
                 } else if (msg.type === 'error') {
                   onError(msg.error)
                 }
+                // 'peaks' messages from the server are ignored — for
+                // file+progressive the Blob is already local and
+                // computePeaksFor decodes it client-side in App.tsx.
               },
               onError: () => onError('WebSocket error during file streaming.'),
               onClose: (code, reason) => {
@@ -490,7 +493,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       if (recording) mic.stop()
       else startMic().catch((e) => onError(e instanceof Error ? e.message : String(e)))
     }
-  }, [mode, pickedFile, urlInput, s, recording, mic, startMic, onResult, onPartial, onError, setBusyAll, onSessionStart, onAudioReady, onPeaks])
+  }, [mode, pickedFile, urlInput, s, recording, mic, startMic, onResult, onPartial, onError, setBusyAll, onSessionStart, onAudioReady])
 
   // Tear down whatever's in flight for file/url. Mic uses its own
   // record/stop path via mic.stop() — handled inside transcribe().

@@ -101,8 +101,23 @@ export default function App() {
     setResult(null)
     setError(null)
     setLive(false)
+    // Drop prior peaks too — the server emits a fresh stream of them
+    // per session via onPeaks. If we kept the old array, the user would
+    // see the previous recording's waveform briefly.
+    setPeaks(null)
     arrivalRef.current = new Map()
     wordArrivalRef.current = new Map()
+  }
+
+  /** Server-emitted PCM peaks for the hero waveform. Append or replace
+   * based on the message's `cumulative` flag. Lets mic mode draw bars as
+   * the user speaks instead of waiting for the post-recording blob
+   * decode. */
+  const handlePeaks = (newPeaks: number[], cumulative: boolean) => {
+    setPeaks((prev) => {
+      if (cumulative || prev === null) return newPeaks
+      return [...prev, ...newPeaks]
+    })
   }
 
   /**
@@ -164,6 +179,7 @@ export default function App() {
             onBusyChange={setBusy}
             onSessionStart={handleSessionStart}
             onAudioReady={handleAudioReady}
+            onPeaks={handlePeaks}
           />
         </aside>
       </main>

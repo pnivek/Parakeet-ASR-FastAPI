@@ -30,6 +30,10 @@ interface Props {
   /** Called early in a streaming session to wire the audio source without
    * setting the final result (so the user can scrub/play during streaming). */
   onAudioReady?: (loaded: LoadedAudio) => void
+  /** Progressive PCM peaks from the server — append or replace the hero
+   * waveform's peaks array. Lets mic mode draw bars as the user speaks
+   * instead of waiting for final_transcription + blob decode. */
+  onPeaks?: (peaks: number[], cumulative: boolean) => void
 }
 
 const FORMATS: { id: ResponseFormat; label: string }[] = [
@@ -65,7 +69,7 @@ const MicIcon = ({ size = 22 }: { size?: number }) => (
   </svg>
 )
 
-export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBusyChange, onSessionStart, onAudioReady }: Props) {
+export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBusyChange, onSessionStart, onAudioReady, onPeaks }: Props) {
   const s = useSettings()
   const [tab, setTab] = useState<SidebarTab>('source')
   const [advOpen, setAdvOpen] = useState(false)
@@ -205,12 +209,15 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           )
           break
         }
+        case 'peaks':
+          onPeaks?.(msg.peaks, msg.cumulative)
+          break
         case 'error':
           onError(msg.error)
           break
       }
     },
-    [onPartial, onResult, onError],
+    [onPartial, onResult, onError, onPeaks],
   )
 
   const mic = useMic({
@@ -383,6 +390,8 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
                       srt_content: msg.srt_content,
                     },
                   })
+                } else if (msg.type === 'peaks') {
+                  onPeaks?.(msg.peaks, msg.cumulative)
                 } else if (msg.type === 'error') {
                   onError(msg.error)
                 }
@@ -481,7 +490,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       if (recording) mic.stop()
       else startMic().catch((e) => onError(e instanceof Error ? e.message : String(e)))
     }
-  }, [mode, pickedFile, urlInput, s, recording, mic, startMic, onResult, onPartial, onError, setBusyAll, onSessionStart, onAudioReady])
+  }, [mode, pickedFile, urlInput, s, recording, mic, startMic, onResult, onPartial, onError, setBusyAll, onSessionStart, onAudioReady, onPeaks])
 
   // Tear down whatever's in flight for file/url. Mic uses its own
   // record/stop path via mic.stop() — handled inside transcribe().

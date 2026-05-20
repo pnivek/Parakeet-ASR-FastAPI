@@ -1420,6 +1420,21 @@ async def handle_streaming_pcm(
                 )
                 await _run_on_asr_executor(engine.feed_float32, samples_np)
                 total_engine_chunks += 1
+                # Hero waveform: emit one peak per engine chunk. Cheap
+                # (single max over the chunk's float32 PCM) and means the
+                # client doesn't have to wait for decodeAudioData on the
+                # blob to draw bars. Raw amplitude in [0, 1]; client
+                # normalizes when rendering.
+                if websocket.application_state == WebSocketState.CONNECTED:
+                    try:
+                        peak = float(np.abs(samples_np).max()) if samples_np.size else 0.0
+                        await websocket.send_json({
+                            "type": "peaks",
+                            "peaks": [round(peak, 4)],
+                            "cumulative": False,
+                        })
+                    except Exception:
+                        pass  # waveform is non-critical, don't break the stream
                 new_segs = engine.pop_committed_segments()
                 if new_segs and websocket.application_state == WebSocketState.CONNECTED:
                     try:

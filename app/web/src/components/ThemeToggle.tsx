@@ -1,30 +1,19 @@
 import { useEffect } from 'react'
 import { useSettings, type ThemeMode } from '../lib/settings'
 
-const SystemIcon = () => (
-  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.6">
-    <rect x="3" y="4" width="18" height="13" rx="2" />
-    <path d="M8 21h8M12 17v4" />
-  </svg>
-)
-const LightIcon = () => (
-  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
-    <circle cx="12" cy="12" r="4" />
-    <path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M5.6 18.4l1.4-1.4M17 7l1.4-1.4" />
-  </svg>
-)
-const DarkIcon = () => (
-  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M21 13A9 9 0 1 1 11 3a7 7 0 0 0 10 10z" />
-  </svg>
-)
-
-const OPTIONS: { value: ThemeMode; icon: React.FC; label: string }[] = [
-  { value: 'system', icon: SystemIcon, label: 'System' },
-  { value: 'light', icon: LightIcon, label: 'Light' },
-  { value: 'dark', icon: DarkIcon, label: 'Dark' },
+const OPTIONS: { value: ThemeMode; label: string }[] = [
+  { value: 'system', label: 'System' },
+  { value: 'light', label: 'Light' },
+  { value: 'dark', label: 'Dark' },
 ]
 
+/**
+ * Three-way theme switch (System / Light / Dark) persisted via the Zustand
+ * store. Writes `data-theme="light"|"dark"` on <html> when an explicit
+ * theme is chosen; clears it for system, letting `prefers-color-scheme`
+ * win. The CSS reads `[data-theme="..."]` selectors in App.css to override
+ * the media-query defaults.
+ */
 export function ThemeToggle() {
   const theme = useSettings((s) => s.theme)
   const setTheme = useSettings((s) => s.set)
@@ -37,24 +26,18 @@ export function ThemeToggle() {
 
   return (
     <div className="theme" role="radiogroup" aria-label="Theme">
-      {OPTIONS.map((opt) => {
-        const Icon = opt.icon
-        const active = theme === opt.value
-        return (
-          <button
-            key={opt.value}
-            type="button"
-            role="radio"
-            aria-checked={active}
-            aria-label={opt.label}
-            title={opt.label}
-            className={active ? 'theme__btn theme__btn--active' : 'theme__btn'}
-            onClick={() => setTheme('theme', opt.value)}
-          >
-            <Icon />
-          </button>
-        )
-      })}
+      {OPTIONS.map((opt) => (
+        <button
+          key={opt.value}
+          type="button"
+          role="radio"
+          aria-checked={theme === opt.value}
+          className={theme === opt.value ? 'theme__btn theme__btn--active' : 'theme__btn'}
+          onClick={() => setTheme('theme', opt.value)}
+        >
+          {opt.label}
+        </button>
+      ))}
     </div>
   )
 }

@@ -1,28 +1,35 @@
 /**
- * Header — 64px tall, hairline border-bottom, brand on the left, nav on
- * the right. Theme switching isn't here in Maison — the warm graphite
- * palette is the only look.
+ * Header — 64 px tall, hairline border-bottom. Bigger detailed mic logo,
+ * single Documentation link. No theme switcher, no API key CTA (self-hosted
+ * app).
  */
 
-const MicLogo = ({ size = 34 }: { size?: number }) => (
-  <svg viewBox="0 0 32 32" width={size} height={size} fill="none" aria-hidden>
+const MicLogo = () => (
+  <svg viewBox="0 0 32 32" width="34" height="34" fill="none" aria-label="mic">
     <defs>
-      <linearGradient id="pk-logo-grad" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0%" stopColor="oklch(0.78 0.13 55)" />
-        <stop offset="100%" stopColor="oklch(0.8 0.085 80)" />
+      <linearGradient id="ma-mic-cap" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.95" />
+        <stop offset="100%" stopColor="var(--accent)" stopOpacity="0.55" />
       </linearGradient>
+      <radialGradient id="ma-mic-glow" cx="50%" cy="35%" r="55%">
+        <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.35" />
+        <stop offset="100%" stopColor="var(--accent)" stopOpacity="0" />
+      </radialGradient>
     </defs>
-    {/* Pill background with the brand gradient */}
-    <rect x="0" y="0" width="32" height="32" rx="9" fill="url(#pk-logo-grad)" />
-    {/* Subtle inner highlight along the top edge */}
-    <rect x="0.5" y="0.5" width="31" height="31" rx="8.5" fill="none" stroke="rgba(255,255,255,0.25)" />
-    {/* Microphone glyph, rendered in the page bg color so it pops on the gradient */}
-    <g stroke="oklch(0.13 0.012 60)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" fill="none">
-      <rect x="12.5" y="7" width="7" height="11" rx="3.5" fill="oklch(0.13 0.012 60)" stroke="none" />
-      <path d="M9 14.5 a7 7 0 0 0 14 0" />
-      <line x1="16" y1="21.5" x2="16" y2="25" />
-      <line x1="12.5" y1="25" x2="19.5" y2="25" />
-    </g>
+    <circle cx="16" cy="14" r="13" fill="url(#ma-mic-glow)" />
+    {/* mic capsule */}
+    <rect x="11.5" y="4.5" width="9" height="14" rx="4.5" fill="url(#ma-mic-cap)" stroke="var(--accent)" strokeOpacity="0.7" strokeWidth="0.6" />
+    {/* grille lines */}
+    <line x1="13.4" y1="8.2" x2="18.6" y2="8.2" stroke="rgba(0,0,0,0.35)" strokeWidth="0.6" strokeLinecap="round" />
+    <line x1="13.4" y1="10.8" x2="18.6" y2="10.8" stroke="rgba(0,0,0,0.35)" strokeWidth="0.6" strokeLinecap="round" />
+    <line x1="13.4" y1="13.4" x2="18.6" y2="13.4" stroke="rgba(0,0,0,0.35)" strokeWidth="0.6" strokeLinecap="round" />
+    {/* highlight */}
+    <rect x="12.4" y="5.4" width="2" height="11.5" rx="1" fill="rgba(255,255,255,0.35)" />
+    {/* yoke */}
+    <path d="M7.5 14.5 a8.5 8.5 0 0 0 17 0" fill="none" stroke="var(--fg)" strokeOpacity="0.85" strokeWidth="1.4" strokeLinecap="round" />
+    {/* stand */}
+    <line x1="16" y1="23" x2="16" y2="27.5" stroke="var(--fg)" strokeOpacity="0.85" strokeWidth="1.4" strokeLinecap="round" />
+    <line x1="12" y1="27.5" x2="20" y2="27.5" stroke="var(--fg)" strokeOpacity="0.85" strokeWidth="1.4" strokeLinecap="round" />
   </svg>
 )
 
@@ -45,21 +52,6 @@ export function Header() {
         >
           Documentation
         </a>
-        <button
-          type="button"
-          className="header__api pk-glow-btn"
-          style={
-            {
-              ['--btn-accent' as never]: 'var(--accent)',
-              ['--top-hl' as never]: 'rgba(255,255,255,0.15)',
-              ['--stroke-pct' as never]: '38%',
-              ['--bottom-pct' as never]: '18%',
-              ['--glow-r' as never]: '14px',
-            } as React.CSSProperties
-          }
-        >
-          Get API key →
-        </button>
       </div>
     </header>
   )

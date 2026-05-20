@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { postTranscription, postTranscriptionUrl, type TranscriptionResponse, connectLiveWS, type LiveWSHandle } from '../lib/api'
+import {
+  postTranscription,
+  postTranscriptionUrl,
+  type TranscriptionResponse,
+  connectLiveWS,
+  type LiveWSHandle,
+} from '../lib/api'
 import { useSettings } from '../lib/settings'
 import { MIC_FORMAT_HINT, MIC_SAMPLE_RATE, MIC_MIME_TYPE, useMic } from '../lib/mic'
 import { formatBytes, formatTime } from '../lib/format'
@@ -7,6 +13,8 @@ import type { ResponseFormat, Strategy, TimestampGranularity, WhisperSegment, WS
 import type { LoadedAudio } from '../lib/download'
 
 export type InputMode = 'file' | 'mic' | 'url'
+
+type SidebarTab = 'source' | 'output' | 'engine'
 
 interface Props {
   mode: InputMode
@@ -42,11 +50,6 @@ const ChevIcon = ({ up }: { up: boolean }) => (
     <path d="M6 9l6 6 6-6" />
   </svg>
 )
-const CheckIcon = () => (
-  <svg viewBox="0 0 24 24" width={8} height={8} fill="none" stroke="oklch(0.13 0.012 60)" strokeWidth={4} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-    <path d="M5 12l5 5L20 7" />
-  </svg>
-)
 const MicIcon = ({ size = 22 }: { size?: number }) => (
   <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
     <rect x="9" y="3" width="6" height="12" rx="3" />
@@ -55,32 +58,12 @@ const MicIcon = ({ size = 22 }: { size?: number }) => (
   </svg>
 )
 
-const LEVEL_BARS = 22
-
 export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBusyChange }: Props) {
   const s = useSettings()
+  const [tab, setTab] = useState<SidebarTab>('source')
   const [advOpen, setAdvOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [progress, setProgress] = useState<number | null>(null)
-
-  // When leaving Live mic, `progressive` is no longer a valid choice for
-  // REST. Slide it back to 'auto' silently so the next Transcribe doesn't
-  // 400.
-  useEffect(() => {
-    if (mode !== 'mic' && s.strategy === 'progressive') {
-      s.set('strategy', 'auto')
-    }
-    // intentionally only react to mode flips
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode])
-
-  /**
-   * For REST modes, never let `progressive` reach the server. Map it to
-   * `chunked` (the engine the backend uses for chunked REST). For Live mic
-   * we keep whatever the user picked.
-   */
-  const restStrategy = (): Strategy =>
-    mode === 'mic' ? s.strategy : s.strategy === 'progressive' ? 'chunked' : s.strategy
 
   const setBusyAll = useCallback(
     (b: boolean) => {
@@ -109,6 +92,17 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   const recordStartRef = useRef<number>(0)
   const [recordElapsed, setRecordElapsed] = useState(0)
 
+  // ── Auto-drop progressive when mode leaves mic ───────────────────
+  useEffect(() => {
+    if (mode !== 'mic' && s.strategy === 'progressive') {
+      s.set('strategy', 'auto')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode])
+  const restStrategy = (): Strategy =>
+    mode === 'mic' ? s.strategy : s.strategy === 'progressive' ? 'chunked' : s.strategy
+
+  // ── WS message → result/partial dispatch ─────────────────────────
   const handleMessage = useCallback(
     (msg: WSMessage) => {
       switch (msg.type) {
@@ -148,7 +142,12 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           const blob = new Blob(chunksRef.current, { type: MIC_MIME_TYPE })
           const file = new File([blob], `mic-${Date.now()}.webm`, { type: MIC_MIME_TYPE })
           onResult(
-            { kind: 'file', title: `live recording — ${new Date().toLocaleTimeString()}`, source: 'live mic', file },
+            {
+              kind: 'file',
+              title: `live recording — ${new Date().toLocaleTimeString()}`,
+              source: 'live mic',
+              file,
+            },
             {
               format: 'verbose_json',
               body: {
@@ -236,7 +235,8 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
     await mic.start()
   }, [s, handleMessage, mic, onError])
 
-  // Drive Transcribe based on mode
+  // Drive the bottom Transcribe button. In mic mode it doubles as
+  // record/stop. In file/url mode it kicks off the REST upload.
   const transcribe = useCallback(async () => {
     if (mode === 'file') {
       if (!pickedFile) return
@@ -298,20 +298,16 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         setBusyAll(false)
       }
     } else if (mode === 'mic') {
-      if (recording) {
-        mic.stop()
-      } else {
-        startMic().catch((e) => onError(e instanceof Error ? e.message : String(e)))
-      }
+      if (recording) mic.stop()
+      else startMic().catch((e) => onError(e instanceof Error ? e.message : String(e)))
     }
   }, [mode, pickedFile, urlInput, s, recording, mic, startMic, onResult, onError, setBusyAll])
 
   const transcribeLabel = (() => {
     if (busy) return 'Working…'
-    if (mode === 'mic') return recording ? 'Stop' : 'Record'
+    if (mode === 'mic') return recording ? 'Stop ▣' : 'Record ●'
     return 'Transcribe →'
   })()
-
   const transcribeDisabled = (() => {
     if (busy) return true
     if (mode === 'file') return !pickedFile
@@ -322,6 +318,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
 
   const granDisabled = s.responseFormat !== 'verbose_json'
   const toggleGran = (g: TimestampGranularity) => {
+    if (granDisabled) return
     const set = new Set(s.timestampGranularities)
     if (set.has(g)) set.delete(g)
     else set.add(g)
@@ -331,356 +328,429 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
 
   return (
     <div className="sb">
-      {/* Input section */}
-      <Section label="Input" first>
-        <div className="sb__list">
-          {(['file', 'mic', 'url'] as InputMode[]).map((id) => (
-            <Radio
+      {/* Section tabs */}
+      <div className="sb__tabs-row">
+        <div className="ma-tabs">
+          {(['source', 'output', 'engine'] as SidebarTab[]).map((id) => (
+            <button
               key={id}
-              active={mode === id}
-              onClick={() => onModeChange(id)}
-              label={id === 'file' ? 'File' : id === 'mic' ? 'Live mic' : 'URL'}
-            />
+              type="button"
+              className={tab === id ? 'ma-tab ma-tab--active' : 'ma-tab'}
+              onClick={() => setTab(id)}
+            >
+              {id}
+            </button>
           ))}
         </div>
+      </div>
 
-        {mode === 'file' && (
-          <>
-            <div
-              className={dragOver ? 'sb__drop sb__drop--active' : 'sb__drop'}
-              onClick={() => fileInputRef.current?.click()}
-              onDragEnter={(e) => {
-                e.preventDefault()
-                setDragOver(true)
-              }}
-              onDragLeave={(e) => {
-                e.preventDefault()
-                setDragOver(false)
-              }}
-              onDragOver={(e) => e.preventDefault()}
-              onDrop={(e) => {
-                e.preventDefault()
-                setDragOver(false)
-                onFiles(e.dataTransfer.files)
-              }}
-              role="button"
-              tabIndex={0}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') fileInputRef.current?.click()
-              }}
-            >
-              <div className="sb__drop-title">
-                Drop file · or <span className="sb__drop-browse">browse</span>
-              </div>
-              <div className="sb__drop-hint">wav · mp3 · flac · m4a · ogg · webm</div>
-            </div>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="audio/*,video/*"
-              hidden
-              onChange={(e) => onFiles(e.target.files)}
-            />
-            {pickedFile && (
-              <div className="sb__file-info">
-                <div>{pickedFile.name}</div>
-                <div className="sb__file-info-meta">
-                  {formatBytes(pickedFile.size)} · {pickedFile.type || 'audio'}
-                </div>
-              </div>
-            )}
-          </>
-        )}
-
-        {mode === 'mic' && (
-          <div className="sb__mic">
-            <button
-              type="button"
-              className={recording ? 'mic-btn mic-btn--recording pk-glow-btn' : 'mic-btn pk-glow-btn'}
-              onClick={() => (recording ? mic.stop() : startMic())}
-              disabled={micBusy}
-              aria-label={recording ? 'Stop recording' : 'Start recording'}
-              style={
-                {
-                  ['--btn-accent' as never]: 'var(--accent)',
-                  ['--top-hl' as never]: recording ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.2)',
-                  ['--stroke-pct' as never]: recording ? '55%' : '50%',
-                  ['--bottom-pct' as never]: recording ? '0%' : '22%',
-                  ['--glow-r' as never]: '20px',
-                  ['--glow-pct' as never]: recording ? '50%' : '10%',
-                } as React.CSSProperties
-              }
-            >
-              {recording ? <span className="mic-btn__square" /> : <MicIcon />}
-              {recording && <span className="mic-btn__halo" />}
-            </button>
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
-              <span className="mic__status">
-                {mic.state === 'idle' && 'READY'}
-                {mic.state === 'starting' && 'CONNECTING'}
-                {mic.state === 'recording' && 'RECORDING'}
-                {mic.state === 'stopping' && 'FINALIZING'}
-                {mic.state === 'error' && 'ERROR'}
-              </span>
-              <span className={recording ? 'mic__timer mic__timer--on num' : 'mic__timer num'}>
-                {formatTime(recordElapsed)}
-              </span>
-            </div>
-            <div className="mic-meter">
-              {Array.from({ length: LEVEL_BARS }).map((_, i) => {
-                const k = i / (LEVEL_BARS - 1)
-                const lvl = mic.level
-                const jit = 0.55 + (i * 0.117) % 0.5
-                const h = recording ? Math.max(8, Math.min(100, lvl * 110 * jit * (k * 0.6 + 0.7))) : 18
-                const hot = recording && lvl * jit > 0.7
-                const cls = !recording
-                  ? 'mic-meter__bar'
-                  : hot
-                    ? 'mic-meter__bar mic-meter__bar--hot'
-                    : 'mic-meter__bar mic-meter__bar--on'
-                return <div key={i} className={cls} style={{ height: `${h}%` }} />
-              })}
-            </div>
-            {mic.state === 'error' && mic.error && <div className="error">{mic.error}</div>}
-          </div>
-        )}
-
-        {mode === 'url' && (
-          <input
-            type="url"
-            value={urlInput}
-            onChange={(e) => setUrlInput(e.target.value)}
-            className="sb__url-input"
-            spellCheck={false}
-            autoComplete="off"
-            placeholder="https://…"
+      {/* Tab content */}
+      <div className="sb__content">
+        {tab === 'source' && (
+          <SourcePane
+            mode={mode}
+            onModeChange={onModeChange}
+            pickedFile={pickedFile}
+            setPickedFile={setPickedFile}
+            dragOver={dragOver}
+            setDragOver={setDragOver}
+            fileInputRef={fileInputRef}
+            onFiles={onFiles}
+            urlInput={urlInput}
+            setUrlInput={setUrlInput}
+            mic={mic}
+            recording={recording}
+            micBusy={micBusy}
+            recordElapsed={recordElapsed}
+            startMic={startMic}
           />
         )}
+        {tab === 'output' && (
+          <OutputPane
+            format={s.responseFormat}
+            setFormat={(v) => s.set('responseFormat', v)}
+            granularities={s.timestampGranularities}
+            granDisabled={granDisabled}
+            toggleGran={toggleGran}
+          />
+        )}
+        {tab === 'engine' && (
+          <EnginePane
+            strategy={s.strategy}
+            setStrategy={(v) => s.set('strategy', v)}
+            mode={mode}
+            advOpen={advOpen}
+            setAdvOpen={setAdvOpen}
+            longAudioThreshold={s.longAudioThreshold}
+            batchSize={s.batchSize}
+            chunkLength={s.chunkLength}
+            liveLatency={s.liveLatency}
+            progressiveRefinement={s.progressiveRefinement}
+            setLong={(v) => s.set('longAudioThreshold', v)}
+            setBatch={(v) => s.set('batchSize', v)}
+            setChunkLen={(v) => s.set('chunkLength', v)}
+            setLiveLatency={(v) => s.set('liveLatency', v)}
+            setProgRefine={(v) => s.set('progressiveRefinement', v)}
+            ChevIcon={ChevIcon}
+          />
+        )}
+      </div>
 
+      {progress !== null && (
+        <>
+          <div className="sb__progress">
+            <div className="sb__progress-bar" style={{ width: `${Math.round(progress * 100)}%` }} />
+          </div>
+        </>
+      )}
+
+      {/* Commit button — pinned to bottom of the sidebar */}
+      <div className="sb__commit">
         <button
           type="button"
+          className="ma-pill ma-pill--primary"
           onClick={transcribe}
           disabled={transcribeDisabled}
-          className="sb__transcribe pk-glow-btn"
-          style={
-            {
-              ['--btn-accent' as never]: 'var(--accent)',
-              ['--top-hl' as never]: 'rgba(255,255,255,0.18)',
-              ['--stroke-pct' as never]: '45%',
-              ['--bottom-pct' as never]: '22%',
-              ['--glow-r' as never]: '18px',
-            } as React.CSSProperties
-          }
         >
           {transcribeLabel}
         </button>
+      </div>
+      {mic.state === 'error' && mic.error && <div className="error">{mic.error}</div>}
+    </div>
+  )
+}
 
-        {progress !== null && (
-          <>
-            <div className="sb__progress">
-              <div className="sb__progress-bar" style={{ width: `${Math.round(progress * 100)}%` }} />
+// ── Section label ─────────────────────────────────────────────────
+function SBLabel({ children, top }: { children: React.ReactNode; top?: number }) {
+  return (
+    <div className="label-eyebrow-row" style={{ marginTop: top ?? 0 }}>
+      <span className="label-eyebrow">{children}</span>
+      <span className="rule-extend" />
+    </div>
+  )
+}
+
+// ── Source pane ───────────────────────────────────────────────────
+type MicReturn = ReturnType<typeof useMic>
+function SourcePane({
+  mode,
+  onModeChange,
+  pickedFile,
+  setPickedFile: _setPickedFile,
+  dragOver,
+  setDragOver,
+  fileInputRef,
+  onFiles,
+  urlInput,
+  setUrlInput,
+  mic,
+  recording,
+  micBusy,
+  recordElapsed,
+  startMic,
+}: {
+  mode: InputMode
+  onModeChange: (m: InputMode) => void
+  pickedFile: File | null
+  setPickedFile: (f: File | null) => void
+  dragOver: boolean
+  setDragOver: (b: boolean) => void
+  fileInputRef: React.RefObject<HTMLInputElement | null>
+  onFiles: (files: FileList | null) => void
+  urlInput: string
+  setUrlInput: (v: string) => void
+  mic: MicReturn
+  recording: boolean
+  micBusy: boolean
+  recordElapsed: number
+  startMic: () => Promise<void>
+}) {
+  return (
+    <div>
+      <SBLabel>Input</SBLabel>
+      <div className="ma-segmented ma-segmented--full">
+        {(['file', 'mic', 'url'] as InputMode[]).map((id) => (
+          <button
+            key={id}
+            type="button"
+            className={mode === id ? 'ma-pill ma-pill--active' : 'ma-pill'}
+            onClick={() => onModeChange(id)}
+          >
+            {id === 'file' ? 'file' : id === 'mic' ? 'live mic' : 'url'}
+          </button>
+        ))}
+      </div>
+
+      {mode === 'file' && (
+        <>
+          <div
+            className={dragOver ? 'sb__drop sb__drop--active' : 'sb__drop'}
+            onClick={() => fileInputRef.current?.click()}
+            onDragEnter={(e) => {
+              e.preventDefault()
+              setDragOver(true)
+            }}
+            onDragLeave={(e) => {
+              e.preventDefault()
+              setDragOver(false)
+            }}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => {
+              e.preventDefault()
+              setDragOver(false)
+              onFiles(e.dataTransfer.files)
+            }}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') fileInputRef.current?.click()
+            }}
+          >
+            <div className="sb__drop-title">
+              Drop file · or <span className="sb__drop-browse">browse</span>
             </div>
-            <div className="sb__progress-label">
-              <span>UPLOAD</span>
-              <span>{Math.round(progress * 100)}%</span>
+            <div className="sb__drop-hint">wav · mp3 · flac · m4a · ogg · webm</div>
+          </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="audio/*,video/*"
+            hidden
+            onChange={(e) => onFiles(e.target.files)}
+          />
+          {pickedFile && (
+            <div className="sb__file-info">
+              <span className="sb__file-info-name">{pickedFile.name}</span>
+              <span className="sb__file-info-meta">
+                {formatBytes(pickedFile.size)} · {pickedFile.type || 'audio'}
+              </span>
             </div>
-          </>
-        )}
-      </Section>
+          )}
+        </>
+      )}
 
-      {/* Format */}
-      <Section label="Format">
-        <div className="sb__list">
-          {FORMATS.map((f) => (
-            <Radio
-              key={f.id}
-              mono
-              active={s.responseFormat === f.id}
-              onClick={() => s.set('responseFormat', f.id)}
-              label={f.label}
-            />
-          ))}
+      {mode === 'mic' && (
+        <div className="sb__mic">
+          <button
+            type="button"
+            className={recording ? 'mic-btn mic-btn--recording' : 'mic-btn'}
+            onClick={() => (recording ? mic.stop() : startMic())}
+            disabled={micBusy}
+            aria-label={recording ? 'Stop recording' : 'Start recording'}
+          >
+            {recording ? <span className="mic-btn__square" /> : <MicIcon />}
+            {recording && <span className="mic-btn__halo" />}
+          </button>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
+            <span className="mic__status">
+              {mic.state === 'idle' && 'READY'}
+              {mic.state === 'starting' && 'CONNECTING'}
+              {mic.state === 'recording' && 'RECORDING'}
+              {mic.state === 'stopping' && 'FINALIZING'}
+              {mic.state === 'error' && 'ERROR'}
+            </span>
+            <span className={recording ? 'mic__timer mic__timer--on num' : 'mic__timer num'}>
+              {formatTime(recordElapsed)}
+            </span>
+          </div>
+          <SidebarMicMeter level={mic.level} recording={recording} />
+          <div className="sb__mic-hint">Tap above to start. Tap Transcribe at the bottom to stop.</div>
         </div>
-      </Section>
+      )}
 
-      {/* Strategy — gate `progressive` on mic mode */}
-      <Section label="Strategy">
-        <div className="sb__list">
-          {STRATEGIES.map((id) => {
-            const disabled = id === 'progressive' && mode !== 'mic'
-            return (
-              <Radio
-                key={id}
-                mono
-                active={s.strategy === id}
-                onClick={() => !disabled && s.set('strategy', id)}
-                disabled={disabled}
-                title={disabled ? 'progressive requires Live mic (WebSocket)' : undefined}
-                label={id}
-              />
-            )
-          })}
-        </div>
-        {s.strategy === 'progressive' && mode !== 'mic' && (
-          <div className="sb__hint">progressive requires Live mic — REST modes will use chunked.</div>
+      {mode === 'url' && (
+        <input
+          type="url"
+          value={urlInput}
+          onChange={(e) => setUrlInput(e.target.value)}
+          className="sb__url-input"
+          spellCheck={false}
+          autoComplete="off"
+          placeholder="https://…"
+        />
+      )}
+    </div>
+  )
+}
+
+function SidebarMicMeter({ level, recording }: { level: number; recording: boolean }) {
+  return (
+    <div className="mic-meter">
+      {Array.from({ length: 22 }).map((_, i) => {
+        const k = i / 21
+        const jit = 0.55 + ((i * 11.7) % 50) / 100
+        const h = recording ? Math.max(8, Math.min(100, level * 110 * jit * (k * 0.6 + 0.7))) : 18
+        const hot = recording && level * jit > 0.7
+        const cls = !recording
+          ? 'mic-meter__bar'
+          : hot
+            ? 'mic-meter__bar mic-meter__bar--hot'
+            : 'mic-meter__bar mic-meter__bar--on'
+        return <div key={i} className={cls} style={{ height: `${h}%` }} />
+      })}
+    </div>
+  )
+}
+
+// ── Output pane ───────────────────────────────────────────────────
+function OutputPane({
+  format,
+  setFormat,
+  granularities,
+  granDisabled,
+  toggleGran,
+}: {
+  format: ResponseFormat
+  setFormat: (v: ResponseFormat) => void
+  granularities: TimestampGranularity[]
+  granDisabled: boolean
+  toggleGran: (g: TimestampGranularity) => void
+}) {
+  return (
+    <div>
+      <SBLabel>Format</SBLabel>
+      <div className="ma-cluster">
+        {FORMATS.map((f) => (
+          <button
+            key={f.id}
+            type="button"
+            className={format === f.id ? 'ma-pill ma-pill--active' : 'ma-pill'}
+            onClick={() => setFormat(f.id)}
+          >
+            {f.label}
+          </button>
+        ))}
+      </div>
+
+      <SBLabel top={22}>
+        Timestamps
+        {granDisabled && (
+          <span
+            style={{
+              marginLeft: 10,
+              fontFamily: 'Newsreader, serif',
+              fontStyle: 'italic',
+              fontSize: 11,
+              color: 'var(--muted-deep)',
+              textTransform: 'none',
+              letterSpacing: 0,
+            }}
+          >
+            verbose_json only
+          </span>
         )}
-      </Section>
-
-      {/* Timestamps */}
-      <Section label="Timestamps">
-        <div className="sb__list">
-          {(['segment', 'word'] as TimestampGranularity[]).map((id) => (
-            <Check
+      </SBLabel>
+      <div className="ma-segmented ma-segmented--full">
+        {(['segment', 'word'] as TimestampGranularity[]).map((id) => {
+          const on = !granDisabled && granularities.includes(id)
+          return (
+            <button
               key={id}
-              active={s.timestampGranularities.includes(id)}
+              type="button"
               disabled={granDisabled}
+              className={on ? 'ma-pill ma-pill--active' : 'ma-pill'}
               onClick={() => toggleGran(id)}
-              label={id === 'segment' ? 'Segment' : 'Word'}
-            />
-          ))}
-        </div>
-        {granDisabled && <div className="sb__hint">verbose_json only</div>}
-      </Section>
+            >
+              {id}
+            </button>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
 
-      {/* Advanced */}
-      <Section label="Advanced">
-        <button type="button" className="sb__adv-toggle" onClick={() => setAdvOpen((o) => !o)}>
+// ── Engine pane ───────────────────────────────────────────────────
+function EnginePane({
+  strategy,
+  setStrategy,
+  mode,
+  advOpen,
+  setAdvOpen,
+  longAudioThreshold,
+  batchSize,
+  chunkLength,
+  liveLatency,
+  progressiveRefinement,
+  setLong,
+  setBatch,
+  setChunkLen,
+  setLiveLatency,
+  setProgRefine,
+  ChevIcon,
+}: {
+  strategy: Strategy
+  setStrategy: (v: Strategy) => void
+  mode: InputMode
+  advOpen: boolean
+  setAdvOpen: (b: boolean) => void
+  longAudioThreshold: number | null
+  batchSize: number | null
+  chunkLength: number | null
+  liveLatency: boolean
+  progressiveRefinement: boolean
+  setLong: (v: number | null) => void
+  setBatch: (v: number | null) => void
+  setChunkLen: (v: number | null) => void
+  setLiveLatency: (v: boolean) => void
+  setProgRefine: (v: boolean) => void
+  ChevIcon: React.FC<{ up: boolean }>
+}) {
+  return (
+    <div>
+      <SBLabel>Strategy</SBLabel>
+      <div className="ma-cluster">
+        {STRATEGIES.map((id) => {
+          const disabled = id === 'progressive' && mode !== 'mic'
+          return (
+            <button
+              key={id}
+              type="button"
+              disabled={disabled}
+              title={disabled ? 'progressive requires Live mic (WebSocket)' : undefined}
+              className={strategy === id ? 'ma-pill ma-pill--active' : 'ma-pill'}
+              onClick={() => !disabled && setStrategy(id)}
+            >
+              {id}
+            </button>
+          )
+        })}
+      </div>
+      {strategy === 'progressive' && mode !== 'mic' && (
+        <div className="sb__hint">progressive requires Live mic — REST uploads use chunked.</div>
+      )}
+
+      <div style={{ marginTop: 22 }}>
+        <button type="button" className="sb__adv-toggle" onClick={() => setAdvOpen(!advOpen)}>
           <ChevIcon up={advOpen} />
-          <span>{advOpen ? 'collapse' : 'expand'}</span>
+          <span>Advanced · {advOpen ? 'hide' : 'show'}</span>
         </button>
         {advOpen && (
-          <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
-            <NumKv
-              k="long_audio_threshold"
-              v={s.longAudioThreshold}
-              defaultV={480}
-              onSet={(v) => s.set('longAudioThreshold', v)}
-              suffix="s"
-            />
-            <NumKv
-              k="batch_size"
-              v={s.batchSize}
-              defaultV={4}
-              onSet={(v) => s.set('batchSize', v)}
-            />
-            <NumKv
-              k="chunk_length"
-              v={s.chunkLength}
-              defaultV={30}
-              onSet={(v) => s.set('chunkLength', v)}
-              suffix="s"
-            />
-            <ToggleKv
-              k="live_latency"
-              v={s.liveLatency}
-              onSet={(v) => s.set('liveLatency', v)}
-            />
-            <ToggleKv
-              k="progressive_refinement"
-              v={s.progressiveRefinement}
-              onSet={(v) => s.set('progressiveRefinement', v)}
-            />
-            <button
-              type="button"
-              onClick={s.reset}
-              style={{
-                marginTop: 4,
-                padding: '6px 10px',
-                background: 'transparent',
-                border: '1px solid var(--rule)',
-                color: 'var(--fg-dim)',
-                fontSize: 10.5,
-                letterSpacing: 0.7,
-                textTransform: 'uppercase',
-                fontFamily: 'var(--font-mono)',
-                cursor: 'pointer',
-                alignSelf: 'flex-start',
-                borderRadius: 4,
-              }}
-            >
-              Reset defaults
-            </button>
+          <div className="sb__adv-body">
+            <NumKv k="long_audio_threshold" v={longAudioThreshold} placeholder={480} suffix="s" onSet={setLong} />
+            <NumKv k="batch_size" v={batchSize} placeholder={4} onSet={setBatch} />
+            <NumKv k="chunk_length" v={chunkLength} placeholder={30} suffix="s" onSet={setChunkLen} />
+            <ToggleKv k="live_latency" v={liveLatency} onSet={setLiveLatency} />
+            <ToggleKv k="progressive_refinement" v={progressiveRefinement} onSet={setProgRefine} />
           </div>
         )}
-      </Section>
+      </div>
     </div>
-  )
-}
-
-function Section({ label, children, first }: { label: string; children: React.ReactNode; first?: boolean }) {
-  return (
-    <div className={first ? 'sb__section sb__section--first' : 'sb__section'}>
-      <div className="sb__label">{label}</div>
-      {children}
-    </div>
-  )
-}
-
-function Radio({
-  active,
-  onClick,
-  disabled,
-  label,
-  mono,
-  title,
-}: {
-  active: boolean
-  onClick: () => void
-  disabled?: boolean
-  label: string
-  mono?: boolean
-  title?: string
-}) {
-  return (
-    <button
-      type="button"
-      className={`${active ? 'sb-radio sb-radio--active' : 'sb-radio'}${mono ? ' sb-radio--mono' : ''}`}
-      onClick={onClick}
-      disabled={disabled}
-      title={title}
-    >
-      <span>{label}</span>
-      <span className="sb-radio__dot" />
-    </button>
-  )
-}
-
-function Check({
-  active,
-  onClick,
-  disabled,
-  label,
-}: {
-  active: boolean
-  onClick: () => void
-  disabled?: boolean
-  label: string
-}) {
-  return (
-    <button
-      type="button"
-      className={active ? 'sb-check sb-check--active' : 'sb-check'}
-      onClick={onClick}
-      disabled={disabled}
-    >
-      <span className="sb-check__box">{active && <CheckIcon />}</span>
-      <span>{label}</span>
-    </button>
   )
 }
 
 function NumKv({
   k,
   v,
-  defaultV,
+  placeholder,
+  suffix,
   onSet,
-  suffix = '',
 }: {
   k: string
   v: number | null
-  defaultV: number
-  onSet: (v: number | null) => void
+  placeholder: number
   suffix?: string
+  onSet: (v: number | null) => void
 }) {
   return (
     <div className="sb__kv">
@@ -688,40 +758,26 @@ function NumKv({
       <input
         type="number"
         value={v ?? ''}
-        placeholder={`${defaultV}`}
+        placeholder={`${placeholder}${suffix ?? ''}`}
         onChange={(e) => onSet(e.target.value === '' ? null : Number(e.target.value))}
-        style={{
-          width: 80,
-          background: 'transparent',
-          border: 'none',
-          borderBottom: '1px solid var(--rule)',
-          color: 'var(--fg-dim)',
-          fontFamily: 'var(--font-mono)',
-          fontVariantNumeric: 'tabular-nums',
-          fontSize: 11,
-          letterSpacing: 0.2,
-          padding: '2px 0',
-          outline: 'none',
-          textAlign: 'right',
-        }}
+        className="sb__kv-v"
+        style={{ background: 'transparent' }}
       />
-      {suffix && <span className="sb__kv-v" style={{ marginLeft: -4, opacity: 0.6 }}>{suffix}</span>}
     </div>
   )
 }
 
 function ToggleKv({ k, v, onSet }: { k: string; v: boolean; onSet: (v: boolean) => void }) {
   return (
-    <button
-      type="button"
-      onClick={() => onSet(!v)}
-      className="sb__kv"
-      style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', textAlign: 'left' }}
-    >
+    <div className="sb__kv">
       <span className="sb__kv-k">{k}</span>
-      <span className="sb__kv-v" style={{ color: v ? 'var(--accent)' : 'var(--muted)' }}>
+      <button
+        type="button"
+        className={v ? 'sb__kv-v sb__kv-v--toggle is-on' : 'sb__kv-v sb__kv-v--toggle'}
+        onClick={() => onSet(!v)}
+      >
         {v ? 'on' : 'off'}
-      </span>
-    </button>
+      </button>
+    </div>
   )
 }

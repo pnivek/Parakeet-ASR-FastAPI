@@ -1,34 +1,37 @@
 import { Waveform } from './Waveform'
 import { formatTime } from '../lib/format'
-import { pause, play, resetPlayback, useCurrentTime, useDuration, useIsPlaying } from '../lib/playback'
+import {
+  pause,
+  play,
+  resetPlayback,
+  useCurrentTime,
+  useDuration,
+  useIsPlaying,
+} from '../lib/playback'
 import { downloadAudio, type LoadedAudio } from '../lib/download'
 
 export type HeroState = 'idle' | 'streaming' | 'done' | 'error'
 
 interface Props {
-  /** Currently-loaded audio info — drives title, meta, downloads. */
   loaded: LoadedAudio | null
-  /** Peaks for the waveform. */
   peaks: number[] | null
-  /** Stream state pill in the eyebrow row. */
   state: HeroState
-  /** Optional language label (defaults to "en"). */
   language?: string
 }
 
-const PlayIcon = ({ size = 17 }: { size?: number }) => (
+const PlayIcon = ({ size = 16 }: { size?: number }) => (
   <svg viewBox="0 0 24 24" width={size} height={size} fill="currentColor" aria-hidden>
     <path d="M8 5.5v13a.5.5 0 0 0 .77.42l10-6.5a.5.5 0 0 0 0-.84l-10-6.5A.5.5 0 0 0 8 5.5z" />
   </svg>
 )
-const PauseIcon = ({ size = 17 }: { size?: number }) => (
+const PauseIcon = ({ size = 16 }: { size?: number }) => (
   <svg viewBox="0 0 24 24" width={size} height={size} fill="currentColor" aria-hidden>
     <rect x="6" y="5" width="4" height="14" rx="1" />
     <rect x="14" y="5" width="4" height="14" rx="1" />
   </svg>
 )
 const ResetIcon = () => (
-  <svg viewBox="0 0 24 24" width={11} height={11} fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden>
+  <svg viewBox="0 0 24 24" width={11} height={11} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" aria-hidden>
     <path d="M19 12a7 7 0 1 1-2-4.9" />
     <path d="M19 4v5h-5" />
   </svg>
@@ -52,21 +55,29 @@ export function HeroRow({ loaded, peaks, state, language = 'en' }: Props) {
   const dur = useDuration()
   const playing = useIsPlaying()
   const progress = dur > 0 ? Math.round((t / dur) * 100) : 0
-  const ext = loaded?.kind === 'file' && loaded.file ? loaded.file.name.split('.').pop() : 'wav'
+  const ext = loaded?.kind === 'file' ? loaded.file.name.split('.').pop() || 'wav' : 'wav'
 
   return (
     <section className="hero spin-in" key={loaded?.title ?? 'empty'}>
-      <div className="hero__id">
-        <div className="hero__eyebrow-row">
-          <span className="label-eyebrow">NOW PLAYING</span>
-          <span
-            className={`status-pill ${
-              state === 'streaming' ? 'status-pill--streaming' : state === 'idle' ? 'status-pill--idle' : ''
-            }`}
-          >
-            <span className="status-pill__dot" />
-            {STATE_LABEL[state]}
-          </span>
+      <div>
+        <div className="hero__id-row">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <span className="label-eyebrow">NOW PLAYING</span>
+            <span
+              className={`status-pill ${
+                state === 'streaming' ? 'status-pill--streaming' : state === 'idle' ? 'status-pill--idle' : ''
+              }`}
+            >
+              <span className="status-pill__dot" />
+              {STATE_LABEL[state]}
+            </span>
+          </div>
+          <div className="hero__position">
+            <span className="hero__position-l">POSITION</span>
+            <span className="hero__position-v num">
+              {formatTime(t)} <span className="hero__position-v--dim">/ {formatTime(dur)}</span>
+            </span>
+          </div>
         </div>
         <h1 className="hero__title">
           {loaded?.title || 'Drop audio, paste a URL, or record to begin.'}
@@ -104,65 +115,20 @@ export function HeroRow({ loaded, peaks, state, language = 'en' }: Props) {
       <div className="transport">
         <button
           type="button"
-          className="transport__play pk-glow-btn"
+          className="ma-pill ma-pill--active transport__play"
           onClick={() => (playing ? pause() : play())}
           disabled={!loaded}
           aria-label={playing ? 'Pause' : 'Play'}
-          style={
-            {
-              ['--btn-accent' as never]: 'var(--accent)',
-              ['--top-hl' as never]: 'rgba(255,255,255,0.2)',
-              ['--stroke-pct' as never]: '50%',
-              ['--bottom-pct' as never]: '22%',
-              ['--glow-r' as never]: '18px',
-            } as React.CSSProperties
-          }
         >
           {playing ? <PauseIcon /> : <PlayIcon />}
         </button>
 
-        <div className="transport__pos">
-          <span className="transport__pos-l">POSITION</span>
-          <span className="transport__pos-v num">
-            {formatTime(t)} <span className="transport__pos-v--dim">/ {formatTime(dur)}</span>
-          </span>
-        </div>
-
-        <span className="transport__divider" />
-
-        <button
-          type="button"
-          className="glass-pill pk-glow-btn"
-          onClick={resetPlayback}
-          disabled={!loaded}
-          style={
-            {
-              ['--btn-accent' as never]: 'var(--accent)',
-              ['--top-hl' as never]: 'rgba(255,255,255,0.14)',
-              ['--stroke-pct' as never]: '18%',
-              ['--bottom-pct' as never]: '0%',
-              ['--glow-r' as never]: '14px',
-            } as React.CSSProperties
-          }
-        >
+        <button type="button" className="ma-pill" onClick={resetPlayback} disabled={!loaded}>
           <ResetIcon />
           Reset
         </button>
         {loaded && (
-          <button
-            type="button"
-            className="glass-pill pk-glow-btn"
-            onClick={() => downloadAudio(loaded)}
-            style={
-              {
-                ['--btn-accent' as never]: 'var(--accent)',
-                ['--top-hl' as never]: 'rgba(255,255,255,0.14)',
-                ['--stroke-pct' as never]: '18%',
-                ['--bottom-pct' as never]: '0%',
-                ['--glow-r' as never]: '14px',
-              } as React.CSSProperties
-            }
-          >
+          <button type="button" className="ma-pill" onClick={() => downloadAudio(loaded)}>
             <DownloadIcon />
             .{ext}
           </button>

@@ -1,11 +1,11 @@
 import { test, expect } from '@playwright/test'
 
 /**
- * Smoke test: load the deployed Maison UI, walk through the three input
- * modes, verify the strategy gate, and capture screenshots.
+ * Smoke test: load the deployed Maison v6 UI, walk the three sidebar
+ * tabs + the three input modes, verify the strategy gate, and capture
+ * screenshots.
  */
-test('Maison UI — boots, modes switch, strategy gate enforced', async ({ page }) => {
-  // Capture all console messages so we surface client errors in the report.
+test('Maison v6 UI — boots, tabs switch, modes switch, strategy gate enforced', async ({ page }) => {
   const consoleErrors: string[] = []
   page.on('console', (msg) => {
     if (msg.type() === 'error') consoleErrors.push(msg.text())
@@ -21,50 +21,63 @@ test('Maison UI — boots, modes switch, strategy gate enforced', async ({ page 
   await expect(page.getByText('Parakeet', { exact: true })).toBeVisible()
   await expect(page.getByText('playground')).toBeVisible()
 
-  // The retired "v5 maison" chip should NOT appear; nor the Pricing link.
+  // Retired chrome must be gone.
   await expect(page.getByText(/v5\s*[·•]\s*maison/i)).toHaveCount(0)
   await expect(page.getByText(/^Pricing$/i)).toHaveCount(0)
+  await expect(page.getByText(/Get API key/i)).toHaveCount(0)
 
-  // Sidebar sections are visible.
-  for (const label of ['Input', 'Format', 'Strategy', 'Timestamps', 'Advanced']) {
-    await expect(page.getByText(label, { exact: true })).toBeVisible()
-  }
+  // Sidebar uses three tabs now: source / output / engine
+  const sourceTab = page.getByRole('button', { name: /^source$/i })
+  const outputTab = page.getByRole('button', { name: /^output$/i })
+  const engineTab = page.getByRole('button', { name: /^engine$/i })
+  await expect(sourceTab).toBeVisible()
+  await expect(outputTab).toBeVisible()
+  await expect(engineTab).toBeVisible()
 
-  // Default mode = File. Switch through all three and assert the right
-  // mode-specific UI shows.
-  await page.getByRole('button', { name: /^File$/ }).click()
+  // Source tab — File mode shows drop zone
+  await sourceTab.click()
   await expect(page.getByText(/Drop file/i)).toBeVisible()
 
-  await page.getByRole('button', { name: /^URL$/ }).click()
+  // Switch to URL mode
+  await page.getByRole('button', { name: /^url$/ }).click()
   await expect(page.getByPlaceholder('https://…')).toBeVisible()
 
-  await page.getByRole('button', { name: /^Live mic$/ }).click()
-  // mic status text appears
+  // Switch to mic mode
+  await page.getByRole('button', { name: /^live mic$/ }).click()
   await expect(page.locator('.mic__status')).toBeVisible()
 
-  // Strategy gate: progressive should be enabled while in mic mode.
-  await page.getByRole('button', { name: /^progressive$/ }).click()
-  // (we just need to confirm it's clickable; settings persist)
+  // Output tab — Format cluster, Timestamps segmented
+  await outputTab.click()
+  await expect(page.getByRole('button', { name: /^verbose_json$/ })).toBeVisible()
+  await expect(page.getByRole('button', { name: /^Segment$/i })).toBeVisible()
+  await expect(page.getByRole('button', { name: /^Word$/i })).toBeVisible()
 
-  // Switch back to File — progressive should be disabled / fallback engaged.
-  await page.getByRole('button', { name: /^File$/ }).click()
+  // Engine tab — Strategy cluster
+  await engineTab.click()
+  await expect(page.getByRole('button', { name: /^auto$/ })).toBeVisible()
+  await expect(page.getByRole('button', { name: /^chunked$/ })).toBeVisible()
+
+  // Strategy gate: progressive should be disabled while mode != mic.
+  await sourceTab.click()
+  await page.getByRole('button', { name: /^file$/ }).click()
+  await engineTab.click()
   const progressiveBtn = page.getByRole('button', { name: /^progressive$/ })
   await expect(progressiveBtn).toBeDisabled()
 
-  // Footer rail metric labels are present.
+  // Footer rail metric labels present.
   for (const label of ['STRATEGY', 'ASR', 'RTFx', 'SEGMENTS', 'WORDS']) {
     await expect(page.getByText(label, { exact: true })).toBeVisible()
   }
 
-  // Snapshot the final state for the artefact folder.
-  await page.screenshot({ path: 'tests/screenshots/maison-file.png', fullPage: true })
+  // Transcribe pill pinned at the bottom of the sidebar.
+  await expect(page.getByRole('button', { name: /Transcribe/i })).toBeVisible()
 
-  // Visit mic mode one more time and snapshot — useful for diffing the
-  // "secure context required" message when running over HTTP.
-  await page.getByRole('button', { name: /^Live mic$/ }).click()
-  await page.getByRole('button', { name: /Record|Stop/ }).click().catch(() => {})
-  await page.waitForTimeout(400)
-  await page.screenshot({ path: 'tests/screenshots/maison-mic.png', fullPage: true })
+  // Snapshots.
+  await page.screenshot({ path: 'tests/screenshots/maison-source.png', fullPage: true })
+  await outputTab.click()
+  await page.screenshot({ path: 'tests/screenshots/maison-output.png', fullPage: true })
+  await engineTab.click()
+  await page.screenshot({ path: 'tests/screenshots/maison-engine.png', fullPage: true })
 
   expect(consoleErrors, `client console errors:\n${consoleErrors.join('\n')}`).toEqual([])
 })

@@ -2132,6 +2132,15 @@ if __name__ == "__main__":
             "main:app",             # FastAPI app instance string
             host=HOST,              # Host to bind to
             port=PORT,              # Port to listen on
-            workers=1,              # Number of Uvicorn worker processes (recommend 1 with current global model)
-            log_level=log_level_str.lower() # Sync Uvicorn log level with app's
+            workers=1,              # Single worker — global model + asyncio.Lock
+            log_level=log_level_str.lower(),
+            # WebSocket keepalive — defaults of 20s ping interval + 20s timeout
+            # are way too aggressive for the streaming endpoints: a long file
+            # being streamed over WS or a long-running mic session can saturate
+            # the socket with binary chunks + outbound segments_batch messages,
+            # which delays ping/pong handshakes and trips a 1011 close. Push
+            # the timeout to 5 minutes so the connection survives realistic
+            # workloads while still catching genuinely dead clients.
+            ws_ping_interval=30,
+            ws_ping_timeout=300,
         )

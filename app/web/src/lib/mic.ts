@@ -18,8 +18,14 @@ export const MIC_SAMPLE_RATE = 48000
 export const MIC_MIME_TYPE = 'audio/webm;codecs=opus'
 /** Container/codec hint passed to ffmpeg over the WS config first frame. */
 export const MIC_FORMAT_HINT = 'webm'
-/** How often MediaRecorder emits a Blob (ms). 1 s keeps latency low without choking ffmpeg. */
-export const MIC_TIMESLICE_MS = 1000
+/**
+ * How often MediaRecorder emits a Blob (ms). 250 ms gives the server data
+ * to chew on much sooner — the first chunk leaves the browser within a
+ * quarter-second of pressing Record instead of waiting a full second.
+ * The server's chunk_queue handles the smaller-but-more-frequent frames
+ * fine; ffmpeg sees the same bytestream either way.
+ */
+export const MIC_TIMESLICE_MS = 250
 
 export interface UseMicOptions {
   /** Called once per MediaRecorder timeslice. Forward the blob to the WS. */

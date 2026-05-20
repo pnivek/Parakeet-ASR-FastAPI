@@ -305,15 +305,26 @@ export function streamFileViaWS(
 
   async function pumpFile() {
     const CHUNK_SIZE = 64 * 1024
+    // Backpressure thresholds. WebSocket.bufferedAmount tells us how many
+    // bytes are queued for send. If we let it climb unboundedly we drown
+    // the server's inbound buffer + delay outbound segments_batch / pings,
+    // which trips uvicorn's keepalive timeout (close 1011). Pause sending
+    // when the buffer crosses HIGH; resume once it drains below LOW.
+    const HIGH = 4 * 1024 * 1024
+    const LOW = 1 * 1024 * 1024
     const stream = file.stream()
     const reader = stream.getReader()
     try {
       while (!aborted) {
         const { value, done } = await reader.read()
         if (done) break
-        // value is a Uint8Array; slice into CHUNK_SIZE pieces so individual
-        // WebSocket frames stay small enough to flush smoothly.
         for (let i = 0; i < value.byteLength; i += CHUNK_SIZE) {
+          if (aborted) return
+          // Wait for the send buffer to drain before queuing more.
+          while (handle.socket.bufferedAmount > HIGH && !aborted) {
+            await new Promise((r) => setTimeout(r, 25))
+            if (handle.socket.bufferedAmount < LOW) break
+          }
           if (aborted) return
           const slice = value.slice(i, Math.min(i + CHUNK_SIZE, value.byteLength))
           handle.sendBinary(slice.buffer as ArrayBuffer)

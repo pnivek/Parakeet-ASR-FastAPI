@@ -43,7 +43,11 @@ const DEFAULTS: Omit<Settings, 'set' | 'reset'> = {
   chunkOverlap: null,
   batchSize: null,
   longAudioThreshold: null,
-  liveLatency: false,
+  // Use the 10-2-2 streaming preset by default — ~6 s emission lag vs
+  // ~7.5 s for 10-10-5. The quality regression at chunk boundaries is
+  // small enough that the snappier default is the right tradeoff for an
+  // interactive playground.
+  liveLatency: true,
   // Default off — refinement runs an extra FULL pass at EOF which adds
   // latency on long recordings. Users who want offline-quality final
   // output can opt in.

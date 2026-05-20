@@ -1,32 +1,50 @@
 /**
- * Audio playback state for the transcription result.
- *
- * Exposes a single `useAudio()` hook returning the shared <audio> element,
- * the current playback time (via `useSyncExternalStore` so only components
- * that subscribe re-render on `timeupdate`), and a `seek(t)` helper.
- *
- * One audio instance per page — kept as a module-level singleton so the
- * mounted <audio> survives parent re-renders without re-loading the blob.
+ * Audio playback singleton. One <audio> element per page, hidden via
+ * `display: none` since the Maison hero row owns the visual transport.
+ * Hooks back into React via `useSyncExternalStore` so only subscribed
+ * components re-render on timeupdate / play / pause / duration.
  */
 import { useEffect, useSyncExternalStore } from 'react'
 
 let audioEl: HTMLAudioElement | null = null
 let currentTime = 0
+let duration = 0
+let isPlaying = false
 const listeners = new Set<() => void>()
+const notify = () => listeners.forEach((l) => l())
 
 function ensureEl(): HTMLAudioElement {
   if (audioEl) return audioEl
   const el = document.createElement('audio')
-  el.controls = true
   el.preload = 'auto'
-  el.style.width = '100%'
+  el.style.display = 'none'
   el.addEventListener('timeupdate', () => {
     currentTime = el.currentTime
-    for (const l of listeners) l()
+    notify()
   })
   el.addEventListener('seeked', () => {
     currentTime = el.currentTime
-    for (const l of listeners) l()
+    notify()
+  })
+  el.addEventListener('loadedmetadata', () => {
+    duration = isFinite(el.duration) ? el.duration : 0
+    notify()
+  })
+  el.addEventListener('durationchange', () => {
+    duration = isFinite(el.duration) ? el.duration : 0
+    notify()
+  })
+  el.addEventListener('play', () => {
+    isPlaying = true
+    notify()
+  })
+  el.addEventListener('pause', () => {
+    isPlaying = false
+    notify()
+  })
+  el.addEventListener('ended', () => {
+    isPlaying = false
+    notify()
   })
   audioEl = el
   return el
@@ -34,11 +52,8 @@ function ensureEl(): HTMLAudioElement {
 
 let currentBlobUrl: string | null = null
 
-/**
- * Replace the audio source. Frees the previous blob URL, sets a new one
- * from the given File. No-op if `file` is null.
- */
-export function setAudioFile(file: File | null) {
+/** Replace the audio source. Null clears it. */
+export function setAudioFile(file: File | Blob | null) {
   const el = ensureEl()
   if (currentBlobUrl) {
     URL.revokeObjectURL(currentBlobUrl)
@@ -48,58 +63,75 @@ export function setAudioFile(file: File | null) {
     el.removeAttribute('src')
     el.load()
     currentTime = 0
-    for (const l of listeners) l()
+    duration = 0
+    isPlaying = false
+    notify()
     return
   }
   currentBlobUrl = URL.createObjectURL(file)
   el.src = currentBlobUrl
   el.load()
   currentTime = 0
-  for (const l of listeners) l()
+  duration = 0
+  isPlaying = false
+  notify()
 }
 
 export function seek(t: number) {
   const el = ensureEl()
   el.currentTime = Math.max(0, t)
-  // Don't autoplay on seek — the user clicks segments to inspect, not to play.
 }
 
-export function getAudioEl(): HTMLAudioElement {
-  return ensureEl()
+export function play() {
+  ensureEl()
+    .play()
+    .catch(() => {})
 }
 
-/**
- * Subscribe to playback time. Backed by useSyncExternalStore so components
- * tracking the current time only re-render when it changes (≈ 4× per
- * second from the browser's `timeupdate` cadence).
- */
+export function pause() {
+  ensureEl().pause()
+}
+
+export function resetPlayback() {
+  const el = ensureEl()
+  el.pause()
+  el.currentTime = 0
+}
+
+function subscribe(cb: () => void) {
+  listeners.add(cb)
+  return () => {
+    listeners.delete(cb)
+  }
+}
+
 export function useCurrentTime(): number {
   return useSyncExternalStore(
-    (cb) => {
-      listeners.add(cb)
-      return () => {
-        listeners.delete(cb)
-      }
-    },
+    subscribe,
     () => currentTime,
     () => 0,
   )
 }
+export function useDuration(): number {
+  return useSyncExternalStore(
+    subscribe,
+    () => duration,
+    () => 0,
+  )
+}
+export function useIsPlaying(): boolean {
+  return useSyncExternalStore(
+    subscribe,
+    () => isPlaying,
+    () => false,
+  )
+}
 
-/**
- * Mount the singleton audio element into the given container. Use this in
- * the component that should own the player visually (we render it inside
- * the right pane above the transcription).
- */
+/** Mount the singleton into a hidden container. */
 export function useAudioContainer(ref: React.RefObject<HTMLDivElement | null>) {
   useEffect(() => {
     if (!ref.current) return
     const el = ensureEl()
-    if (el.parentNode !== ref.current) {
-      ref.current.appendChild(el)
-    }
-    return () => {
-      // Leave the element alive across remounts so playback state isn't lost.
-    }
+    if (el.parentNode !== ref.current) ref.current.appendChild(el)
   }, [ref])
 }

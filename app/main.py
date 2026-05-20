@@ -1435,10 +1435,51 @@ def _segments_to_vtt(segments: List[dict]) -> str:
     return "\n".join(lines)
 
 
+_MAX_URL_BYTES = 512 * 1024 * 1024  # 512 MB hard cap on URL-ingested audio
+_URL_FETCH_TIMEOUT_S = 60
+
+
+async def _fetch_audio_url(url: str, request_id: str) -> Tuple[bytes, str]:
+    """Download audio bytes from a URL. Returns (bytes, inferred_filename).
+
+    Runs urllib in a worker thread so it doesn't block the event loop. Enforces
+    a 512 MB cap and a 60 s connect+read timeout. Rejects non-http(s) schemes.
+    """
+    from urllib.parse import urlparse
+    from urllib.request import urlopen, Request as UrlRequest
+    from urllib.error import URLError, HTTPError
+
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"Unsupported URL scheme '{parsed.scheme}'; must be http or https.")
+
+    def _fetch_sync() -> Tuple[bytes, str]:
+        req = UrlRequest(url, headers={"User-Agent": "parakeet-asr/1.0"})
+        with urlopen(req, timeout=_URL_FETCH_TIMEOUT_S) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            clen = resp.headers.get("Content-Length")
+            if clen and int(clen) > _MAX_URL_BYTES:
+                raise ValueError(f"URL audio is {int(clen)} bytes, exceeds 512 MB cap.")
+            data = resp.read(_MAX_URL_BYTES + 1)
+            if len(data) > _MAX_URL_BYTES:
+                raise ValueError(f"URL audio exceeds 512 MB cap during read.")
+            name = os.path.basename(parsed.path) or "audio-from-url"
+            logger.info(f"({request_id}) URL fetch: {len(data)} bytes from {url} (content-type={ctype!r}).")
+            return data, name
+
+    try:
+        return await asyncio.to_thread(_fetch_sync)
+    except HTTPError as e:
+        raise ValueError(f"URL fetch failed: HTTP {e.code} {e.reason}") from e
+    except URLError as e:
+        raise ValueError(f"URL fetch failed: {e.reason}") from e
+
+
 @app.post("/v1/audio/transcriptions")
 async def transcribe_endpoint_rest(
     request: Request,
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
+    url: Optional[str] = Form(None),
     # OpenAI Whisper API-compatible form fields (multipart). All optional —
     # only `file` is required. We accept-and-ignore the parameters Parakeet
     # can't honor (model is fixed; greedy decoding means temperature is 0;
@@ -1481,7 +1522,19 @@ async def transcribe_endpoint_rest(
         return JSONResponse(status_code=503, content={"error": "ASR model not available. Service is initializing or encountered an error."})
 
     request_id = base64.urlsafe_b64encode(os.urandom(6)).decode() # Short unique ID for logging
-    logger.info(f"({request_id}) REST request received for file: '{file.filename}'. Content-type: {file.content_type}")
+
+    # Exactly one of `file` (multipart) or `url` (form field) must be set. The
+    # URL path fetches the bytes server-side and then re-enters the same
+    # pipeline as a file upload.
+    if (file is None) == (not url):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Provide exactly one of `file` (multipart) or `url` (form field)."},
+        )
+    if file is not None:
+        logger.info(f"({request_id}) REST request received for file: '{file.filename}'. Content-type: {file.content_type}")
+    else:
+        logger.info(f"({request_id}) REST request received for url: {url!r}.")
 
     # Validate response_format up front so we fail fast on bad client input.
     if response_format not in _VALID_RESPONSE_FORMATS:
@@ -1552,8 +1605,15 @@ async def transcribe_endpoint_rest(
         async with model_access_lock:
             logger.debug(f"({request_id}) REST: Acquired ASR model access lock.")
             try:
-                audio_bytes = await file.read()
-                logger.info(f"({request_id}) REST: Read {len(audio_bytes)} bytes from upload '{file.filename}'.")
+                if file is not None:
+                    audio_bytes = await file.read()
+                    logger.info(f"({request_id}) REST: Read {len(audio_bytes)} bytes from upload '{file.filename}'.")
+                else:
+                    try:
+                        audio_bytes, _fetched_name = await _fetch_audio_url(url, request_id)
+                    except ValueError as e_url:
+                        logger.warning(f"({request_id}) REST: URL fetch failed: {e_url}")
+                        return JSONResponse(status_code=400, content={"error": str(e_url)})
 
                 waveform_tensor, total_audio_duration_s = await load_and_preprocess_audio(
                     audio_source=io.BytesIO(audio_bytes),

@@ -9,9 +9,21 @@ import { useEffect, useSyncExternalStore } from 'react'
 let audioEl: HTMLAudioElement | null = null
 let currentTime = 0
 let duration = 0
+/** Externally-supplied duration (e.g. parsed from a WAV header) used
+ * as a fallback when the <audio> element hasn't reported `duration`
+ * yet — keeps the hero's duration readout populated for very long
+ * uploads where metadata loads slowly. */
+let durationHint = 0
 let isPlaying = false
 const listeners = new Set<() => void>()
 const notify = () => listeners.forEach((l) => l())
+const effectiveDuration = () => (duration > 0 ? duration : durationHint)
+
+/** Set a duration fallback. Cleared on every setAudioFile. */
+export function setDurationHint(seconds: number) {
+  durationHint = isFinite(seconds) && seconds > 0 ? seconds : 0
+  notify()
+}
 
 function ensureEl(): HTMLAudioElement {
   if (audioEl) return audioEl
@@ -64,6 +76,7 @@ export function setAudioFile(file: File | Blob | null) {
     el.load()
     currentTime = 0
     duration = 0
+    durationHint = 0
     isPlaying = false
     notify()
     return
@@ -73,6 +86,7 @@ export function setAudioFile(file: File | Blob | null) {
   el.load()
   currentTime = 0
   duration = 0
+  durationHint = 0
   isPlaying = false
   notify()
 }
@@ -115,7 +129,7 @@ export function useCurrentTime(): number {
 export function useDuration(): number {
   return useSyncExternalStore(
     subscribe,
-    () => duration,
+    effectiveDuration,
     () => 0,
   )
 }

@@ -20,16 +20,35 @@
 const COMPRESSED_DECODE_CAP_BYTES = 200 * 1024 * 1024
 
 export async function computePeaks(file: Blob, bins = 220): Promise<number[]> {
-  const name = (file as File).name || ''
-  const looksWav =
-    name.toLowerCase().endsWith('.wav') || file.type === 'audio/wav' || file.type === 'audio/x-wav'
+  // Sniff the first 12 bytes for the RIFF/WAVE (or RIFX) magic so the
+  // fast path runs for ANY wav — regardless of filename or MIME type.
+  // This is what makes long uploads (multi-hour WAVs that blow past the
+  // decodeAudioData cap) still render a waveform.
+  let isWav = false
+  try {
+    const sig = new Uint8Array(await file.slice(0, 12).arrayBuffer())
+    const riff =
+      (sig[0] === 0x52 && sig[1] === 0x49 && sig[2] === 0x46 && sig[3] === 0x46) || // "RIFF"
+      (sig[0] === 0x52 && sig[1] === 0x49 && sig[2] === 0x46 && sig[3] === 0x58) //   "RIFX"
+    const wave = sig[8] === 0x57 && sig[9] === 0x41 && sig[10] === 0x56 && sig[11] === 0x45 // "WAVE"
+    isWav = riff && wave
+  } catch {
+    // ignore — fall through to extension/MIME heuristics
+  }
+  if (!isWav) {
+    const name = (file as File).name || ''
+    isWav =
+      name.toLowerCase().endsWith('.wav') ||
+      file.type === 'audio/wav' ||
+      file.type === 'audio/x-wav'
+  }
 
-  if (looksWav) {
+  if (isWav) {
     try {
       return await fastWavPeaks(file, bins)
     } catch (e) {
-      // Header parse failed (might be a wav with an unusual format, or
-      // mislabelled). Fall through to the decode path.
+      // Header parse failed (unusual format, or mislabelled). Fall
+      // through to the decode path.
       console.warn('fastWavPeaks failed, falling back to decodeAudioData:', e)
     }
   }
@@ -43,14 +62,65 @@ export async function computePeaks(file: Blob, bins = 220): Promise<number[]> {
 }
 
 /**
+ * Read a WAV's duration in seconds straight from the header — no
+ * decode, no <audio> element. Returns null if it's not a parseable
+ * WAV. Used as a duration fallback in the hero meta for very long
+ * uploads where the <audio> element is slow (or fails) to report
+ * `duration`.
+ */
+export async function readWavDuration(file: Blob): Promise<number | null> {
+  try {
+    const headerSlice = await file.slice(0, Math.min(64 * 1024, file.size)).arrayBuffer()
+    const dv = new DataView(headerSlice)
+    const td = new TextDecoder('ascii')
+    const riff = td.decode(new Uint8Array(headerSlice, 0, 4))
+    if (riff !== 'RIFF' && riff !== 'RIFX') return null
+    const isLE = riff === 'RIFF'
+    if (td.decode(new Uint8Array(headerSlice, 8, 4)) !== 'WAVE') return null
+    let sampleRate = 0
+    let channels = 0
+    let bitsPerSample = 0
+    let dataSize = 0
+    let dataOffset = 0
+    let cur = 12
+    while (cur + 8 <= headerSlice.byteLength) {
+      const id = td.decode(new Uint8Array(headerSlice, cur, 4))
+      const size = dv.getUint32(cur + 4, isLE)
+      if (id === 'fmt ') {
+        channels = dv.getUint16(cur + 10, isLE)
+        sampleRate = dv.getUint32(cur + 12, isLE)
+        bitsPerSample = dv.getUint16(cur + 22, isLE)
+      } else if (id === 'data') {
+        dataOffset = cur + 8
+        dataSize = size
+        break
+      }
+      cur += 8 + size + (size & 1)
+    }
+    if (!sampleRate || !channels || !bitsPerSample) return null
+    const bytesPerFrame = (bitsPerSample / 8) * channels
+    const usable =
+      dataSize > 0 && dataOffset + dataSize <= file.size
+        ? dataSize
+        : Math.max(0, file.size - dataOffset)
+    const frames = Math.floor(usable / bytesPerFrame)
+    const seconds = frames / sampleRate
+    return isFinite(seconds) && seconds > 0 ? seconds : null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Direct WAV reader. Parses the RIFF chunks to find the data chunk + PCM
  * format, then takes 220 strided peeks across the file via Blob.slice().
  * Memory + CPU is O(bins), not O(file size).
  */
 export async function fastWavPeaks(file: Blob, bins = 220): Promise<number[]> {
   // The 'fmt ' + 'data' chunks usually live in the first 1 KB but some
-  // tools dump LIST/JUNK metadata first; grab 16 KB to be safe.
-  const headerSlice = await file.slice(0, Math.min(16 * 1024, file.size)).arrayBuffer()
+  // tools dump large LIST/INFO/JUNK metadata first; grab 64 KB to be
+  // safe before giving up and falling back to decodeAudioData.
+  const headerSlice = await file.slice(0, Math.min(64 * 1024, file.size)).arrayBuffer()
   const dv = new DataView(headerSlice)
   const td = new TextDecoder('ascii')
 

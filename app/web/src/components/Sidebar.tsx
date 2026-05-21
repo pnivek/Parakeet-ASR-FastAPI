@@ -306,6 +306,35 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
     return () => clearInterval(i)
   }, [recording])
 
+  // Live-preview listening: in mic + Live mode the meter should reflect
+  // real speech BEFORE the user hits Record (the design's "Listening"
+  // state). Open a preview-only mic stream while idle in that mode;
+  // tear it down whenever we leave it. start() reuses the preview
+  // stream when the user commits to recording.
+  //
+  // Only attempt where getUserMedia is actually available (secure
+  // context). On a plain-HTTP LAN deployment the API is undefined, so
+  // we skip the preview entirely rather than surface a mic error on
+  // mode switch — the meter just stays flat there.
+  useEffect(() => {
+    const micAvailable =
+      typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getUserMedia
+    if (!micAvailable) return
+    const wantListen = mode === 'mic' && s.micCaptureMode === 'live'
+    if (wantListen && mic.state === 'idle') {
+      void mic.listen()
+    } else if (!wantListen && mic.state === 'listening') {
+      mic.stopListening()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, s.micCaptureMode, mic.state])
+
+  // Stop the preview when the component unmounts.
+  useEffect(() => {
+    return () => mic.stopListening()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   const startMic = useCallback(
     async (captureMode: 'live' | 'record' = s.micCaptureMode) => {
       onSessionStart?.()
@@ -849,6 +878,7 @@ function SourcePane({
   micCaptureMode: 'live' | 'record'
   setMicCaptureMode: (v: 'live' | 'record') => void
 }) {
+  const urlValid = /^https?:\/\/\S+/i.test(urlInput.trim()) && urlInput.trim() !== 'https://'
   return (
     <div>
       <SBLabel>Input</SBLabel>
@@ -963,7 +993,7 @@ function SourcePane({
             )}
           </div>
           <div className="sb__file-formats">
-            Accepts .wav .mp3 .flac .m4a .ogg .webm
+            .wav · .mp3 · .flac · .m4a · .ogg · .webm
           </div>
         </div>
       )}
@@ -1051,33 +1081,57 @@ function SourcePane({
       )}
 
       {mode === 'url' && (
-        <input
-          type="url"
-          value={urlInput}
-          onChange={(e) => setUrlInput(e.target.value)}
-          className="sb__url-input"
-          spellCheck={false}
-          autoComplete="off"
-          placeholder="https://…"
-        />
+        <div style={{ marginTop: 16 }}>
+          <div className="sb__url-field">
+            <svg
+              viewBox="0 0 24 24"
+              width="14"
+              height="14"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden
+            >
+              <path d="M10 13a5 5 0 0 0 7.07 0l3.18-3.18a5 5 0 0 0-7.07-7.07L11.34 5" />
+              <path d="M14 11a5 5 0 0 0-7.07 0L3.75 14.18a5 5 0 0 0 7.07 7.07L12.66 19" />
+            </svg>
+            <input
+              type="url"
+              value={urlInput}
+              onChange={(e) => setUrlInput(e.target.value)}
+              className="sb__url-input"
+              spellCheck={false}
+              autoComplete="off"
+              placeholder="https://…"
+            />
+          </div>
+          <div className="sb__url-status">
+            <span className={urlValid ? 'sb__url-dot sb__url-dot--on' : 'sb__url-dot'} />
+            <span className="sb__url-status-label">
+              {urlValid ? 'Ready to fetch' : 'Enter a media URL'}
+            </span>
+          </div>
+          <div className="sb__file-formats">Direct link to an audio or video file</div>
+        </div>
       )}
     </div>
   )
 }
 
-/** Bar meter inside the mic card. 28 bars with three behaviours:
+/** Bar meter inside the mic card. Real audio only — driven by
+ * mic.level (the AnalyserNode peak), not a synthetic animation. The
+ * meter is "active" both while recording AND while previewing (live
+ * mode opens the mic before the user hits Record), so it reflects
+ * actual speech in both cases:
  *
- *   - capture='live' + recording        — real reactivity: bar
- *     heights modulated by mic.level (AnalyserNode peak).
- *   - capture='live' + idle             — synthetic preview: the
- *     meter "always listens" with a sin-wave pattern driven by a
- *     local rAF tick.
- *   - capture='record' + recording      — same as live+recording.
- *   - capture='record' + idle           — bars sit flat.
+ *   - recording, OR live-mode preview → bars scale with level.
+ *   - record-mode idle               → bars sit flat (mic not open).
  *
- * The synthetic-preview mode matches the design: in live mode the
- * meter is always animated so the user sees the affordance even
- * before they click Record. */
+ * Each bar has a static center-hump envelope + per-bar texture so the
+ * meter reads as a wave rather than a flat block; the overall
+ * amplitude tracks loudness. Quiet input = short bars, speech = tall. */
 function MicCardBars({
   level,
   recording,
@@ -1088,40 +1142,19 @@ function MicCardBars({
   captureMode: 'live' | 'record'
 }) {
   const N = 28
-  const meterActive = recording || captureMode === 'live'
-  const [tick, setTick] = useState(0)
-  useEffect(() => {
-    if (!meterActive) return
-    let raf = 0
-    let t = 0
-    const loop = () => {
-      t += 1
-      setTick(t)
-      raf = requestAnimationFrame(loop)
-    }
-    raf = requestAnimationFrame(loop)
-    return () => cancelAnimationFrame(raf)
-  }, [meterActive])
+  const active = recording || captureMode === 'live'
+  const drive = active ? Math.min(1, level * 2.4) : 0
   return (
     <div className="mic-card__bars">
       {Array.from({ length: N }).map((_, i) => {
-        const envelope = 0.5 + 0.5 * Math.sin((i / N) * Math.PI)
-        const phase = meterActive
-          ? Math.sin(tick * 0.18 + i * 0.5) * 0.5 + 0.5
-          : Math.abs(Math.sin(i * 0.55 + 1.3))
-        const noise = meterActive ? Math.sin(tick * 0.31 + i * 1.7) * 0.25 + 0.25 : 0
-        // When actually recording, scale by real audio level so loud
-        // input drives tall bars. In live-idle, fall back to a
-        // base-1 scale so the synthetic preview is always visible.
-        const drive = recording ? Math.max(0.1, Math.min(1, level * 1.6)) : 1
-        const h = meterActive
-          ? Math.max(6, Math.min(90, (phase * 0.7 + noise * 0.5) * 90 * envelope * drive))
-          : 4 + (i % 2) * 1.5
+        const envelope = 0.45 + 0.55 * Math.sin((i / (N - 1)) * Math.PI)
+        const variety = 0.65 + 0.35 * Math.abs(Math.sin(i * 1.7 + 0.6))
+        const h = active ? Math.max(4, drive * 86 * envelope * variety) : 4
         return (
           <span
             key={i}
-            className={meterActive ? 'mic-card__bar mic-card__bar--on' : 'mic-card__bar'}
-            style={{ height: `${h}%`, opacity: meterActive ? 0.55 + 0.45 * phase : 1 }}
+            className={active ? 'mic-card__bar mic-card__bar--on' : 'mic-card__bar'}
+            style={{ height: `${h}%`, opacity: active ? 0.55 + 0.45 * variety : 1 }}
           />
         )
       })}
@@ -1388,13 +1421,15 @@ function ToggleKv({ k, v, onSet }: { k: string; v: boolean; onSet: (v: boolean) 
   return (
     <div className="ma-kv">
       <span className="ma-kv__k">{k}</span>
-      <span className="ma-kv__v" style={{ paddingRight: 16 }}>
+      <span className="ma-kv__v" style={{ justifyContent: 'flex-start' }}>
         <button
           type="button"
           className={v ? 'ma-switch ma-switch--on' : 'ma-switch'}
           onClick={() => onSet(!v)}
           aria-pressed={v}
         >
+          <span className="ma-switch__label ma-switch__label--off">Off</span>
+          <span className="ma-switch__label ma-switch__label--on">On</span>
           <span className="ma-switch__knob" />
         </button>
       </span>

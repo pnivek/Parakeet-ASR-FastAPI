@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { TranscriptionResponse } from './lib/api'
-import { setAudioFile, useAudioContainer, useCurrentTime } from './lib/playback'
-import { computePeaks } from './lib/peaks'
+import { setAudioFile, setDurationHint, useAudioContainer, useCurrentTime } from './lib/playback'
+import { computePeaks, readWavDuration } from './lib/peaks'
 import type { LoadedAudio } from './lib/download'
 import type { WhisperSegment, Word } from './lib/types'
 import { Header } from './components/Header'
@@ -76,6 +76,12 @@ export default function App() {
         if (!cancelled) setPeaks(null)
       },
     )
+    // Duration fallback for WAVs — the <audio> element can be slow (or
+    // fail) to report `duration` on multi-hour uploads. Parse it from
+    // the header so the hero meta shows it immediately.
+    readWavDuration(loadedFile).then((s) => {
+      if (!cancelled && s) setDurationHint(s)
+    })
     return () => {
       cancelled = true
     }

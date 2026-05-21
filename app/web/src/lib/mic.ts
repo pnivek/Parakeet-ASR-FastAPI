@@ -15,7 +15,13 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-export type MicState = 'idle' | 'starting' | 'recording' | 'stopping' | 'error'
+export type MicState =
+  | 'idle'
+  | 'listening' // preview: mic open + level meter live, but NOT recording
+  | 'starting'
+  | 'recording'
+  | 'stopping'
+  | 'error'
 
 /** Browser default for MediaRecorder(audio/webm;codecs=opus) — Opus's native rate. */
 export const MIC_SAMPLE_RATE = 48000
@@ -48,10 +54,17 @@ export interface UseMicResult {
   state: MicState
   /** Last error message, cleared on successful start. */
   error: string | null
-  /** Live mic level, 0..1. Updated while recording, coalesced per rAF. */
+  /** Live mic level, 0..1. Updated while listening or recording, coalesced per rAF. */
   level: number
   start: () => Promise<void>
   stop: () => void
+  /** Open the mic + level meter WITHOUT recording — used as a live
+   * preview in mic+live mode so the meter reflects real speech before
+   * the user commits to transcribing. No-op if already
+   * listening/recording. */
+  listen: () => Promise<void>
+  /** Tear down a preview-only listen (does nothing while recording). */
+  stopListening: () => void
 }
 
 /**
@@ -78,6 +91,11 @@ export function useMic({
   /** Last setLevel value — used to coalesce rAF updates that don't move the
    * peak meaningfully. Cuts the re-render rate of the sidebar by ~5×. */
   const lastLevelRef = useRef<number>(0)
+  /** Whether the analyser tick should emit waveform peak samples. True
+   * only while recording — a preview listen drives the level meter but
+   * shouldn't populate the hero waveform. Mutable so the single tick
+   * loop survives a listen→record upgrade without restarting. */
+  const emitPeaksRef = useRef<boolean>(false)
 
   const cleanup = useCallback(() => {
     if (rafRef.current !== null) {
@@ -98,55 +116,133 @@ export function useMic({
     }
     recorderRef.current = null
     lastLevelRef.current = 0
+    emitPeaksRef.current = false
     setLevel(0)
   }, [])
+
+  /** getUserMedia helper with friendly error messages. */
+  const acquireStream = useCallback(async (): Promise<MediaStream> => {
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+      const insecure = typeof window !== 'undefined' && !window.isSecureContext
+      throw new Error(
+        insecure
+          ? `Microphone access requires HTTPS or localhost. This page is being served over plain HTTP (${window.location.host}). Open it via https:// or http://localhost:<port> to enable recording.`
+          : 'Microphone API not available in this browser.',
+      )
+    }
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression },
+      })
+    } catch (e) {
+      const err = e as DOMException
+      if (err?.name === 'NotAllowedError') {
+        throw new Error('Microphone permission denied. Allow access in the browser site settings and retry.')
+      }
+      if (err?.name === 'NotFoundError') {
+        throw new Error('No microphone detected. Plug one in (or check system input settings) and retry.')
+      }
+      throw new Error(`Microphone access failed: ${err?.message || String(e)}`)
+    }
+  }, [noiseSuppression])
+
+  /** Attach the AnalyserNode + rAF level loop to a stream. Idempotent —
+   * skips if an analyser is already running (e.g. a preview listen that
+   * a recording start is upgrading). */
+  const attachAnalyser = useCallback(
+    (stream: MediaStream) => {
+      if (analyserRef.current) return
+      const ctx = new AudioContext()
+      audioCtxRef.current = ctx
+      const source = ctx.createMediaStreamSource(stream)
+      const analyser = ctx.createAnalyser()
+      analyser.fftSize = 1024
+      analyser.smoothingTimeConstant = 0.4
+      source.connect(analyser)
+      analyserRef.current = analyser
+
+      const buf = new Uint8Array(analyser.fftSize)
+      const LEVEL_THRESHOLD = 0.012
+      const PEAK_SAMPLE_INTERVAL_MS = 100
+      let lastPeakSampleMs = performance.now()
+      let runningPeakSinceLastSample = 0
+      const tick = () => {
+        if (!analyserRef.current) return
+        analyserRef.current.getByteTimeDomainData(buf as unknown as Uint8Array<ArrayBuffer>)
+        let peak = 0
+        for (let i = 0; i < buf.length; i++) {
+          const v = Math.abs(buf[i] - 128) / 128
+          if (v > peak) peak = v
+        }
+        if (peak > runningPeakSinceLastSample) runningPeakSinceLastSample = peak
+        if (Math.abs(peak - lastLevelRef.current) >= LEVEL_THRESHOLD) {
+          lastLevelRef.current = peak
+          setLevel(peak)
+        }
+        const now = performance.now()
+        if (now - lastPeakSampleMs >= PEAK_SAMPLE_INTERVAL_MS) {
+          // Only feed the hero waveform while actually recording.
+          if (emitPeaksRef.current) {
+            onPeakSample?.(Math.min(1, runningPeakSinceLastSample * 3))
+          }
+          runningPeakSinceLastSample = 0
+          lastPeakSampleMs = now
+        }
+        rafRef.current = requestAnimationFrame(tick)
+      }
+      rafRef.current = requestAnimationFrame(tick)
+    },
+    [onPeakSample],
+  )
+
+  const listen = useCallback(async () => {
+    // Already capturing (preview or recording) — nothing to do.
+    if (streamRef.current) return
+    setError(null)
+    try {
+      const stream = await acquireStream()
+      streamRef.current = stream
+      emitPeaksRef.current = false
+      attachAnalyser(stream)
+      setState('listening')
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(msg)
+      onError?.(e instanceof Error ? e : new Error(msg))
+      cleanup()
+      setState('error')
+    }
+  }, [acquireStream, attachAnalyser, onError, cleanup])
+
+  const stopListening = useCallback(() => {
+    // Only tear down a preview listen; never interrupt a recording.
+    if (recorderRef.current) return
+    cleanup()
+    setState('idle')
+  }, [cleanup])
 
   const start = useCallback(async () => {
     if (state === 'recording' || state === 'starting') return
     setError(null)
     setState('starting')
     try {
-      // navigator.mediaDevices is only exposed in a secure context
-      // (HTTPS or localhost). On plain HTTP over a LAN address the API is
-      // undefined and there's no client-side workaround — explain it.
-      if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
-        const insecure = typeof window !== 'undefined' && !window.isSecureContext
-        throw new Error(
-          insecure
-            ? `Microphone access requires HTTPS or localhost. This page is being served over plain HTTP (${window.location.host}). Open it via https:// or http://localhost:<port> to enable recording.`
-            : 'Microphone API not available in this browser.',
-        )
-      }
       if (!window.MediaRecorder || !MediaRecorder.isTypeSupported(MIC_MIME_TYPE)) {
         throw new Error(
           `Browser does not support ${MIC_MIME_TYPE}. ` +
             `Try Chrome, Firefox, or another Chromium-based browser.`,
         )
       }
-      let stream: MediaStream
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            channelCount: 1,
-            echoCancellation: true,
-            noiseSuppression,
-          },
-        })
-      } catch (e) {
-        const err = e as DOMException
-        if (err?.name === 'NotAllowedError') {
-          throw new Error('Microphone permission denied. Allow access in the browser site settings and retry.')
-        }
-        if (err?.name === 'NotFoundError') {
-          throw new Error('No microphone detected. Plug one in (or check system input settings) and retry.')
-        }
-        throw new Error(`Microphone access failed: ${err?.message || String(e)}`)
-      }
+      // Reuse the preview stream if we're already listening; otherwise
+      // acquire one now. The analyser may already be running (preview)
+      // — attachAnalyser is idempotent, and flipping emitPeaksRef makes
+      // the existing tick start feeding the hero waveform.
+      const stream = streamRef.current ?? (await acquireStream())
       streamRef.current = stream
+      emitPeaksRef.current = true
+      attachAnalyser(stream)
 
       const recorder = new MediaRecorder(stream, { mimeType: MIC_MIME_TYPE })
       recorderRef.current = recorder
-
       recorder.ondataavailable = (ev) => {
         if (ev.data && ev.data.size > 0) onChunk(ev.data)
       }
@@ -163,55 +259,6 @@ export function useMic({
         setState('error')
       }
       recorder.start(MIC_TIMESLICE_MS)
-
-      // Audio analyser for the level meter. Separate from the recorder so the
-      // recorder's encoder stays untouched.
-      const ctx = new AudioContext()
-      audioCtxRef.current = ctx
-      const source = ctx.createMediaStreamSource(stream)
-      const analyser = ctx.createAnalyser()
-      analyser.fftSize = 1024
-      analyser.smoothingTimeConstant = 0.4
-      source.connect(analyser)
-      analyserRef.current = analyser
-
-      const buf = new Uint8Array(analyser.fftSize)
-      const LEVEL_THRESHOLD = 0.025 // coalesce sub-threshold rAF ticks
-      // Waveform sampling cadence — one bar per ~100ms gives a
-      // pleasantly smooth growing waveform (10 bars/s) without flooding
-      // React with per-frame state updates. Tracked between rAF ticks
-      // by holding the max peak we've seen since the last sample.
-      const PEAK_SAMPLE_INTERVAL_MS = 100
-      let lastPeakSampleMs = performance.now()
-      let runningPeakSinceLastSample = 0
-      const tick = () => {
-        if (!analyserRef.current) return
-        // Cast: lib.dom.d.ts in TS6 narrowed this to ArrayBuffer-only views.
-        analyserRef.current.getByteTimeDomainData(buf as unknown as Uint8Array<ArrayBuffer>)
-        let peak = 0
-        for (let i = 0; i < buf.length; i++) {
-          const v = Math.abs(buf[i] - 128) / 128
-          if (v > peak) peak = v
-        }
-        if (peak > runningPeakSinceLastSample) runningPeakSinceLastSample = peak
-        if (Math.abs(peak - lastLevelRef.current) >= LEVEL_THRESHOLD) {
-          lastLevelRef.current = peak
-          setLevel(peak)
-        }
-        const now = performance.now()
-        if (now - lastPeakSampleMs >= PEAK_SAMPLE_INTERVAL_MS) {
-          // Modest gain so typical speech (peak ≈ 0.2–0.4 in the
-          // analyser's 0..1 range) lands as visible-but-not-clipped
-          // bars. clamp(0..1) keeps the renderer's geometry honest.
-          const sampled = Math.min(1, runningPeakSinceLastSample * 3)
-          onPeakSample?.(sampled)
-          runningPeakSinceLastSample = 0
-          lastPeakSampleMs = now
-        }
-        rafRef.current = requestAnimationFrame(tick)
-      }
-      rafRef.current = requestAnimationFrame(tick)
-
       setState('recording')
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -220,7 +267,7 @@ export function useMic({
       cleanup()
       setState('error')
     }
-  }, [state, onChunk, onStop, onError, noiseSuppression, onPeakSample, cleanup])
+  }, [state, onChunk, onStop, onError, acquireStream, attachAnalyser, cleanup])
 
   const stop = useCallback(() => {
     const rec = recorderRef.current
@@ -247,5 +294,5 @@ export function useMic({
     [cleanup],
   )
 
-  return { state, error, level, start, stop }
+  return { state, error, level, start, stop, listen, stopListening }
 }

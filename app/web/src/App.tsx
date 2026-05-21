@@ -30,15 +30,32 @@ export default function App() {
   /** Per-word-index arrival timestamps, same idea — drives the streaming
    * word reveal in the text view. */
   const wordArrivalRef = useRef<Map<number, number>>(new Map())
+  /** Highest segment.id we've already stamped — lets us O(new) the arrival
+   * walk instead of O(total). Segments are emitted with monotonically
+   * increasing ids; words are append-only by index. */
+  const maxSeenSegIdRef = useRef<number>(-1)
+  const wordArrivalCountRef = useRef<number>(0)
 
   // Hidden host for the singleton <audio>.
   const audioMountRef = useRef<HTMLDivElement>(null)
   useAudioContainer(audioMountRef)
   const currentTime = useCurrentTime()
 
+  // decodeAudioData allocates ~10x the compressed file size in PCM — a 3hr
+  // mp3 (≈180MB on disk) would need ~1.5GB of float32 PCM and may OOM the
+  // tab. Skip the decode for huge files and leave peaks null (the Waveform
+  // component renders placeholder bars).
+  const PEAKS_MAX_BYTES = 200 * 1024 * 1024 // 200 MB compressed input ceiling
+
   // Recompute peaks when a new file is loaded.
   const computePeaksFor = async (blob: Blob) => {
     setPeaks(null)
+    if (blob.size > PEAKS_MAX_BYTES) {
+      console.warn(
+        `Peaks decode skipped: ${(blob.size / 1024 / 1024).toFixed(0)} MB > ${PEAKS_MAX_BYTES / 1024 / 1024} MB cap.`,
+      )
+      return
+    }
     try {
       const p = await computePeaks(blob, 220)
       setPeaks(p)
@@ -55,6 +72,8 @@ export default function App() {
     setLive(false) // finalized — drop the streaming reveal
     arrivalRef.current = new Map() // settled results don't need arrival fades
     wordArrivalRef.current = new Map()
+    maxSeenSegIdRef.current = -1
+    wordArrivalCountRef.current = 0
     if (l.kind === 'file') {
       setAudioFile(l.file)
       computePeaksFor(l.file)
@@ -67,20 +86,25 @@ export default function App() {
 
   const handlePartial = (r: TranscriptionResponse) => {
     // Stamp any newly-seen segments + words with their arrival time.
-    // Existing ids/indices keep their original timestamp so they don't
-    // re-animate on each partial.
+    // Segments are emitted with monotonically increasing ids and words
+    // are append-only, so we only need to walk the NEW tail — not the
+    // whole accumulated list. The latter would be O(N²) over a long
+    // streaming session.
     if (r.format === 'verbose_json') {
       const now = performance.now()
       for (const s of r.body.segments) {
-        if (!arrivalRef.current.has(s.id)) {
+        if (s.id > maxSeenSegIdRef.current) {
           arrivalRef.current.set(s.id, now)
+          maxSeenSegIdRef.current = s.id
         }
       }
       if (r.body.words) {
-        for (let i = 0; i < r.body.words.length; i++) {
-          if (!wordArrivalRef.current.has(i)) {
-            wordArrivalRef.current.set(i, now)
-          }
+        const total = r.body.words.length
+        for (let i = wordArrivalCountRef.current; i < total; i++) {
+          wordArrivalRef.current.set(i, now)
+        }
+        if (total > wordArrivalCountRef.current) {
+          wordArrivalCountRef.current = total
         }
       }
     }
@@ -101,22 +125,27 @@ export default function App() {
     setResult(null)
     setError(null)
     setLive(false)
-    // Drop prior peaks too — the server emits a fresh stream of them
-    // per session via onPeaks. If we kept the old array, the user would
-    // see the previous recording's waveform briefly.
     setPeaks(null)
     arrivalRef.current = new Map()
     wordArrivalRef.current = new Map()
+    maxSeenSegIdRef.current = -1
+    wordArrivalCountRef.current = 0
   }
 
-  /** Server-emitted PCM peaks for the hero waveform. Append or replace
-   * based on the message's `cumulative` flag. Lets mic mode draw bars as
-   * the user speaks instead of waiting for the post-recording blob
-   * decode. */
+  /** Live peaks for the hero waveform. Currently driven by the mic's
+   * AnalyserNode (via Sidebar's onPeakSample → onPeaks) at ~10 Hz. We
+   * cap the array to a sliding window so a long mic recording doesn't
+   * grow the peaks array (and the rendered SVG rects) without bound —
+   * when handleResult fires we'll replace with a properly-binned
+   * computePeaks on the final blob. */
+  const PEAKS_LIVE_WINDOW = 300 // ~30s at 10 Hz, plenty of feedback
   const handlePeaks = (newPeaks: number[], cumulative: boolean) => {
     setPeaks((prev) => {
-      if (cumulative || prev === null) return newPeaks
-      return [...prev, ...newPeaks]
+      if (cumulative || prev === null) return newPeaks.slice(-PEAKS_LIVE_WINDOW)
+      const merged = prev.concat(newPeaks)
+      return merged.length > PEAKS_LIVE_WINDOW
+        ? merged.slice(merged.length - PEAKS_LIVE_WINDOW)
+        : merged
     })
   }
 

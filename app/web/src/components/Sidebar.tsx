@@ -139,6 +139,58 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
     hpf_hz: s.hpfHz,
   })
 
+  // ── Throttle for onPartial during streaming ──────────────────────
+  // Server emits segments_batch up to ~10/s during fast file processing.
+  // Dispatching every one causes O(N) React re-renders of the transcript
+  // view per partial (text.join over a growing array, full DOM diff).
+  // Coalesce to ~4 Hz with leading + trailing edges; build the payload
+  // off the refs at dispatch time so the trailing call always carries
+  // the latest accumulated state.
+  const PARTIAL_THROTTLE_MS = 250
+  const lastPartialAtRef = useRef(0)
+  const partialTimerRef = useRef<number | null>(null)
+  const buildPartialPayload = useCallback((): TranscriptionResponse => {
+    const wall = (Date.now() - recordStartRef.current) / 1000
+    const segs = segmentsRef.current
+    const words = wordsRef.current
+    return {
+      format: 'verbose_json',
+      body: {
+        task: 'transcribe',
+        language: 'en',
+        duration: segs[segs.length - 1]?.end ?? 0,
+        text: segs.map((x) => x.text).join(' ').trim(),
+        segments: segs,
+        words: words.length > 0 ? words : undefined,
+        strategy: 'progressive',
+        transcription_time_seconds: wall,
+      },
+    }
+  }, [])
+  const schedulePartial = useCallback(() => {
+    const now = Date.now()
+    const since = now - lastPartialAtRef.current
+    if (since >= PARTIAL_THROTTLE_MS) {
+      lastPartialAtRef.current = now
+      onPartial(buildPartialPayload())
+      return
+    }
+    if (partialTimerRef.current === null) {
+      partialTimerRef.current = window.setTimeout(() => {
+        partialTimerRef.current = null
+        lastPartialAtRef.current = Date.now()
+        onPartial(buildPartialPayload())
+      }, PARTIAL_THROTTLE_MS - since)
+    }
+  }, [onPartial, buildPartialPayload])
+  const cancelPendingPartial = useCallback(() => {
+    if (partialTimerRef.current !== null) {
+      clearTimeout(partialTimerRef.current)
+      partialTimerRef.current = null
+    }
+    lastPartialAtRef.current = 0
+  }, [])
+
   // ── WS message → result/partial dispatch ─────────────────────────
   const handleMessage = useCallback(
     (msg: WSMessage) => {
@@ -148,23 +200,11 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           if (msg.words && msg.words.length > 0) {
             wordsRef.current = [...wordsRef.current, ...msg.words]
           }
-          const wall = (Date.now() - recordStartRef.current) / 1000
-          onPartial({
-            format: 'verbose_json',
-            body: {
-              task: 'transcribe',
-              language: 'en',
-              duration: segmentsRef.current[segmentsRef.current.length - 1]?.end ?? 0,
-              text: segmentsRef.current.map((x) => x.text).join(' ').trim(),
-              segments: segmentsRef.current,
-              words: wordsRef.current.length > 0 ? wordsRef.current : undefined,
-              strategy: 'progressive',
-              transcription_time_seconds: wall,
-            },
-          })
+          schedulePartial()
           break
         }
         case 'refined_transcription':
+          cancelPendingPartial()
           segmentsRef.current = msg.segments
           if (msg.words) wordsRef.current = msg.words
           onPartial({
@@ -182,6 +222,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           })
           break
         case 'final_transcription': {
+          cancelPendingPartial()
           const blob = new Blob(chunksRef.current, { type: MIC_MIME_TYPE })
           const file = new File([blob], `mic-${Date.now()}.webm`, { type: MIC_MIME_TYPE })
           onResult(
@@ -218,7 +259,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           break
       }
     },
-    [onPartial, onResult, onError],
+    [onPartial, onResult, onError, schedulePartial, cancelPendingPartial],
   )
 
   const mic = useMic({
@@ -253,6 +294,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
 
   const startMic = useCallback(async () => {
     onSessionStart?.()
+    cancelPendingPartial()
     segmentsRef.current = []
     wordsRef.current = []
     chunksRef.current = []
@@ -305,6 +347,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       // The audio player gets the file immediately so the user can scrub
       // / play while transcription streams in.
       if (s.strategy === 'progressive') {
+        cancelPendingPartial()
         segmentsRef.current = []
         wordsRef.current = []
         chunksRef.current = []
@@ -331,7 +374,13 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
               bytes_per_sample: 2,
               format: fileExt,
               strategy: 'progressive',
-              live_latency: s.liveLatency,
+              // Force the offline 10s-chunk preset for file mode. The
+              // user's `liveLatency` toggle exists for mic responsiveness
+              // (2s chunks → 4s emission lag) but actively slows file
+              // throughput ~4x because the engine runs more steps per
+              // second of audio. Bench: 75x RTFx offline vs 18x live on
+              // the same 25-min file.
+              live_latency: false,
               progressive_refinement: s.progressiveRefinement,
               chunk_length: s.chunkLength ?? undefined,
               chunk_overlap: s.chunkOverlap ?? undefined,
@@ -346,21 +395,9 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
                   segmentsRef.current = [...segmentsRef.current, ...msg.segments]
                   if (msg.words && msg.words.length > 0)
                     wordsRef.current = [...wordsRef.current, ...msg.words]
-                  const wall = (Date.now() - recordStartRef.current) / 1000
-                  onPartial({
-                    format: 'verbose_json',
-                    body: {
-                      task: 'transcribe',
-                      language: 'en',
-                      duration: segmentsRef.current[segmentsRef.current.length - 1]?.end ?? 0,
-                      text: segmentsRef.current.map((x) => x.text).join(' ').trim(),
-                      segments: segmentsRef.current,
-                      words: wordsRef.current.length > 0 ? wordsRef.current : undefined,
-                      strategy: 'progressive',
-                      transcription_time_seconds: wall,
-                    },
-                  })
+                  schedulePartial()
                 } else if (msg.type === 'refined_transcription') {
+                  cancelPendingPartial()
                   segmentsRef.current = msg.segments
                   if (msg.words) wordsRef.current = msg.words
                   onPartial({
@@ -377,6 +414,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
                     },
                   })
                 } else if (msg.type === 'final_transcription') {
+                  cancelPendingPartial()
                   onResult(loaded, {
                     format: 'verbose_json',
                     body: {

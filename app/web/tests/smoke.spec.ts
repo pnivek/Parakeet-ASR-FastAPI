@@ -34,43 +34,50 @@ test('Maison v6 UI — boots, tabs switch, modes switch, strategy gate enforced'
   await expect(outputTab).toBeVisible()
   await expect(engineTab).toBeVisible()
 
-  // Source tab — File mode shows drop zone
+  // Source tab — Input dropdown defaults to file → drop zone shown
   await sourceTab.click()
   await expect(page.getByText(/Drop file/i)).toBeVisible()
 
-  // Switch to URL mode
-  await page.getByRole('button', { name: /^url$/ }).click()
+  // Switch to URL mode via the Input dropdown
+  await page.getByLabel('Input source').click()
+  await page.getByRole('option', { name: 'URL' }).click()
   await expect(page.getByPlaceholder('https://…')).toBeVisible()
 
   // Switch to mic mode
-  await page.getByRole('button', { name: /^live mic$/ }).click()
+  await page.getByLabel('Input source').click()
+  await page.getByRole('option', { name: 'live microphone' }).click()
   await expect(page.locator('.mic__status')).toBeVisible()
 
-  // Output tab — Format cluster, Timestamps segmented
+  // Output tab — Format dropdown shows current value (verbose_json); the
+  // listbox isn't open by default. Timestamps are now ma-check rows.
   await outputTab.click()
-  await expect(page.getByRole('button', { name: /^verbose_json$/ })).toBeVisible()
+  await expect(page.getByLabel('Response format')).toBeVisible()
+  await expect(page.getByLabel('Response format')).toHaveText(/verbose_json/i)
   await expect(page.getByRole('button', { name: /^Segment$/i })).toBeVisible()
   await expect(page.getByRole('button', { name: /^Word$/i })).toBeVisible()
 
-  // Engine tab — Strategy cluster
+  // Engine tab — Strategy dropdown shows current value
   await engineTab.click()
-  await expect(page.getByRole('button', { name: /^auto$/ })).toBeVisible()
-  await expect(page.getByRole('button', { name: /^chunked$/ })).toBeVisible()
+  await expect(page.getByLabel('Strategy')).toBeVisible()
 
-  // Strategy gate: progressive is now valid for file (streams over WS) +
-  // mic; only disabled in URL mode (server-side fetch is REST-only).
+  // Strategy gate: open the dropdown and confirm the progressive option
+  // is enabled for file mode and disabled for URL mode.
   await sourceTab.click()
-  await page.getByRole('button', { name: /^file$/ }).click()
+  await page.getByLabel('Input source').click()
+  await page.getByRole('option', { name: 'file upload' }).click()
   await engineTab.click()
-  let progressiveBtn = page.getByRole('button', { name: /^progressive$/ })
-  await expect(progressiveBtn).toBeEnabled()
+  await page.getByLabel('Strategy').click()
+  await expect(page.getByRole('option', { name: 'progressive' })).toBeEnabled()
+  // Close the menu.
+  await page.keyboard.press('Escape')
 
-  // URL mode — progressive should now be disabled.
   await sourceTab.click()
-  await page.getByRole('button', { name: /^url$/ }).click()
+  await page.getByLabel('Input source').click()
+  await page.getByRole('option', { name: 'URL' }).click()
   await engineTab.click()
-  progressiveBtn = page.getByRole('button', { name: /^progressive$/ })
-  await expect(progressiveBtn).toBeDisabled()
+  await page.getByLabel('Strategy').click()
+  await expect(page.getByRole('option', { name: 'progressive' })).toBeDisabled()
+  await page.keyboard.press('Escape')
 
   // Footer rail metric labels present.
   for (const label of ['STRATEGY', 'ASR', 'RTFx', 'SEGMENTS', 'WORDS']) {

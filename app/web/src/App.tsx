@@ -35,6 +35,15 @@ export default function App() {
    * increasing ids; words are append-only by index. */
   const maxSeenSegIdRef = useRef<number>(-1)
   const wordArrivalCountRef = useRef<number>(0)
+  /** The blob whose peaks are currently in state. Prevents the duplicate
+   * decode where handleAudioReady fires one (decode 1) and handleResult
+   * later fires another (decode 2) on the SAME file — which would clear
+   * peaks=null on decode 2 start and make the waveform vanish + reappear
+   * at the end of transcription. */
+  const peaksForBlobRef = useRef<Blob | null>(null)
+  /** Promise of the in-flight decode for the current blob, so handleResult
+   * can join it instead of starting a fresh decode. */
+  const peaksInFlightRef = useRef<Promise<void> | null>(null)
 
   // Hidden host for the singleton <audio>.
   const audioMountRef = useRef<HTMLDivElement>(null)
@@ -47,22 +56,40 @@ export default function App() {
   // component renders placeholder bars).
   const PEAKS_MAX_BYTES = 200 * 1024 * 1024 // 200 MB compressed input ceiling
 
-  // Recompute peaks when a new file is loaded.
-  const computePeaksFor = async (blob: Blob) => {
+  /** Decode peaks for a blob. Idempotent: if we already started a decode
+   * for this exact blob, return the same promise — no double-work, no
+   * peaks-flicker. Caller can ignore the returned promise. */
+  const computePeaksFor = (blob: Blob): Promise<void> => {
+    if (peaksForBlobRef.current === blob && peaksInFlightRef.current) {
+      return peaksInFlightRef.current
+    }
+    if (peaksForBlobRef.current === blob) {
+      // Already decoded; peaks state still reflects this blob.
+      return Promise.resolve()
+    }
+    peaksForBlobRef.current = blob
     setPeaks(null)
     if (blob.size > PEAKS_MAX_BYTES) {
       console.warn(
         `Peaks decode skipped: ${(blob.size / 1024 / 1024).toFixed(0)} MB > ${PEAKS_MAX_BYTES / 1024 / 1024} MB cap.`,
       )
-      return
+      peaksInFlightRef.current = null
+      return Promise.resolve()
     }
-    try {
-      const p = await computePeaks(blob, 220)
-      setPeaks(p)
-    } catch (e) {
-      console.warn('Peaks decode failed:', e)
-      setPeaks(null)
+    const run = async (): Promise<void> => {
+      try {
+        const peaks = await computePeaks(blob, 220)
+        if (peaksForBlobRef.current === blob) setPeaks(peaks)
+      } catch (e) {
+        console.warn('Peaks decode failed:', e)
+        if (peaksForBlobRef.current === blob) setPeaks(null)
+      }
     }
+    const promise = run().finally(() => {
+      if (peaksInFlightRef.current === promise) peaksInFlightRef.current = null
+    })
+    peaksInFlightRef.current = promise
+    return promise
   }
 
   const handleResult = (l: LoadedAudio, r: TranscriptionResponse) => {
@@ -126,6 +153,8 @@ export default function App() {
     setError(null)
     setLive(false)
     setPeaks(null)
+    peaksForBlobRef.current = null
+    peaksInFlightRef.current = null
     arrivalRef.current = new Map()
     wordArrivalRef.current = new Map()
     maxSeenSegIdRef.current = -1

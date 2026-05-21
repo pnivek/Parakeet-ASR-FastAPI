@@ -108,6 +108,51 @@ body {
 }
 .spin-in { animation: maSpinIn 0.9s cubic-bezier(0.22, 0.61, 0.36, 1); }
 
+/* Hero waveform fade-in. The SVG renders placeholder bars until peaks
+ * resolve from decodeAudioData; once they land we fade the real
+ * waveform in over ~400ms. CSS-driven so React doesn't re-render. */
+@keyframes wfFadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.wf-fade-in { animation: wfFadeIn 380ms cubic-bezier(0.22, 0.61, 0.36, 1); }
+
+/* Word + segment reveal during a live stream. Each newly-mounted node
+ * with the .word-reveal / .seg-reveal class fades up once. The animation
+ * runs natively in the compositor — no per-frame React re-render. */
+@keyframes wordReveal {
+  from {
+    opacity: 0;
+    filter: blur(2.2px);
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    filter: none;
+    transform: none;
+  }
+}
+.word-reveal {
+  animation: wordReveal 380ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  will-change: opacity, filter, transform;
+}
+@keyframes segReveal {
+  from {
+    opacity: 0;
+    filter: blur(2px);
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    filter: none;
+    transform: none;
+  }
+}
+.seg-reveal {
+  animation: segReveal 380ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  will-change: opacity, filter, transform;
+}
+
 /* Subtle underline reveal on header links. */
 .ma-link { position: relative; cursor: pointer; }
 .ma-link::after {

@@ -102,7 +102,11 @@ export function HeroRow({ loaded, peaks, state, language = 'en' }: Props) {
       </div>
 
       <div style={{ position: 'relative', padding: '4px 0 6px' }}>
-        <Waveform peaks={peaks} currentTime={t} duration={dur} height={90} />
+        {/* Key flip on peaks ready triggers the CSS fade-in. Static
+            keys keep the placeholder bars stable. */}
+        <div key={peaks ? 'wf-ready' : 'wf-placeholder'} className={peaks ? 'wf-fade-in' : undefined}>
+          <Waveform peaks={peaks} currentTime={t} duration={dur} height={90} />
+        </div>
         <div className="hero__wf-times">
           <span>0:00</span>
           <span>{formatTime(dur * 0.25)}</span>

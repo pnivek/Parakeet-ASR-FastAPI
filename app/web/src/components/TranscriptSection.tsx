@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useState } from 'react'
+import { memo, useMemo, useState } from 'react'
 import type { TranscriptionResponse } from '../lib/api'
 import type { VerboseJsonResponse, WhisperSegment } from '../lib/types'
 import { play, seek } from '../lib/playback'
@@ -144,37 +144,37 @@ function VerboseBody({
 }
 
 // ── Plain text view with reveal animation ─────────────────────────
-const WORD_FADE_MS = 380
-/**
- * Only the trailing N words run the arrival reveal animation. Earlier
- * words go straight to the static "color by playback position" render
- * path — which is what they'd land on anyway after their fade completes.
- * Capping the animated window keeps the re-render hot loop O(N), not
- * O(total words).
- */
-const ANIMATED_TAIL = 40
+// Animation strategy: each new word is mounted with a `.word-reveal`
+// class that runs a 380ms CSS keyframe (App.css → @keyframes wordReveal).
+// The browser drives the animation in the compositor — React doesn't
+// re-render per frame. Result: zero per-frame React work during a
+// live stream, regardless of how many words have accumulated.
+//
+// Once a word is mounted, subsequent re-renders keep its className
+// stable (same arrival stamp → same class), so the animation does
+// NOT replay. Stable keys (`${i}-${w.start}`) also keep React from
+// unmounting + remounting elements as new partials arrive.
 
-/** Static (or finished-fading) word. Memoized: only re-renders when its
- * own props change. The Map of arrivals reference doesn't matter here
- * because static words never read it. */
-const StaticWord = memo(function StaticWord({
+const Word = memo(function Word({
   word,
   start,
   active,
   past,
+  reveal,
   isLast,
 }: {
   word: string
   start: number
   active: boolean
   past: boolean
+  reveal: boolean
   isLast: boolean
 }) {
   const color = active ? 'var(--accent)' : past ? 'var(--fg)' : 'var(--muted)'
   return (
     <>
       <span
-        className="editorial-word"
+        className={reveal ? 'editorial-word word-reveal' : 'editorial-word'}
         onClick={() => {
           seek(start)
           play()
@@ -189,60 +189,6 @@ const StaticWord = memo(function StaticWord({
   )
 })
 
-/** Word that's currently mid-fade. Reads `now` so it re-renders each rAF
- * tick — but only the last ANIMATED_TAIL of them ever take this path. */
-function AnimatingWord({
-  word,
-  start,
-  active,
-  past,
-  arrivedAt,
-  now,
-  isLast,
-}: {
-  word: string
-  start: number
-  active: boolean
-  past: boolean
-  arrivedAt: number | undefined
-  now: number
-  isLast: boolean
-}) {
-  const color = active ? 'var(--accent)' : past ? 'var(--fg)' : 'var(--muted)'
-  let revealStyle: React.CSSProperties = { color }
-  if (arrivedAt !== undefined) {
-    const raw = Math.max(0, Math.min(1, (now - arrivedAt) / WORD_FADE_MS))
-    const eased = raw * raw * (3 - 2 * raw)
-    if (eased < 1) {
-      revealStyle = {
-        color,
-        opacity: eased,
-        filter: `blur(${(1 - eased) * 2.2}px)`,
-        transform: `translateY(${(1 - eased) * 3}px)`,
-        willChange: 'opacity, filter, transform',
-      }
-    }
-  } else {
-    revealStyle = { ...revealStyle, opacity: 0 }
-  }
-  return (
-    <>
-      <span
-        className="editorial-word"
-        onClick={() => {
-          seek(start)
-          play()
-        }}
-        style={revealStyle}
-      >
-        {word}
-        {active && <span className="editorial-word__under" />}
-      </span>
-      {!isLast && ' '}
-    </>
-  )
-}
-
 function PlainText({
   body,
   currentTime: _currentTime,
@@ -256,68 +202,33 @@ function PlainText({
   /** True only while transcripts are arriving mid-stream — drives the
    * arrival-based fade-in. False for finalized results. */
   live: boolean
-  /** Per-word-index arrival timestamps for the live reveal. */
+  /** Per-word-index arrival timestamps for the live reveal. The CSS
+   * fade runs on first mount; we only need to know whether a word has
+   * an arrival stamp so we apply the class for ones that should fade. */
   wordArrivals: Map<number, number>
 }) {
-  const [now, setNow] = useState(() =>
-    typeof performance !== 'undefined' ? performance.now() : 0,
-  )
-  // rAF tick to advance the fade — only spins while at least one word is
-  // mid-fade. Stops itself once everything is settled.
-  useEffect(() => {
-    if (!live) return
-    let raf = 0
-    const tick = () => {
-      const cur = performance.now()
-      setNow(cur)
-      let anim = false
-      for (const [, arrivedAt] of wordArrivals) {
-        if (cur - arrivedAt < WORD_FADE_MS) {
-          anim = true
-          break
-        }
-      }
-      if (anim) raf = requestAnimationFrame(tick)
-    }
-    raf = requestAnimationFrame(tick)
-    return () => cancelAnimationFrame(raf)
-  }, [live, wordArrivals, body.words?.length])
-
   if (!body.words || body.words.length === 0) {
     return <div className="editorial-body">{body.text}</div>
   }
   const words = body.words
   const total = words.length
-  // Cap the animation window: only the last ANIMATED_TAIL words can be
-  // mid-fade. Anything older is rendered statically + memoized.
-  const tailStart = live ? Math.max(0, total - ANIMATED_TAIL) : total
   return (
     <div className="editorial-body">
       {words.map((w, i) => {
         const active = i === activeWordIdx
         const past = i < activeWordIdx
         const isLast = i === total - 1
-        if (i < tailStart) {
-          return (
-            <StaticWord
-              key={`${i}-${w.start}`}
-              word={w.word}
-              start={w.start}
-              active={active}
-              past={past}
-              isLast={isLast}
-            />
-          )
-        }
         return (
-          <AnimatingWord
+          <Word
             key={`${i}-${w.start}`}
             word={w.word}
             start={w.start}
             active={active}
             past={past}
-            arrivedAt={wordArrivals.get(i)}
-            now={now}
+            // Only the newly-arrived word(s) get the reveal class — and
+            // because the className is stable per element after mount,
+            // the animation never replays.
+            reveal={live && wordArrivals.has(i)}
             isLast={isLast}
           />
         )
@@ -327,11 +238,9 @@ function PlainText({
 }
 
 // ── Segments with single-line timestamps + compact metadata ─────
-
-// Arrival animation: smoothstep over SEG_FADE_MS ms starting from
-// arrivalMs. While the row is fading in we apply a small upward translate
-// + opacity ramp + blur dropoff, mirroring the word reveal recipe.
-const SEG_FADE_MS = 380
+// Same animation strategy as words: each new row mounts with a CSS
+// class that drives a one-shot keyframe; React doesn't re-render per
+// frame.
 
 function SegmentRows({
   segments,
@@ -345,29 +254,6 @@ function SegmentRows({
   segmentArrivals: Map<number, number>
 }) {
   const [openId, setOpenId] = useState<number | null>(null)
-  const [now, setNow] = useState(() => (typeof performance !== 'undefined' ? performance.now() : 0))
-
-  // While we're animating new arrivals, drive a rAF tick so the fade
-  // completes smoothly. Stops as soon as every segment is settled.
-  useEffect(() => {
-    if (!live) return
-    let raf = 0
-    const tick = () => {
-      const cur = performance.now()
-      setNow(cur)
-      // continue if any segment is still inside its fade window
-      let stillAnimating = false
-      for (const [, arrivedAt] of segmentArrivals) {
-        if (cur - arrivedAt < SEG_FADE_MS) {
-          stillAnimating = true
-          break
-        }
-      }
-      if (stillAnimating) raf = requestAnimationFrame(tick)
-    }
-    raf = requestAnimationFrame(tick)
-    return () => cancelAnimationFrame(raf)
-  }, [live, segmentArrivals, segments.length])
 
   if (segments.length === 0) {
     return (
@@ -386,27 +272,17 @@ function SegmentRows({
       {segments.map((s, i) => {
         const active = i === activeIdx
         const open = openId === s.id
-        // Per-segment reveal — only when live AND we have an arrival stamp
-        // for this id. Static results render at full opacity.
-        let revealStyle: React.CSSProperties | undefined
-        if (live && segmentArrivals.has(s.id)) {
-          const arrivedAt = segmentArrivals.get(s.id)!
-          const raw = Math.max(0, Math.min(1, (now - arrivedAt) / SEG_FADE_MS))
-          const eased = raw * raw * (3 - 2 * raw)
-          if (eased < 1) {
-            revealStyle = {
-              opacity: eased,
-              filter: `blur(${(1 - eased) * 2}px)`,
-              transform: `translateY(${(1 - eased) * 4}px)`,
-              willChange: 'opacity, filter, transform',
-            }
-          }
-        }
+        const reveal = live && segmentArrivals.has(s.id)
+        const cls = [
+          active ? 'segs-row segs-row--active' : 'segs-row',
+          reveal ? 'seg-reveal' : '',
+        ]
+          .filter(Boolean)
+          .join(' ')
         return (
           <div
             key={s.id}
-            className={active ? 'segs-row segs-row--active' : 'segs-row'}
-            style={revealStyle}
+            className={cls}
             onClick={() => goTo(s.start, s.id)}
             role="button"
             tabIndex={0}

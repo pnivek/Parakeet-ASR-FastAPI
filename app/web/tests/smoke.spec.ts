@@ -34,50 +34,41 @@ test('Maison v6 UI — boots, tabs switch, modes switch, strategy gate enforced'
   await expect(outputTab).toBeVisible()
   await expect(engineTab).toBeVisible()
 
-  // Source tab — Input dropdown defaults to file → file card shown
+  // Source tab — Input list defaults to file → file card shown.
   await sourceTab.click()
   await expect(page.getByText(/Drop a file or browse/i)).toBeVisible()
 
-  // Switch to URL mode via the Input dropdown
-  await page.getByLabel('Input source').click()
-  await page.getByRole('option', { name: 'URL' }).click()
+  // Switch to URL mode via the Input option list.
+  await page.getByRole('radio', { name: 'URL' }).click()
   await expect(page.getByPlaceholder('https://…')).toBeVisible()
 
-  // Switch to mic mode
-  await page.getByLabel('Input source').click()
-  await page.getByRole('option', { name: 'live microphone' }).click()
-  await expect(page.locator('.mic__status')).toBeVisible()
+  // Switch to mic mode — the Capture sub-list (Live / Record) shows.
+  await page.getByRole('radio', { name: 'Live microphone' }).click()
+  await expect(page.getByRole('radio', { name: /Live transcription/i })).toBeVisible()
+  await expect(page.getByRole('radio', { name: /Record \(transcribe after\)/i })).toBeVisible()
 
-  // Output tab — Format dropdown shows current value (verbose_json); the
-  // listbox isn't open by default. Timestamps are now ma-check rows.
+  // Output tab — Format option list visible (current = verbose_json),
+  // Timestamps are ma-check rows.
   await outputTab.click()
-  await expect(page.getByLabel('Response format')).toBeVisible()
-  await expect(page.getByLabel('Response format')).toHaveText(/verbose_json/i)
+  await expect(page.getByRole('radio', { name: 'verbose_json' })).toBeVisible()
   await expect(page.getByRole('button', { name: /^Segment$/i })).toBeVisible()
   await expect(page.getByRole('button', { name: /^Word$/i })).toBeVisible()
 
-  // Engine tab — Strategy dropdown shows current value
+  // Engine tab — Strategy option list visible.
   await engineTab.click()
-  await expect(page.getByLabel('Strategy')).toBeVisible()
+  await expect(page.getByRole('radio', { name: 'auto' })).toBeVisible()
+  await expect(page.getByRole('radio', { name: 'chunked' })).toBeVisible()
 
-  // Strategy gate: open the dropdown and confirm the progressive option
-  // is enabled for file mode and disabled for URL mode.
+  // Strategy gate: progressive enabled in file mode, disabled in URL.
   await sourceTab.click()
-  await page.getByLabel('Input source').click()
-  await page.getByRole('option', { name: 'file upload' }).click()
+  await page.getByRole('radio', { name: 'File upload' }).click()
   await engineTab.click()
-  await page.getByLabel('Strategy').click()
-  await expect(page.getByRole('option', { name: 'progressive' })).toBeEnabled()
-  // Close the menu.
-  await page.keyboard.press('Escape')
+  await expect(page.getByRole('radio', { name: 'progressive' })).toBeEnabled()
 
   await sourceTab.click()
-  await page.getByLabel('Input source').click()
-  await page.getByRole('option', { name: 'URL' }).click()
+  await page.getByRole('radio', { name: 'URL' }).click()
   await engineTab.click()
-  await page.getByLabel('Strategy').click()
-  await expect(page.getByRole('option', { name: 'progressive' })).toBeDisabled()
-  await page.keyboard.press('Escape')
+  await expect(page.getByRole('radio', { name: 'progressive' })).toBeDisabled()
 
   // Footer rail metric labels present.
   for (const label of ['STRATEGY', 'ASR', 'RTFx', 'SEGMENTS', 'WORDS']) {

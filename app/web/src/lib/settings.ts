@@ -45,6 +45,11 @@ export interface Settings {
   /** Forwarded to `getUserMedia({ audio: { noiseSuppression } })`. */
   noiseSuppression: boolean
 
+  /** Mic capture mode: 'live' streams via WS during recording; 'record'
+   * just captures locally then transcribes the finished blob as a file
+   * (REST upload). Default 'live'. */
+  micCaptureMode: 'live' | 'record'
+
   // UI
   theme: ThemeMode
 
@@ -72,6 +77,8 @@ const DEFAULTS: Omit<Settings, 'set' | 'reset'> = {
   vadPadDurationMs: 0,
   hpfHz: 100,
   noiseSuppression: true,
+
+  micCaptureMode: 'live',
 
   theme: 'system',
 }

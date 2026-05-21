@@ -9,10 +9,10 @@ import {
 } from '../lib/api'
 import { useSettings } from '../lib/settings'
 import { MIC_FORMAT_HINT, MIC_SAMPLE_RATE, MIC_MIME_TYPE, useMic } from '../lib/mic'
-import { formatBytes, formatTime } from '../lib/format'
+import { formatBytes } from '../lib/format'
 import type { ResponseFormat, Strategy, TimestampGranularity, WhisperSegment, Word, WSMessage } from '../lib/types'
 import type { LoadedAudio } from '../lib/download'
-import { Dropdown } from './Dropdown'
+import { OptionList } from './OptionList'
 
 export type InputMode = 'file' | 'mic' | 'url'
 
@@ -48,14 +48,6 @@ const FORMATS: { id: ResponseFormat; label: string }[] = [
   { id: 'vtt', label: 'vtt' },
 ]
 const STRATEGIES: Strategy[] = ['auto', 'full', 'chunked', 'progressive']
-
-const MicIcon = ({ size = 22 }: { size?: number }) => (
-  <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-    <rect x="9" y="3" width="6" height="12" rx="3" />
-    <path d="M5 11a7 7 0 0 0 14 0" />
-    <path d="M12 18v3" />
-  </svg>
-)
 
 export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBusyChange, onSessionStart, onAudioReady, onPeaks, onPartialSegment }: Props) {
   const s = useSettings()
@@ -272,10 +264,25 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   const mic = useMic({
     onChunk: (blob) => {
       chunksRef.current.push(blob)
+      // Live mode forwards each chunk to the server while recording.
+      // Record mode just accumulates locally — wsRef is null, so this
+      // is a no-op.
       wsRef.current?.sendBinary(blob)
     },
     onStop: () => {
-      wsRef.current?.finish()
+      if (wsRef.current) {
+        // Live mode: tell the server we're done. Final segments/words
+        // arrive via the WS message handler.
+        wsRef.current.finish()
+        return
+      }
+      // Record mode: build a File from the accumulated chunks and
+      // stage it as pickedFile. The user clicks Transcribe to send it
+      // through the REST upload path.
+      if (chunksRef.current.length === 0) return
+      const blob = new Blob(chunksRef.current, { type: MIC_MIME_TYPE })
+      const file = new File([blob], `recording-${Date.now()}.webm`, { type: MIC_MIME_TYPE })
+      setPickedFile(file)
     },
     onError: (err) => {
       onError(err.message)
@@ -299,48 +306,62 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
     return () => clearInterval(i)
   }, [recording])
 
-  const startMic = useCallback(async () => {
-    onSessionStart?.()
-    cancelPendingPartial()
-    segmentsRef.current = []
-    wordsRef.current = []
-    chunksRef.current = []
-    recordStartRef.current = Date.now()
-    setRecordElapsed(0)
-    // Honor the user's strategy choice. Live mic + chunked/full just means
-    // "accumulate then process" — no partials, slow. progressive is the
-    // real-time path. auto routes to progressive over WS.
-    const wsStrategy: Strategy =
-      s.strategy === 'auto' || s.strategy === 'progressive' ? 'progressive' : s.strategy
-    const ws = connectLiveWS(
-      {
-        sample_rate: MIC_SAMPLE_RATE,
-        channels: 1,
-        bytes_per_sample: 2,
-        format: MIC_FORMAT_HINT,
-        strategy: wsStrategy,
-        live_latency: s.liveLatency,
-        progressive_refinement: s.progressiveRefinement,
-        chunk_length: s.chunkLength ?? undefined,
-        chunk_overlap: s.chunkOverlap ?? undefined,
-        batch_size: s.batchSize ?? undefined,
-        long_audio_threshold: s.longAudioThreshold ?? undefined,
-        ...vadConfig(),
-      },
-      {
-        onMessage: handleMessage,
-        onError: () => onError('WebSocket error — connection failed.'),
-        onClose: (code, reason) => {
-          if (code !== 1000 && code !== 1005) {
-            onError(`WebSocket closed: code=${code} reason=${reason || 'no reason'}`)
-          }
-          wsRef.current = null
+  const startMic = useCallback(
+    async (captureMode: 'live' | 'record' = s.micCaptureMode) => {
+      onSessionStart?.()
+      cancelPendingPartial()
+      segmentsRef.current = []
+      wordsRef.current = []
+      chunksRef.current = []
+      recordStartRef.current = Date.now()
+      setRecordElapsed(0)
+      // Record mode skips the WS entirely — useMic still records to
+      // chunksRef, and the onStop handler stages the resulting blob
+      // as pickedFile + routes through the REST file path on
+      // Transcribe click.
+      if (captureMode === 'record') {
+        // Make sure any prior recording / WS is cleared so the new
+        // blob can be staged cleanly.
+        wsRef.current = null
+        setPickedFile(null)
+        await mic.start()
+        return
+      }
+      // Live mode: open the WS, then start the mic.
+      const wsStrategy: Strategy =
+        s.strategy === 'auto' || s.strategy === 'progressive' ? 'progressive' : s.strategy
+      const ws = connectLiveWS(
+        {
+          sample_rate: MIC_SAMPLE_RATE,
+          channels: 1,
+          bytes_per_sample: 2,
+          format: MIC_FORMAT_HINT,
+          strategy: wsStrategy,
+          live_latency: s.liveLatency,
+          progressive_refinement: s.progressiveRefinement,
+          chunk_length: s.chunkLength ?? undefined,
+          chunk_overlap: s.chunkOverlap ?? undefined,
+          batch_size: s.batchSize ?? undefined,
+          long_audio_threshold: s.longAudioThreshold ?? undefined,
+          ...vadConfig(),
         },
-      },
-    )
-    wsRef.current = ws
-    await mic.start()
-  }, [s, handleMessage, mic, onError, onSessionStart])
+        {
+          onMessage: handleMessage,
+          onError: () => onError('WebSocket error — connection failed.'),
+          onClose: (code, reason) => {
+            if (code !== 1000 && code !== 1005) {
+              onError(`WebSocket closed: code=${code} reason=${reason || 'no reason'}`)
+            }
+            wsRef.current = null
+          },
+        },
+      )
+      wsRef.current = ws
+      await mic.start()
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [s, handleMessage, mic, onError, onSessionStart],
+  )
 
   // Drive the bottom Transcribe button. In mic mode it doubles as
   // record/stop. In file mode + progressive, stream the bytes over the WS
@@ -535,8 +556,52 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         setBusyAll(false)
       }
     } else if (mode === 'mic') {
-      if (recording) mic.stop()
-      else startMic().catch((e) => onError(e instanceof Error ? e.message : String(e)))
+      if (recording) {
+        mic.stop()
+        return
+      }
+      // Record sub-mode with a staged blob: upload via REST so the
+      // user gets the full pipeline (auto strategy, refinement, etc).
+      if (s.micCaptureMode === 'record' && pickedFile) {
+        onSessionStart?.()
+        setBusyAll(true)
+        setProgress(0)
+        const ac = new AbortController()
+        restAbortRef.current = ac
+        try {
+          const r = await postTranscription(
+            pickedFile,
+            {
+              response_format: s.responseFormat,
+              timestamp_granularities: s.timestampGranularities,
+              strategy: restStrategy(),
+              chunk_length: s.chunkLength ?? undefined,
+              chunk_overlap: s.chunkOverlap ?? undefined,
+              batch_size: s.batchSize ?? undefined,
+              long_audio_threshold: s.longAudioThreshold ?? undefined,
+            },
+            { onProgress: (loaded, total) => setProgress(loaded / total), signal: ac.signal },
+          )
+          onResult(
+            {
+              kind: 'file',
+              title: `recording — ${new Date().toLocaleTimeString()}`,
+              source: 'mic · recorded',
+              file: pickedFile,
+            },
+            r,
+          )
+        } catch (e) {
+          if (e instanceof DOMException && e.name === 'AbortError') return
+          onError(e instanceof Error ? e.message : String(e))
+        } finally {
+          if (restAbortRef.current === ac) restAbortRef.current = null
+          setBusyAll(false)
+          setProgress(null)
+        }
+        return
+      }
+      startMic(s.micCaptureMode).catch((e) => onError(e instanceof Error ? e.message : String(e)))
     }
   }, [mode, pickedFile, urlInput, s, recording, mic, startMic, onResult, onPartial, onError, setBusyAll, onSessionStart, onAudioReady])
 
@@ -575,7 +640,12 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
 
   const transcribeLabel = (() => {
     if (busy) return mode === 'mic' ? 'Working…' : 'Stop ▣'
-    if (mode === 'mic') return recording ? 'Stop ▣' : 'Record ●'
+    if (mode === 'mic') {
+      if (recording) return 'Stop ▣'
+      // Record sub-mode with a staged blob → bottom button uploads it.
+      if (s.micCaptureMode === 'record' && pickedFile) return 'Transcribe →'
+      return 'Record ●'
+    }
     return 'Transcribe →'
   })()
   const onCommitClick = () => {
@@ -641,6 +711,8 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             micBusy={micBusy}
             recordElapsed={recordElapsed}
             startMic={startMic}
+            micCaptureMode={s.micCaptureMode}
+            setMicCaptureMode={(v) => s.set('micCaptureMode', v)}
           />
         )}
         {tab === 'output' && (
@@ -657,6 +729,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             strategy={s.strategy}
             setStrategy={(v) => s.set('strategy', v)}
             mode={mode}
+            micCaptureMode={s.micCaptureMode}
             longAudioThreshold={s.longAudioThreshold}
             batchSize={s.batchSize}
             chunkLength={s.chunkLength}
@@ -739,6 +812,8 @@ function SourcePane({
   micBusy,
   recordElapsed,
   startMic,
+  micCaptureMode,
+  setMicCaptureMode,
 }: {
   mode: InputMode
   onModeChange: (m: InputMode) => void
@@ -754,17 +829,18 @@ function SourcePane({
   recording: boolean
   micBusy: boolean
   recordElapsed: number
-  startMic: () => Promise<void>
+  startMic: (captureMode: 'live' | 'record') => Promise<void>
+  micCaptureMode: 'live' | 'record'
+  setMicCaptureMode: (v: 'live' | 'record') => void
 }) {
   return (
     <div>
       <SBLabel>Input</SBLabel>
-      <Dropdown<InputMode>
+      <OptionList<InputMode>
         value={mode}
-        ariaLabel="Input source"
         options={[
-          { id: 'file', label: 'file upload' },
-          { id: 'mic', label: 'live microphone' },
+          { id: 'file', label: 'File upload' },
+          { id: 'mic', label: 'Live microphone' },
           { id: 'url', label: 'URL' },
         ]}
         onChange={onModeChange}
@@ -877,31 +953,86 @@ function SourcePane({
       )}
 
       {mode === 'mic' && (
-        <div className="sb__mic">
+        <div style={{ marginTop: 16 }}>
+          <SBLabel>Capture</SBLabel>
+          <OptionList<'live' | 'record'>
+            value={micCaptureMode}
+            options={[
+              { id: 'live', label: 'Live transcription' },
+              { id: 'record', label: 'Record (transcribe after)' },
+            ]}
+            onChange={setMicCaptureMode}
+          />
+
+          <div className="mic-card" style={{ marginTop: 16 }}>
+            <MicCardBars level={mic.level} recording={recording} />
+            <div className="mic-card__row">
+              <span className="mic-card__status">
+                {recording ? 'Recording' : 'Standby'}
+              </span>
+              <span
+                className={
+                  recording ? 'mic-card__timer mic-card__timer--rec' : 'mic-card__timer'
+                }
+              >
+                {formatMicTimer(recordElapsed)}
+              </span>
+            </div>
+          </div>
+
           <button
             type="button"
-            className={recording ? 'mic-btn mic-btn--recording' : 'mic-btn'}
-            onClick={() => (recording ? mic.stop() : startMic())}
+            className={recording ? 'ma-pill ma-pill--active mic-card__btn' : 'ma-pill mic-card__btn'}
+            onClick={() => (recording ? mic.stop() : startMic(micCaptureMode))}
             disabled={micBusy}
-            aria-label={recording ? 'Stop recording' : 'Start recording'}
           >
-            {recording ? <span className="mic-btn__square" /> : <MicIcon />}
-            {recording && <span className="mic-btn__halo" />}
+            <span className={recording ? 'mic-card__dot mic-card__dot--rec' : 'mic-card__dot'} />
+            {recording
+              ? 'Stop recording'
+              : pickedFile && micCaptureMode === 'record'
+                ? 'Re-record'
+                : 'Start recording'}
           </button>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
-            <span className="mic__status">
-              {mic.state === 'idle' && 'READY'}
-              {mic.state === 'starting' && 'CONNECTING'}
-              {mic.state === 'recording' && 'RECORDING'}
-              {mic.state === 'stopping' && 'FINALIZING'}
-              {mic.state === 'error' && 'ERROR'}
-            </span>
-            <span className={recording ? 'mic__timer mic__timer--on num' : 'mic__timer num'}>
-              {formatTime(recordElapsed)}
-            </span>
-          </div>
-          <SidebarMicMeter level={mic.level} recording={recording} />
-          <div className="sb__mic-hint">Tap above to start. Tap Transcribe at the bottom to stop.</div>
+
+          {!recording && pickedFile && micCaptureMode === 'record' && (
+            <div className="sb__file-card" style={{ marginTop: 10 }}>
+              <div className="sb__file-card__icon">
+                <svg
+                  viewBox="0 0 24 24"
+                  width="16"
+                  height="16"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden
+                >
+                  <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+                  <path d="M14 3v5h5" />
+                </svg>
+              </div>
+              <div className="sb__file-card__body">
+                <div className="sb__file-card__name">{pickedFile.name}</div>
+                <div className="sb__file-card__meta">
+                  {formatBytes(pickedFile.size)} · WebM Opus
+                </div>
+              </div>
+              <button
+                type="button"
+                className="ma-pill ma-pill--sm"
+                aria-label="Discard recording"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setPickedFile(null)
+                }}
+              >
+                ✕
+              </button>
+            </div>
+          )}
+
+          <div className="mic-card__hint">16 kHz · Mono · WebM Opus</div>
         </div>
       )}
 
@@ -920,23 +1051,41 @@ function SourcePane({
   )
 }
 
-function SidebarMicMeter({ level, recording }: { level: number; recording: boolean }) {
+/** Bar meter inside the mic card. 28 bars driven by the AnalyserNode
+ * peak level via mic.level, with a per-bar sin pattern so the meter
+ * looks wave-shaped instead of a flat block. Animates implicitly as
+ * setLevel fires from the analyser tick (~30Hz coalesced). */
+function MicCardBars({ level, recording }: { level: number; recording: boolean }) {
+  const N = 28
   return (
-    <div className="mic-meter">
-      {Array.from({ length: 22 }).map((_, i) => {
-        const k = i / 21
-        const jit = 0.55 + ((i * 11.7) % 50) / 100
-        const h = recording ? Math.max(8, Math.min(100, level * 110 * jit * (k * 0.6 + 0.7))) : 18
-        const hot = recording && level * jit > 0.7
-        const cls = !recording
-          ? 'mic-meter__bar'
-          : hot
-            ? 'mic-meter__bar mic-meter__bar--hot'
-            : 'mic-meter__bar mic-meter__bar--on'
-        return <div key={i} className={cls} style={{ height: `${h}%` }} />
+    <div className="mic-card__bars">
+      {Array.from({ length: N }).map((_, i) => {
+        // Per-bar envelope: bigger toward the middle, smaller at the
+        // edges. Always at least a tiny resting height so the meter
+        // doesn't disappear in silence.
+        const envelope = 0.5 + 0.5 * Math.sin((i / N) * Math.PI)
+        const phase = Math.abs(Math.sin(i * 0.55 + 1.3))
+        const h = recording
+          ? Math.max(6, Math.min(90, level * 90 * (0.45 + 0.55 * phase) * envelope))
+          : 4 + (i % 2) * 1.5
+        return (
+          <span
+            key={i}
+            className={recording ? 'mic-card__bar mic-card__bar--on' : 'mic-card__bar'}
+            style={{ height: `${h}%`, opacity: recording ? 0.55 + 0.45 * phase : 1 }}
+          />
+        )
       })}
     </div>
   )
+}
+
+/** Tabular MM:SS.t format for the mic card timer. */
+function formatMicTimer(seconds: number): string {
+  const m = Math.floor(seconds / 60)
+  const s = Math.floor(seconds % 60)
+  const t = Math.floor((seconds * 10) % 10)
+  return `${m}:${String(s).padStart(2, '0')}.${t}`
 }
 
 // ── Output pane ───────────────────────────────────────────────────
@@ -956,9 +1105,9 @@ function OutputPane({
   return (
     <div>
       <SBLabel>Format</SBLabel>
-      <Dropdown<ResponseFormat>
+      <OptionList<ResponseFormat>
         value={format}
-        ariaLabel="Response format"
+        mono
         options={FORMATS.map((f) => ({ id: f.id, label: f.label }))}
         onChange={setFormat}
       />
@@ -1023,6 +1172,7 @@ function EnginePane({
   strategy,
   setStrategy,
   mode,
+  micCaptureMode,
   longAudioThreshold,
   batchSize,
   chunkLength,
@@ -1053,6 +1203,7 @@ function EnginePane({
   strategy: Strategy
   setStrategy: (v: Strategy) => void
   mode: InputMode
+  micCaptureMode: 'live' | 'record'
   longAudioThreshold: number | null
   batchSize: number | null
   chunkLength: number | null
@@ -1080,12 +1231,20 @@ function EnginePane({
   setHpfHz: (v: number | null) => void
   setNoiseSuppression: (v: boolean) => void
 }) {
+  // Each setting only shows in the modes where it actually matters.
+  // - `file`, `url`, and `mic+record` all go through the REST file
+  //   upload path, so they share batch/chunk/threshold/refinement.
+  // - `mic+live` is the only path that uses live_latency, VAD, and
+  //   the browser-side mic-input quality knobs (hpf, noise_supp).
+  const isMicLive = mode === 'mic' && micCaptureMode === 'live'
+  const isMicAny = mode === 'mic'
+  const isRestPath = !isMicLive
   return (
     <div>
       <SBLabel>Strategy</SBLabel>
-      <Dropdown<Strategy>
+      <OptionList<Strategy>
         value={strategy}
-        ariaLabel="Strategy"
+        mono
         options={STRATEGIES.map((id) => ({
           id,
           label: id,
@@ -1103,25 +1262,42 @@ function EnginePane({
 
       <SBLabel top={22}>Advanced</SBLabel>
       <div className="sb__adv-list">
-        <NumKv k="long_audio_threshold" v={longAudioThreshold} placeholder={480} suffix="s" onSet={setLong} />
-        <NumKv k="batch_size" v={batchSize} placeholder={4} onSet={setBatch} />
-        <NumKv k="chunk_length" v={chunkLength} placeholder={30} suffix="s" onSet={setChunkLen} />
-        <ToggleKv k="live_latency" v={liveLatency} onSet={setLiveLatency} />
+        {isRestPath && (
+          <>
+            <NumKv k="long_audio_threshold" v={longAudioThreshold} placeholder={480} suffix="s" onSet={setLong} />
+            <NumKv k="batch_size" v={batchSize} placeholder={4} onSet={setBatch} />
+            <NumKv k="chunk_length" v={chunkLength} placeholder={30} suffix="s" onSet={setChunkLen} />
+          </>
+        )}
+        {isMicLive && <ToggleKv k="live_latency" v={liveLatency} onSet={setLiveLatency} />}
         <ToggleKv k="progressive_refinement" v={progressiveRefinement} onSet={setProgRefine} />
 
-        <div className="sb__adv-divider" />
+        {isMicAny && (
+          <>
+            <div className="sb__adv-divider" />
 
-        <ToggleKv k="vad_enabled" v={vadEnabled} onSet={setVadEnabled} />
-        {mode !== 'mic' && vadEnabled && (
-          <div className="sb__hint">Auto-disabled for File and URL modes — the engine queue isn’t bandwidth-limited there, so VAD only adds per-frame CPU cost.</div>
+            {/* Mic input quality (browser-side getUserMedia constraints +
+                ffmpeg highpass). Applies to both Live and Record. */}
+            <NumKv k="hpf_hz" v={hpfHz} placeholder={100} suffix="Hz" onSet={setHpfHz} />
+            <ToggleKv k="noise_suppression (browser)" v={noiseSuppression} onSet={setNoiseSuppression} />
+          </>
         )}
-        <NumKv k="vad_threshold" v={vadThreshold} placeholder={0.5} step={0.05} onSet={setVadThreshold} />
-        <NumKv k="vad_consecutive" v={vadConsecutive} placeholder={3} onSet={setVadConsecutive} />
-        <NumKv k="vad_hangover_ms" v={vadHangoverMs} placeholder={500} suffix="ms" onSet={setVadHangoverMs} />
-        <NumKv k="vad_pad_min_gap_ms" v={vadPadMinGapMs} placeholder={400} suffix="ms" onSet={setVadPadMinGap} />
-        <NumKv k="vad_pad_duration_ms" v={vadPadDurationMs} placeholder={0} suffix="ms" onSet={setVadPadDuration} />
-        <NumKv k="hpf_hz" v={hpfHz} placeholder={100} suffix="Hz" onSet={setHpfHz} />
-        <ToggleKv k="noise_suppression (browser)" v={noiseSuppression} onSet={setNoiseSuppression} />
+
+        {isMicLive && (
+          <>
+            <div className="sb__adv-divider" />
+
+            {/* VAD settings only apply to the live WS streaming path —
+                Record mode uploads the raw blob via REST and ffmpeg
+                doesn't touch VAD on the server. */}
+            <ToggleKv k="vad_enabled" v={vadEnabled} onSet={setVadEnabled} />
+            <NumKv k="vad_threshold" v={vadThreshold} placeholder={0.5} step={0.05} onSet={setVadThreshold} />
+            <NumKv k="vad_consecutive" v={vadConsecutive} placeholder={3} onSet={setVadConsecutive} />
+            <NumKv k="vad_hangover_ms" v={vadHangoverMs} placeholder={500} suffix="ms" onSet={setVadHangoverMs} />
+            <NumKv k="vad_pad_min_gap_ms" v={vadPadMinGapMs} placeholder={400} suffix="ms" onSet={setVadPadMinGap} />
+            <NumKv k="vad_pad_duration_ms" v={vadPadDurationMs} placeholder={0} suffix="ms" onSet={setVadPadDuration} />
+          </>
+        )}
       </div>
     </div>
   )

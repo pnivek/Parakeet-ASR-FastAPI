@@ -503,6 +503,83 @@ body {
   border-color: var(--ma-accent);
 }
 
+/* ── Option list ──────────────────────────────────────────────────
+ * Vertical column of click-to-select option rows. Each row has a
+ * small dot indicator on the right that fills accent when active,
+ * and a 2px accent bar on the left edge of the active row. Used for
+ * Input / Format / Strategy selectors instead of the previous
+ * dropdowns — wastes less of the sidebar's vertical space and lets
+ * the user see all options at a glance. */
+.ma-option-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ma-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  padding: 8px 8px 8px 14px;
+  position: relative;
+  text-align: left;
+  color: var(--ma-fgDim);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  letter-spacing: 0.1px;
+  transition: color 0.18s ease, background 0.18s ease;
+}
+.ma-option::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 7px;
+  bottom: 7px;
+  width: 2px;
+  background: transparent;
+  transition: background 0.18s ease;
+  border-radius: 1px;
+}
+.ma-option:hover:not([disabled]) {
+  color: var(--ma-fg);
+}
+.ma-option:hover:not([disabled])::before {
+  background: rgba(255, 255, 255, 0.18);
+}
+.ma-option--active {
+  color: var(--ma-accent);
+}
+.ma-option--active::before {
+  background: var(--ma-accent);
+}
+.ma-option--mono {
+  font-family: var(--font-mono);
+  text-transform: lowercase;
+  letter-spacing: 0.3px;
+  font-size: 12px;
+}
+.ma-option[disabled] {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+.ma-option__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 99px;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  flex-shrink: 0;
+  transition: background 0.18s ease, border-color 0.18s ease;
+}
+.ma-option--active .ma-option__dot {
+  background: currentColor;
+  border-color: currentColor;
+}
+
 /* ── Advanced KV list (always-visible) ─────────────────────────────
  * Replaces the prior collapsible toggle. A hairline left-rule signals
  * grouped settings, accent only on the labels. */
@@ -801,14 +878,14 @@ body {
 .format-pill {
   display: inline-flex;
   align-items: center;
-  padding: 3px 9px;
+  padding: 3px 10px;
   font-family: var(--font-mono);
   font-size: 10.5px;
   letter-spacing: 0.4px;
   color: var(--accent);
   background: color-mix(in oklch, var(--accent) 10%, transparent);
   border: 1px solid color-mix(in oklch, var(--accent) 26%, transparent);
-  border-radius: 4px;
+  border-radius: 999px;
 }
 .transcript__body {
   flex: 1;
@@ -1273,7 +1350,86 @@ body {
   letter-spacing: 0.3px;
 }
 
-/* Mic block in sidebar */
+/* ── Mic card ─────────────────────────────────────────────────────
+ * Bordered card containing an animated bar meter + status/timer row.
+ * Below the card: a full-width pill button toggling recording state
+ * (with a circle-to-square morphing dot, matching the design). Used
+ * for both Live and Record capture modes — the difference is whether
+ * the captured audio gets streamed to the server live (WS) or
+ * transcribed as a file after stop. */
+.mic-card {
+  padding: 16px 14px;
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.015);
+}
+.mic-card__bars {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 40px;
+  gap: 2px;
+}
+.mic-card__bar {
+  flex: 1;
+  border-radius: 1px;
+  background: rgba(255, 255, 255, 0.18);
+  transition: height 0.25s ease, background 0.25s ease, opacity 0.25s ease;
+}
+.mic-card__bar--on {
+  background: var(--accent);
+  transition: none;
+}
+.mic-card__row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-top: 12px;
+}
+.mic-card__status {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--muted-deep);
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+}
+.mic-card__timer {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  color: var(--fg);
+}
+.mic-card__timer--rec {
+  color: var(--accent);
+}
+.mic-card__btn {
+  width: 100%;
+  margin-top: 10px;
+  padding: 11px 14px;
+  gap: 9px;
+}
+.mic-card__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 99px;
+  background: currentColor;
+  transition: border-radius 0.25s ease;
+}
+.mic-card__dot--rec {
+  border-radius: 2px;
+}
+.mic-card__hint {
+  margin-top: 12px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--muted-deep);
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+}
+
+/* Mic block in sidebar (legacy — only kept for fallback styling) */
 .sb__mic {
   margin-top: 12px;
   display: flex;

@@ -1408,11 +1408,21 @@ async def handle_streaming_pcm(
         # Force the engine to flush its partial sentence buffer if nothing
         # has committed in this many seconds. The engine only commits
         # segments on terminal '.!?' tokens; without this fallback, a
-        # speaker who doesn't pause between sentences sees nothing until
-        # they stop (the EOF flush). 3s is short enough to feel live but
-        # long enough that normal punctuated speech still gets clean
-        # sentence-bounded segments.
-        PARTIAL_FLUSH_INTERVAL_S = 3.0
+        # live-mic speaker who runs sentences together sees nothing
+        # until they stop (the EOF flush).
+        #
+        # Gated on live_latency=True — that's the mic preset. File mode
+        # uses the offline preset (live_latency=False) and prioritises
+        # clean sentence-bounded segments over responsiveness, so we
+        # don't fragment those.
+        #
+        # 5s + min-token threshold reduces fragmentation: only flush
+        # when the user has genuinely been talking through a long run
+        # of words without natural punctuation. Short utterances still
+        # get committed in clean sentences.
+        PARTIAL_FLUSH_INTERVAL_S = 5.0
+        PARTIAL_FLUSH_MIN_TOKENS = 6
+        partial_flush_enabled = live_latency
         import time as _time
         last_emit_at = _time.monotonic()
         try:
@@ -1431,9 +1441,15 @@ async def handle_streaming_pcm(
                 await _run_on_asr_executor(engine.feed_float32, samples_np)
                 total_engine_chunks += 1
                 new_segs = engine.pop_committed_segments()
-                if not new_segs and (_time.monotonic() - last_emit_at) > PARTIAL_FLUSH_INTERVAL_S:
-                    # Long enough without a sentence boundary — flush whatever
-                    # tokens are buffered so the UI doesn't stall.
+                if (
+                    not new_segs
+                    and partial_flush_enabled
+                    and (_time.monotonic() - last_emit_at) > PARTIAL_FLUSH_INTERVAL_S
+                    and engine.pending_token_count >= PARTIAL_FLUSH_MIN_TOKENS
+                ):
+                    # Long enough without a sentence boundary — flush
+                    # whatever tokens are buffered so the UI doesn't
+                    # stall. Live mic only.
                     new_segs = engine.flush_partial_sentence()
                 if new_segs and websocket.application_state == WebSocketState.CONNECTED:
                     try:

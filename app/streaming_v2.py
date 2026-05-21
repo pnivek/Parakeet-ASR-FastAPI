@@ -480,6 +480,13 @@ class StreamingPrevBatchedEngine:
     def asr_time_s(self) -> float:
         return self._asr_time_s
 
+    @property
+    def pending_token_count(self) -> int:
+        """Tokens accumulated in the current sentence buffer (haven't seen
+        a terminal '.!?' yet). The consumer uses this to decide whether
+        an in-progress partial is worth flushing on a timer."""
+        return len(self._sentence_buffer_ids)
+
     def reset(self) -> None:
         """Release buffer + decoder state. Safe to re-feed afterwards."""
         self._reset_streaming_state()

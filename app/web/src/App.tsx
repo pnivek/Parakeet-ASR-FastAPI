@@ -41,11 +41,6 @@ export default function App() {
   useAudioContainer(audioMountRef)
   const currentTime = useCurrentTime()
 
-  // decodeAudioData allocates ~10x the compressed file size in PCM — a 3hr
-  // mp3 (≈180MB on disk) would need ~1.5GB of float32 PCM and may OOM the
-  // tab. Skip the decode for huge files and leave peaks null.
-  const PEAKS_MAX_BYTES = 200 * 1024 * 1024
-
   // Decode peaks for whichever file is currently loaded. One source of
   // truth: any time `loaded.file` becomes a new blob (file picked, mic
   // recording finalized, etc.), kick off a decode. We DON'T clear peaks
@@ -53,16 +48,15 @@ export default function App() {
   // session, or a previous file) stay visible until the new decode
   // resolves, avoiding a flash of empty bars. Cancellation flag prevents
   // a stale decode from clobbering a newer file's peaks.
+  //
+  // peaks.ts handles format dispatch + size caps. WAV files go through a
+  // header-parsing fast path that reads only ~3MB per file regardless of
+  // duration; other formats fall through to decodeAudioData (capped at
+  // 200MB compressed input).
   const loadedFile = loaded?.kind === 'file' ? loaded.file : null
   useEffect(() => {
     if (!loadedFile) {
       setPeaks(null)
-      return
-    }
-    if (loadedFile.size > PEAKS_MAX_BYTES) {
-      console.warn(
-        `Peaks decode skipped: ${(loadedFile.size / 1024 / 1024).toFixed(0)} MB > ${PEAKS_MAX_BYTES / 1024 / 1024} MB cap.`,
-      )
       return
     }
     let cancelled = false

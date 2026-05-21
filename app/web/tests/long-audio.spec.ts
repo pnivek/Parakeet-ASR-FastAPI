@@ -130,13 +130,15 @@ test('long-audio progressive: timing + hang diagnostics', async ({ page }) => {
   await installProbes(page)
   await page.goto('/')
 
-  // Switch to engine tab and pick `progressive`.
-  await page.getByRole('button', { name: /^engine$/i }).click()
-  await page.getByRole('button', { name: /^progressive$/ }).click()
-
-  // Source tab → File mode.
+  // Source tab → File mode (option-list radio).
   await page.getByRole('button', { name: /^source$/i }).click()
-  await page.getByRole('button', { name: /^file$/ }).click()
+  await page.getByRole('radio', { name: 'File upload' }).click()
+
+  // Switch to engine tab and pick `progressive` (option-list radio).
+  await page.getByRole('button', { name: /^engine$/i }).click()
+  await page.getByRole('radio', { name: 'progressive' }).click()
+  // Back to source so the file input is in the DOM for upload.
+  await page.getByRole('button', { name: /^source$/i }).click()
 
   // Upload the long file.
   const fileInput = page.locator('input[type="file"]').first()

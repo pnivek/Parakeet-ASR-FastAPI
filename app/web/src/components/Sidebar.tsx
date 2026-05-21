@@ -12,6 +12,7 @@ import { MIC_FORMAT_HINT, MIC_SAMPLE_RATE, MIC_MIME_TYPE, useMic } from '../lib/
 import { formatBytes, formatTime } from '../lib/format'
 import type { ResponseFormat, Strategy, TimestampGranularity, WhisperSegment, Word, WSMessage } from '../lib/types'
 import type { LoadedAudio } from '../lib/download'
+import { Dropdown } from './Dropdown'
 
 export type InputMode = 'file' | 'mic' | 'url'
 
@@ -48,22 +49,6 @@ const FORMATS: { id: ResponseFormat; label: string }[] = [
 ]
 const STRATEGIES: Strategy[] = ['auto', 'full', 'chunked', 'progressive']
 
-const ChevIcon = ({ up }: { up: boolean }) => (
-  <svg
-    viewBox="0 0 24 24"
-    width={11}
-    height={11}
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="2"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    style={{ transform: up ? 'rotate(180deg)' : 'none', transition: 'transform .15s' }}
-    aria-hidden
-  >
-    <path d="M6 9l6 6 6-6" />
-  </svg>
-)
 const MicIcon = ({ size = 22 }: { size?: number }) => (
   <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
     <rect x="9" y="3" width="6" height="12" rx="3" />
@@ -75,7 +60,6 @@ const MicIcon = ({ size = 22 }: { size?: number }) => (
 export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBusyChange, onSessionStart, onAudioReady, onPeaks, onPartialSegment }: Props) {
   const s = useSettings()
   const [tab, setTab] = useState<SidebarTab>('source')
-  const [advOpen, setAdvOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [progress, setProgress] = useState<number | null>(null)
 
@@ -673,8 +657,6 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             strategy={s.strategy}
             setStrategy={(v) => s.set('strategy', v)}
             mode={mode}
-            advOpen={advOpen}
-            setAdvOpen={setAdvOpen}
             longAudioThreshold={s.longAudioThreshold}
             batchSize={s.batchSize}
             chunkLength={s.chunkLength}
@@ -701,7 +683,6 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             setVadPadDuration={(v) => s.set('vadPadDurationMs', v ?? 0)}
             setHpfHz={(v) => s.set('hpfHz', v ?? 100)}
             setNoiseSuppression={(v) => s.set('noiseSuppression', v)}
-            ChevIcon={ChevIcon}
           />
         )}
       </div>
@@ -778,18 +759,16 @@ function SourcePane({
   return (
     <div>
       <SBLabel>Input</SBLabel>
-      <div className="ma-segmented ma-segmented--full">
-        {(['file', 'mic', 'url'] as InputMode[]).map((id) => (
-          <button
-            key={id}
-            type="button"
-            className={mode === id ? 'ma-pill ma-pill--active' : 'ma-pill'}
-            onClick={() => onModeChange(id)}
-          >
-            {id === 'file' ? 'file' : id === 'mic' ? 'live mic' : 'url'}
-          </button>
-        ))}
-      </div>
+      <Dropdown<InputMode>
+        value={mode}
+        ariaLabel="Input source"
+        options={[
+          { id: 'file', label: 'file upload' },
+          { id: 'mic', label: 'live microphone' },
+          { id: 'url', label: 'URL' },
+        ]}
+        onChange={onModeChange}
+      />
 
       {mode === 'file' && (
         <>
@@ -919,18 +898,12 @@ function OutputPane({
   return (
     <div>
       <SBLabel>Format</SBLabel>
-      <div className="ma-cluster">
-        {FORMATS.map((f) => (
-          <button
-            key={f.id}
-            type="button"
-            className={format === f.id ? 'ma-pill ma-pill--active' : 'ma-pill'}
-            onClick={() => setFormat(f.id)}
-          >
-            {f.label}
-          </button>
-        ))}
-      </div>
+      <Dropdown<ResponseFormat>
+        value={format}
+        ariaLabel="Response format"
+        options={FORMATS.map((f) => ({ id: f.id, label: f.label }))}
+        onChange={setFormat}
+      />
 
       <SBLabel top={22}>
         Timestamps
@@ -950,7 +923,7 @@ function OutputPane({
           </span>
         )}
       </SBLabel>
-      <div className="ma-segmented ma-segmented--full">
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
         {(['segment', 'word'] as TimestampGranularity[]).map((id) => {
           const on = !granDisabled && granularities.includes(id)
           return (
@@ -958,10 +931,27 @@ function OutputPane({
               key={id}
               type="button"
               disabled={granDisabled}
-              className={on ? 'ma-pill ma-pill--active' : 'ma-pill'}
+              className={on ? 'ma-check ma-check--on' : 'ma-check'}
               onClick={() => toggleGran(id)}
             >
-              {id}
+              <span className="ma-check__box">
+                {on && (
+                  <svg
+                    viewBox="0 0 24 24"
+                    width="9"
+                    height="9"
+                    fill="none"
+                    stroke="oklch(0.135 0.012 60)"
+                    strokeWidth="4"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden
+                  >
+                    <path d="M5 12l5 5L20 7" />
+                  </svg>
+                )}
+              </span>
+              <span style={{ textTransform: 'capitalize' }}>{id}</span>
             </button>
           )
         })}
@@ -975,8 +965,6 @@ function EnginePane({
   strategy,
   setStrategy,
   mode,
-  advOpen,
-  setAdvOpen,
   longAudioThreshold,
   batchSize,
   chunkLength,
@@ -1003,13 +991,10 @@ function EnginePane({
   setVadPadDuration,
   setHpfHz,
   setNoiseSuppression,
-  ChevIcon,
 }: {
   strategy: Strategy
   setStrategy: (v: Strategy) => void
   mode: InputMode
-  advOpen: boolean
-  setAdvOpen: (b: boolean) => void
   longAudioThreshold: number | null
   batchSize: number | null
   chunkLength: number | null
@@ -1036,30 +1021,21 @@ function EnginePane({
   setVadPadDuration: (v: number | null) => void
   setHpfHz: (v: number | null) => void
   setNoiseSuppression: (v: boolean) => void
-  ChevIcon: React.FC<{ up: boolean }>
 }) {
   return (
     <div>
       <SBLabel>Strategy</SBLabel>
-      <div className="ma-cluster">
-        {STRATEGIES.map((id) => {
-          // progressive: allowed for file (we stream over WS) and mic.
-          // Not available for url (server fetches the audio — no WS path).
-          const disabled = id === 'progressive' && mode === 'url'
-          return (
-            <button
-              key={id}
-              type="button"
-              disabled={disabled}
-              title={disabled ? 'progressive isn’t available for URL ingest' : undefined}
-              className={strategy === id ? 'ma-pill ma-pill--active' : 'ma-pill'}
-              onClick={() => !disabled && setStrategy(id)}
-            >
-              {id}
-            </button>
-          )
-        })}
-      </div>
+      <Dropdown<Strategy>
+        value={strategy}
+        ariaLabel="Strategy"
+        options={STRATEGIES.map((id) => ({
+          id,
+          label: id,
+          disabled: id === 'progressive' && mode === 'url',
+          disabledReason: 'progressive isn’t available for URL ingest',
+        }))}
+        onChange={setStrategy}
+      />
       {strategy === 'progressive' && mode === 'url' && (
         <div className="sb__hint">progressive isn’t available for URL ingest — falling back to chunked.</div>
       )}
@@ -1067,34 +1043,27 @@ function EnginePane({
         <div className="sb__hint">file + progressive streams the audio over a WebSocket so partials arrive live.</div>
       )}
 
-      <div style={{ marginTop: 22 }}>
-        <button type="button" className="sb__adv-toggle" onClick={() => setAdvOpen(!advOpen)}>
-          <ChevIcon up={advOpen} />
-          <span>Advanced · {advOpen ? 'hide' : 'show'}</span>
-        </button>
-        {advOpen && (
-          <div className="sb__adv-body">
-            <NumKv k="long_audio_threshold" v={longAudioThreshold} placeholder={480} suffix="s" onSet={setLong} />
-            <NumKv k="batch_size" v={batchSize} placeholder={4} onSet={setBatch} />
-            <NumKv k="chunk_length" v={chunkLength} placeholder={30} suffix="s" onSet={setChunkLen} />
-            <ToggleKv k="live_latency" v={liveLatency} onSet={setLiveLatency} />
-            <ToggleKv k="progressive_refinement" v={progressiveRefinement} onSet={setProgRefine} />
+      <SBLabel top={22}>Advanced</SBLabel>
+      <div className="sb__adv-list">
+        <NumKv k="long_audio_threshold" v={longAudioThreshold} placeholder={480} suffix="s" onSet={setLong} />
+        <NumKv k="batch_size" v={batchSize} placeholder={4} onSet={setBatch} />
+        <NumKv k="chunk_length" v={chunkLength} placeholder={30} suffix="s" onSet={setChunkLen} />
+        <ToggleKv k="live_latency" v={liveLatency} onSet={setLiveLatency} />
+        <ToggleKv k="progressive_refinement" v={progressiveRefinement} onSet={setProgRefine} />
 
-            <div className="sb__adv-divider" />
+        <div className="sb__adv-divider" />
 
-            <ToggleKv k="vad_enabled" v={vadEnabled} onSet={setVadEnabled} />
-            {mode !== 'mic' && vadEnabled && (
-              <div className="sb__hint">Auto-disabled for File and URL modes — the engine queue isn’t bandwidth-limited there, so VAD only adds per-frame CPU cost.</div>
-            )}
-            <NumKv k="vad_threshold" v={vadThreshold} placeholder={0.5} step={0.05} onSet={setVadThreshold} />
-            <NumKv k="vad_consecutive" v={vadConsecutive} placeholder={3} onSet={setVadConsecutive} />
-            <NumKv k="vad_hangover_ms" v={vadHangoverMs} placeholder={500} suffix="ms" onSet={setVadHangoverMs} />
-            <NumKv k="vad_pad_min_gap_ms" v={vadPadMinGapMs} placeholder={400} suffix="ms" onSet={setVadPadMinGap} />
-            <NumKv k="vad_pad_duration_ms" v={vadPadDurationMs} placeholder={0} suffix="ms" onSet={setVadPadDuration} />
-            <NumKv k="hpf_hz" v={hpfHz} placeholder={100} suffix="Hz" onSet={setHpfHz} />
-            <ToggleKv k="noise_suppression (browser)" v={noiseSuppression} onSet={setNoiseSuppression} />
-          </div>
+        <ToggleKv k="vad_enabled" v={vadEnabled} onSet={setVadEnabled} />
+        {mode !== 'mic' && vadEnabled && (
+          <div className="sb__hint">Auto-disabled for File and URL modes — the engine queue isn’t bandwidth-limited there, so VAD only adds per-frame CPU cost.</div>
         )}
+        <NumKv k="vad_threshold" v={vadThreshold} placeholder={0.5} step={0.05} onSet={setVadThreshold} />
+        <NumKv k="vad_consecutive" v={vadConsecutive} placeholder={3} onSet={setVadConsecutive} />
+        <NumKv k="vad_hangover_ms" v={vadHangoverMs} placeholder={500} suffix="ms" onSet={setVadHangoverMs} />
+        <NumKv k="vad_pad_min_gap_ms" v={vadPadMinGapMs} placeholder={400} suffix="ms" onSet={setVadPadMinGap} />
+        <NumKv k="vad_pad_duration_ms" v={vadPadDurationMs} placeholder={0} suffix="ms" onSet={setVadPadDuration} />
+        <NumKv k="hpf_hz" v={hpfHz} placeholder={100} suffix="Hz" onSet={setHpfHz} />
+        <ToggleKv k="noise_suppression (browser)" v={noiseSuppression} onSet={setNoiseSuppression} />
       </div>
     </div>
   )

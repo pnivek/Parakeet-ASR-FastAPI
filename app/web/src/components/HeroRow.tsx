@@ -119,7 +119,11 @@ export function HeroRow({ loaded, peaks, state, language = 'en' }: Props) {
       <div className="transport">
         <button
           type="button"
-          className="ma-pill ma-pill--active transport__play"
+          className={
+            playing
+              ? 'ma-pill ma-pill--active transport__play'
+              : 'ma-pill transport__play'
+          }
           onClick={() => (playing ? pause() : play())}
           disabled={!loaded}
           aria-label={playing ? 'Pause' : 'Play'}

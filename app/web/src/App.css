@@ -234,8 +234,8 @@ body {
   border-radius: 999px;
   font-family: var(--font-mono);
   font-size: 10.5px;
-  letter-spacing: 0.7px;
-  text-transform: lowercase;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
   color: var(--ma-fgDim);
   background: transparent;
   border: 1px solid rgba(255, 255, 255, 0.10);
@@ -469,9 +469,10 @@ body {
   background: transparent;
   border: 1px solid transparent;
   color: var(--ma-fgDim);
-  font-family: var(--font-sans);
-  font-size: 13px;
-  letter-spacing: 0.1px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
   text-align: left;
   cursor: pointer;
   transition: color 0.18s ease, background 0.18s ease, border-color 0.18s ease;
@@ -515,22 +516,24 @@ body {
   padding: 3px;
   background: rgba(255, 255, 255, 0.022);
   border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: 14px;
+  border-radius: 19px;
 }
 .ma-option {
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: space-between;
+  gap: 10px;
   width: 100%;
-  padding: 8px 12px;
+  padding: 8px 14px;
   border-radius: 999px;
   background: transparent;
   border: 1px solid transparent;
   cursor: pointer;
   font-family: var(--font-mono);
   font-size: 10.5px;
-  letter-spacing: 1.4px;
+  letter-spacing: 0.8px;
   text-transform: uppercase;
+  text-align: left;
   color: var(--ma-fgDim);
   transition: color 0.18s ease, background 0.18s ease, border-color 0.18s ease;
 }
@@ -549,6 +552,24 @@ body {
 .ma-option[disabled] {
   cursor: not-allowed;
   opacity: 0.4;
+}
+
+/* Right-aligned dot indicator inside ma-option rows. Inactive = thin
+ * border ring; active = filled with currentColor (the accent at that
+ * point). Matches the design's vertical tab list pattern. */
+.ma-option__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 99px;
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  opacity: 0.7;
+}
+.ma-option--active .ma-option__dot {
+  background: currentColor;
+  border-color: currentColor;
+  opacity: 1;
 }
 
 /* ── Advanced KV list (always-visible) ─────────────────────────────
@@ -1087,8 +1108,12 @@ body {
   padding-top: 18px;
   border-top: 1px solid var(--rule);
 }
-.sb__commit .ma-pill--primary {
+.sb__commit .ma-pill {
   width: 100%;
+  padding: 11px 14px;
+  gap: 9px;
+  letter-spacing: 1.2px;
+  font-weight: 600;
 }
 /* ── File picker card ───────────────────────────────────────────
  * Single dashed card with a file-icon tile + name + meta. Also acts

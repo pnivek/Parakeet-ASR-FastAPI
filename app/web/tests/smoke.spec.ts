@@ -42,10 +42,10 @@ test('Maison v6 UI — boots, tabs switch, modes switch, strategy gate enforced'
   await page.getByRole('radio', { name: 'URL' }).click()
   await expect(page.getByPlaceholder('https://…')).toBeVisible()
 
-  // Switch to mic mode — the Capture sub-list (Live / Record) shows.
-  await page.getByRole('radio', { name: 'Live microphone' }).click()
+  // Switch to mic mode — the Capture sub-list (Live / Recording) shows.
+  await page.getByRole('radio', { name: 'Microphone' }).click()
   await expect(page.getByRole('radio', { name: /Live transcription/i })).toBeVisible()
-  await expect(page.getByRole('radio', { name: /Record \(transcribe after\)/i })).toBeVisible()
+  await expect(page.getByRole('radio', { name: /^Recording$/i })).toBeVisible()
 
   // Output tab — Format option list visible (current = verbose_json),
   // Timestamps are ma-check rows.

@@ -638,16 +638,20 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
     setProgress(null)
   }, [mode, setBusyAll, cancelPendingPartial])
 
+  // Plain-text labels — the pill's accent fill conveys active state,
+  // we don't need unicode glyphs to decorate them. The "Transcribe"
+  // label gets a small document icon at render time.
   const transcribeLabel = (() => {
-    if (busy) return mode === 'mic' ? 'Working…' : 'Stop ▣'
+    if (busy) return mode === 'mic' ? 'Working' : 'Stop'
     if (mode === 'mic') {
-      if (recording) return 'Stop ▣'
-      // Record sub-mode with a staged blob → bottom button uploads it.
-      if (s.micCaptureMode === 'record' && pickedFile) return 'Transcribe →'
-      return 'Record ●'
+      if (recording) return 'Stop'
+      if (s.micCaptureMode === 'record' && pickedFile) return 'Transcribe'
+      return 'Record'
     }
-    return 'Transcribe →'
+    return 'Transcribe'
   })()
+  const transcribeIsAccent = busy || recording
+  const transcribeShowsIcon = transcribeLabel === 'Transcribe'
   const onCommitClick = () => {
     if (busy && mode !== 'mic') {
       cancelInFlight()
@@ -770,10 +774,28 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       <div className="sb__commit">
         <button
           type="button"
-          className="ma-pill ma-pill--primary"
+          className={transcribeIsAccent ? 'ma-pill ma-pill--active' : 'ma-pill'}
           onClick={onCommitClick}
           disabled={transcribeDisabled}
         >
+          {transcribeShowsIcon && (
+            <svg
+              viewBox="0 0 24 24"
+              width="13"
+              height="13"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden
+            >
+              <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+              <path d="M14 3v5h5" />
+              <line x1="8.5" y1="12.5" x2="15" y2="12.5" />
+              <line x1="8.5" y1="16" x2="14" y2="16" />
+            </svg>
+          )}
           {transcribeLabel}
         </button>
       </div>
@@ -834,7 +856,7 @@ function SourcePane({
         value={mode}
         options={[
           { id: 'file', label: 'File upload' },
-          { id: 'mic', label: 'Live microphone' },
+          { id: 'mic', label: 'Microphone' },
           { id: 'url', label: 'URL' },
         ]}
         onChange={onModeChange}
@@ -959,17 +981,29 @@ function SourcePane({
           />
 
           <div className="mic-card" style={{ marginTop: 16 }}>
-            <MicCardBars level={mic.level} recording={recording} />
+            <MicCardBars
+              level={mic.level}
+              recording={recording}
+              captureMode={micCaptureMode}
+            />
             <div className="mic-card__row">
               <span className="mic-card__status">
-                {recording ? 'Recording' : 'Standby'}
+                {recording
+                  ? 'Recording'
+                  : micCaptureMode === 'live'
+                    ? 'Listening'
+                    : 'Standby'}
               </span>
               <span
                 className={
-                  recording ? 'mic-card__timer mic-card__timer--rec' : 'mic-card__timer'
+                  recording || (micCaptureMode === 'live' && !recording)
+                    ? 'mic-card__timer mic-card__timer--rec'
+                    : 'mic-card__timer'
                 }
               >
-                {formatMicTimer(recordElapsed)}
+                {micCaptureMode === 'live' && !recording
+                  ? '——'
+                  : formatMicTimer(recordElapsed)}
               </span>
             </div>
           </div>
@@ -1031,28 +1065,63 @@ function SourcePane({
   )
 }
 
-/** Bar meter inside the mic card. 28 bars driven by the AnalyserNode
- * peak level via mic.level, with a per-bar sin pattern so the meter
- * looks wave-shaped instead of a flat block. Animates implicitly as
- * setLevel fires from the analyser tick (~30Hz coalesced). */
-function MicCardBars({ level, recording }: { level: number; recording: boolean }) {
+/** Bar meter inside the mic card. 28 bars with three behaviours:
+ *
+ *   - capture='live' + recording        — real reactivity: bar
+ *     heights modulated by mic.level (AnalyserNode peak).
+ *   - capture='live' + idle             — synthetic preview: the
+ *     meter "always listens" with a sin-wave pattern driven by a
+ *     local rAF tick.
+ *   - capture='record' + recording      — same as live+recording.
+ *   - capture='record' + idle           — bars sit flat.
+ *
+ * The synthetic-preview mode matches the design: in live mode the
+ * meter is always animated so the user sees the affordance even
+ * before they click Record. */
+function MicCardBars({
+  level,
+  recording,
+  captureMode,
+}: {
+  level: number
+  recording: boolean
+  captureMode: 'live' | 'record'
+}) {
   const N = 28
+  const meterActive = recording || captureMode === 'live'
+  const [tick, setTick] = useState(0)
+  useEffect(() => {
+    if (!meterActive) return
+    let raf = 0
+    let t = 0
+    const loop = () => {
+      t += 1
+      setTick(t)
+      raf = requestAnimationFrame(loop)
+    }
+    raf = requestAnimationFrame(loop)
+    return () => cancelAnimationFrame(raf)
+  }, [meterActive])
   return (
     <div className="mic-card__bars">
       {Array.from({ length: N }).map((_, i) => {
-        // Per-bar envelope: bigger toward the middle, smaller at the
-        // edges. Always at least a tiny resting height so the meter
-        // doesn't disappear in silence.
         const envelope = 0.5 + 0.5 * Math.sin((i / N) * Math.PI)
-        const phase = Math.abs(Math.sin(i * 0.55 + 1.3))
-        const h = recording
-          ? Math.max(6, Math.min(90, level * 90 * (0.45 + 0.55 * phase) * envelope))
+        const phase = meterActive
+          ? Math.sin(tick * 0.18 + i * 0.5) * 0.5 + 0.5
+          : Math.abs(Math.sin(i * 0.55 + 1.3))
+        const noise = meterActive ? Math.sin(tick * 0.31 + i * 1.7) * 0.25 + 0.25 : 0
+        // When actually recording, scale by real audio level so loud
+        // input drives tall bars. In live-idle, fall back to a
+        // base-1 scale so the synthetic preview is always visible.
+        const drive = recording ? Math.max(0.1, Math.min(1, level * 1.6)) : 1
+        const h = meterActive
+          ? Math.max(6, Math.min(90, (phase * 0.7 + noise * 0.5) * 90 * envelope * drive))
           : 4 + (i % 2) * 1.5
         return (
           <span
             key={i}
-            className={recording ? 'mic-card__bar mic-card__bar--on' : 'mic-card__bar'}
-            style={{ height: `${h}%`, opacity: recording ? 0.55 + 0.45 * phase : 1 }}
+            className={meterActive ? 'mic-card__bar mic-card__bar--on' : 'mic-card__bar'}
+            style={{ height: `${h}%`, opacity: meterActive ? 0.55 + 0.45 * phase : 1 }}
           />
         )
       })}

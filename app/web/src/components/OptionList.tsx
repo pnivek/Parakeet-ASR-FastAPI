@@ -41,7 +41,8 @@ export function OptionList<T extends string>({
               if (!active) onChange(o.id)
             }}
           >
-            {o.label}
+            <span>{o.label}</span>
+            <span className="ma-option__dot" aria-hidden />
           </button>
         )
       })}

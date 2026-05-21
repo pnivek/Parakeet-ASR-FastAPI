@@ -436,23 +436,31 @@ class StreamingPrevBatchedEngine:
         committed.extend(partial)
         return committed
 
-    def flush_partial_sentence(self) -> List[dict]:
-        """Force-flush the in-progress sentence buffer as a partial segment,
-        without waiting for a terminal '.!?'. The consumer calls this on
-        a timer during live streaming so users see incremental segments
-        even when their speech doesn't have clean sentence boundaries
-        (the model only commits on terminal punctuation otherwise).
+    def peek_partial_segment(self) -> Optional[dict]:
+        """Read-only view of the in-progress sentence buffer as a segment-
+        shaped dict. Returns None if the buffer is empty. Does NOT mutate
+        the buffer — the eventual sentence-bounded commit (on terminal
+        `.!?`) is unaffected.
 
-        Returns a list (possibly empty) of newly-emitted segments. Safe
-        to call repeatedly; subsequent calls return [] until more tokens
-        accumulate.
+        Used by the consumer to stream interim text to the client between
+        actual commits so the UI doesn't sit blank while the user is
+        speaking mid-sentence.
         """
-        # Drain any newly-committed sentence-bounded tokens first, then
-        # flush whatever's in the running sentence buffer.
-        committed = self.pop_committed_segments()
-        partial = self._flush_partial_buffer()
-        committed.extend(partial)
-        return committed
+        if not self._sentence_buffer_ids:
+            return None
+        text = self.tokenizer.ids_to_text(self._sentence_buffer_ids).strip()
+        if not text:
+            return None
+        has_lps = any(x is not None for x in self._sentence_buffer_logprobs)
+        return _whisper_segment(
+            self._next_seg_id,
+            self._sentence_buffer_start or 0.0,
+            self._sentence_buffer_last_t,
+            text,
+            self._sentence_buffer_ids,
+            avg_logprob=_avg_logprob(self._sentence_buffer_logprobs) if has_lps else None,
+            token_times=self._sentence_buffer_times,
+        )
 
     def _flush_partial_buffer(self) -> List[dict]:
         out: List[dict] = []

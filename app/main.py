@@ -829,7 +829,11 @@ def _build_vad_state(client_config: dict) -> dict:
         'consecutive': max(1, int(client_config.get('vad_consecutive', 3))),
         'hangover_ms': float(client_config.get('vad_hangover_ms', 500)),
         'pad_min_gap_ms': float(client_config.get('vad_pad_min_gap_ms', 400)),
-        'pad_duration_ms': float(client_config.get('vad_pad_duration_ms', 250)),
+        # Default 0 — we don't synthesize audio for the model by default.
+        # The model sees the speech-only stream as cut by VAD. Power
+        # users can re-enable via the Advanced toggle if they ever want
+        # to test the old behaviour.
+        'pad_duration_ms': float(client_config.get('vad_pad_duration_ms', 0)),
         # Mutable state
         'mode': 'silent',           # 'silent' | 'speech'
         'consec': 0,                # consecutive loud frames toward N-of-consecutive
@@ -1405,26 +1409,12 @@ async def handle_streaming_pcm(
         )
 
         total_engine_chunks = 0
-        # Force the engine to flush its partial sentence buffer if nothing
-        # has committed in this many seconds. The engine only commits
-        # segments on terminal '.!?' tokens; without this fallback, a
-        # live-mic speaker who runs sentences together sees nothing
-        # until they stop (the EOF flush).
-        #
-        # Gated on live_latency=True — that's the mic preset. File mode
-        # uses the offline preset (live_latency=False) and prioritises
-        # clean sentence-bounded segments over responsiveness, so we
-        # don't fragment those.
-        #
-        # 5s + min-token threshold reduces fragmentation: only flush
-        # when the user has genuinely been talking through a long run
-        # of words without natural punctuation. Short utterances still
-        # get committed in clean sentences.
-        PARTIAL_FLUSH_INTERVAL_S = 5.0
-        PARTIAL_FLUSH_MIN_TOKENS = 6
-        partial_flush_enabled = live_latency
-        import time as _time
-        last_emit_at = _time.monotonic()
+        # Stream the in-progress (uncommitted) sentence buffer to the
+        # client between real commits so the UI doesn't sit blank for
+        # the 4–6 s emission lag while the user is speaking. Only the
+        # live-mic preset (live_latency=True) gets these; offline files
+        # render clean sentence-bounded segments only.
+        partial_emit_enabled = live_latency
         try:
             while True:
                 item = await chunk_queue.get()
@@ -1441,16 +1431,6 @@ async def handle_streaming_pcm(
                 await _run_on_asr_executor(engine.feed_float32, samples_np)
                 total_engine_chunks += 1
                 new_segs = engine.pop_committed_segments()
-                if (
-                    not new_segs
-                    and partial_flush_enabled
-                    and (_time.monotonic() - last_emit_at) > PARTIAL_FLUSH_INTERVAL_S
-                    and engine.pending_token_count >= PARTIAL_FLUSH_MIN_TOKENS
-                ):
-                    # Long enough without a sentence boundary — flush
-                    # whatever tokens are buffered so the UI doesn't
-                    # stall. Live mic only.
-                    new_segs = engine.flush_partial_sentence()
                 if new_segs and websocket.application_state == WebSocketState.CONNECTED:
                     try:
                         # When VAD is on, engine timestamps are speech-clock —
@@ -1465,9 +1445,23 @@ async def handle_streaming_pcm(
                             "words": new_words,
                         })
                         sent_segments_pcm.extend(new_segs)
-                        last_emit_at = _time.monotonic()
                     except Exception as e_send:
                         logger.warning(f"({session_id}) Stream: segment send failed: {e_send}")
+                # In-flight peek of the next sentence (uncommitted tokens).
+                # Read-only; the engine still commits naturally on .!?.
+                if partial_emit_enabled and websocket.application_state == WebSocketState.CONNECTED:
+                    partial = engine.peek_partial_segment()
+                    if partial is not None:
+                        try:
+                            _translate_segment_times([partial], vad_state)
+                            partial_words = _segments_to_words([partial])
+                            await websocket.send_json({
+                                "type": "partial_segment",
+                                "segment": partial,
+                                "words": partial_words,
+                            })
+                        except Exception as e_send:
+                            logger.warning(f"({session_id}) Stream: partial send failed: {e_send}")
 
             # EOF — pad + flush to commit trailing tokens
             await _run_on_asr_executor(engine.flush)

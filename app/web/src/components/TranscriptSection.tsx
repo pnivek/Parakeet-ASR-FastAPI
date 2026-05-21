@@ -1,6 +1,6 @@
 import { memo, useMemo, useState } from 'react'
 import type { TranscriptionResponse } from '../lib/api'
-import type { VerboseJsonResponse, WhisperSegment } from '../lib/types'
+import type { VerboseJsonResponse, WhisperSegment, Word } from '../lib/types'
 import { play, seek } from '../lib/playback'
 import { formatTime } from '../lib/format'
 
@@ -17,6 +17,12 @@ interface Props {
   segmentArrivals: Map<number, number>
   /** Map of word-index → arrival ms. Drives the text view's word reveal. */
   wordArrivals: Map<number, number>
+  /** Engine's in-flight sentence buffer — uncommitted tokens streamed
+   * by the server between actual .!? commits. Rendered as dimmed text
+   * at the end of the transcript so the user sees words appear as the
+   * model decodes them, without us mutating the model's outputs. */
+  partialSegment?: WhisperSegment | null
+  partialWords?: Word[]
 }
 
 type View = 'text' | 'segments' | 'words' | 'raw'
@@ -31,18 +37,65 @@ const NULL_TIPS: Record<string, string> = {
   seek: 'Not populated for now.',
 }
 
-export function TranscriptSection({ result, filename, currentTime, live, segmentArrivals, wordArrivals }: Props) {
+export function TranscriptSection({
+  result,
+  filename,
+  currentTime,
+  live,
+  segmentArrivals,
+  wordArrivals,
+  partialSegment,
+  partialWords,
+}: Props) {
   const [view, setView] = useState<View>('text')
 
+  // No committed transcript yet — but if the engine is already
+  // streaming an in-flight partial, render that. Otherwise show the
+  // empty state.
   if (!result) {
+    if (!partialSegment) {
+      return (
+        <section className="transcript">
+          <div className="transcript__head">
+            <div className="transcript__head-l">
+              <span className="label-eyebrow">TRANSCRIPT</span>
+            </div>
+          </div>
+          <div className="empty">Pick a source on the right to begin.</div>
+        </section>
+      )
+    }
+    const partialOnlyBody: VerboseJsonResponse = {
+      task: 'transcribe',
+      language: 'en',
+      duration: partialSegment.end,
+      text: '',
+      segments: [],
+      words: [],
+      strategy: 'progressive',
+      transcription_time_seconds: 0,
+    }
     return (
       <section className="transcript">
         <div className="transcript__head">
           <div className="transcript__head-l">
             <span className="label-eyebrow">TRANSCRIPT</span>
+            <span className="format-pill">verbose_json</span>
           </div>
         </div>
-        <div className="empty">Pick a source on the right to begin.</div>
+        <div className="transcript__body">
+          <VerboseBody
+            body={partialOnlyBody}
+            view={view}
+            currentTime={currentTime}
+            filename={filename}
+            live={live}
+            segmentArrivals={segmentArrivals}
+            wordArrivals={wordArrivals}
+            partialSegment={partialSegment}
+            partialWords={partialWords ?? []}
+          />
+        </div>
       </section>
     )
   }
@@ -87,6 +140,8 @@ export function TranscriptSection({ result, filename, currentTime, live, segment
             live={live}
             segmentArrivals={segmentArrivals}
             wordArrivals={wordArrivals}
+            partialSegment={partialSegment ?? null}
+            partialWords={partialWords ?? []}
           />
         )}
       </div>
@@ -102,6 +157,8 @@ function VerboseBody({
   live,
   segmentArrivals,
   wordArrivals,
+  partialSegment,
+  partialWords,
 }: {
   body: VerboseJsonResponse
   view: View
@@ -110,6 +167,8 @@ function VerboseBody({
   live: boolean
   segmentArrivals: Map<number, number>
   wordArrivals: Map<number, number>
+  partialSegment: WhisperSegment | null
+  partialWords: Word[]
 }) {
   const activeWordIdx = useMemo(() => {
     if (!body.words) return -1
@@ -128,6 +187,7 @@ function VerboseBody({
         activeWordIdx={activeWordIdx}
         live={live}
         wordArrivals={wordArrivals}
+        partialWords={partialWords}
       />
     )
   if (view === 'segments')
@@ -137,9 +197,11 @@ function VerboseBody({
         activeIdx={activeSegIdx}
         live={live}
         segmentArrivals={segmentArrivals}
+        partialSegment={partialSegment}
       />
     )
-  if (view === 'words') return <WordsGrid body={body} activeIdx={activeWordIdx} />
+  if (view === 'words')
+    return <WordsGrid body={body} activeIdx={activeWordIdx} partialWords={partialWords} />
   return <Code text={JSON.stringify(body, null, 2)} filename={filename} syntaxColor />
 }
 
@@ -195,6 +257,7 @@ function PlainText({
   activeWordIdx,
   live,
   wordArrivals,
+  partialWords,
 }: {
   body: VerboseJsonResponse
   currentTime: number
@@ -206,18 +269,23 @@ function PlainText({
    * fade runs on first mount; we only need to know whether a word has
    * an arrival stamp so we apply the class for ones that should fade. */
   wordArrivals: Map<number, number>
+  /** In-flight words from the engine's uncommitted sentence buffer.
+   * Rendered after the committed words with a dimmed style. Replaced
+   * by real committed words when the sentence terminates. */
+  partialWords: Word[]
 }) {
-  if (!body.words || body.words.length === 0) {
+  const committed = body.words ?? []
+  if (committed.length === 0 && partialWords.length === 0) {
     return <div className="editorial-body">{body.text}</div>
   }
-  const words = body.words
-  const total = words.length
+  const total = committed.length
+  const lastCommittedIsActuallyLast = partialWords.length === 0
   return (
     <div className="editorial-body">
-      {words.map((w, i) => {
+      {committed.map((w, i) => {
         const active = i === activeWordIdx
         const past = i < activeWordIdx
-        const isLast = i === total - 1
+        const isLast = i === total - 1 && lastCommittedIsActuallyLast
         return (
           <Word
             key={`${i}-${w.start}`}
@@ -225,14 +293,30 @@ function PlainText({
             start={w.start}
             active={active}
             past={past}
-            // Only the newly-arrived word(s) get the reveal class — and
-            // because the className is stable per element after mount,
-            // the animation never replays.
             reveal={live && wordArrivals.has(i)}
             isLast={isLast}
           />
         )
       })}
+      {partialWords.length > 0 && (
+        <span className="editorial-partial">
+          {/* Separating space when there are committed words before. */}
+          {committed.length > 0 && ' '}
+          {partialWords.map((w, i) => (
+            <span
+              key={`partial-${i}-${w.start}`}
+              className="editorial-word editorial-word--partial"
+              onClick={() => {
+                seek(w.start)
+                play()
+              }}
+            >
+              {w.word}
+              {i < partialWords.length - 1 && ' '}
+            </span>
+          ))}
+        </span>
+      )}
     </div>
   )
 }
@@ -247,15 +331,17 @@ function SegmentRows({
   activeIdx,
   live,
   segmentArrivals,
+  partialSegment,
 }: {
   segments: WhisperSegment[]
   activeIdx: number
   live: boolean
   segmentArrivals: Map<number, number>
+  partialSegment: WhisperSegment | null
 }) {
   const [openId, setOpenId] = useState<number | null>(null)
 
-  if (segments.length === 0) {
+  if (segments.length === 0 && !partialSegment) {
     return (
       <div className="empty">{live ? 'Listening…' : 'No segments.'}</div>
     )
@@ -312,6 +398,23 @@ function SegmentRows({
           </div>
         )
       })}
+      {partialSegment && (
+        <div
+          className="segs-row segs-row--partial"
+          onClick={() => {
+            seek(partialSegment.start)
+            play()
+          }}
+        >
+          <span className="segs-row__t">
+            {formatTime(partialSegment.start)}{' '}
+            <span className="segs-row__t-end">→ …</span>
+          </span>
+          <div>
+            <div className="segs-row__text segs-row__text--partial">{partialSegment.text}</div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -327,8 +430,17 @@ function Kv({ k, v }: { k: string; v: unknown }) {
   )
 }
 
-function WordsGrid({ body, activeIdx }: { body: VerboseJsonResponse; activeIdx: number }) {
-  if (!body.words || body.words.length === 0) {
+function WordsGrid({
+  body,
+  activeIdx,
+  partialWords,
+}: {
+  body: VerboseJsonResponse
+  activeIdx: number
+  partialWords: Word[]
+}) {
+  const committed = body.words ?? []
+  if (committed.length === 0 && partialWords.length === 0) {
     return (
       <div className="empty">
         No word-level timestamps — enable the <span className="mono">word</span> granularity.
@@ -337,11 +449,27 @@ function WordsGrid({ body, activeIdx }: { body: VerboseJsonResponse; activeIdx: 
   }
   return (
     <div className="words-grid">
-      {body.words.map((w, i) => (
+      {committed.map((w, i) => (
         <button
           key={`${i}-${w.start}`}
           type="button"
           className={i === activeIdx ? 'words-cell words-cell--active' : 'words-cell'}
+          onClick={() => {
+            seek(w.start)
+            play()
+          }}
+        >
+          <span className="words-cell__word">{w.word}</span>
+          <span className="words-cell__t num">
+            {w.start.toFixed(2)} → {w.end.toFixed(2)}
+          </span>
+        </button>
+      ))}
+      {partialWords.map((w, i) => (
+        <button
+          key={`partial-${i}-${w.start}`}
+          type="button"
+          className="words-cell words-cell--partial"
           onClick={() => {
             seek(w.start)
             play()

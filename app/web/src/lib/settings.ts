@@ -69,7 +69,7 @@ const DEFAULTS: Omit<Settings, 'set' | 'reset'> = {
   vadConsecutive: 3,
   vadHangoverMs: 500,
   vadPadMinGapMs: 400,
-  vadPadDurationMs: 250,
+  vadPadDurationMs: 0,
   hpfHz: 100,
   noiseSuppression: true,
 

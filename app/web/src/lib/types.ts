@@ -147,11 +147,25 @@ export interface WSError {
   error: string
 }
 
+/** Read-only peek of the engine's in-progress sentence buffer. Server
+ * emits this after every chunk (live mic only) so the client can show
+ * interim text while the model decodes — instead of waiting up to ~6s
+ * for a `.!?` to commit. The same content will arrive as a real
+ * segments_batch entry once the model terminates the sentence; the
+ * client should clear the partial when that happens. Does NOT mutate
+ * the model's outputs. */
+export interface WSPartialSegment {
+  type: 'partial_segment'
+  segment: WhisperSegment
+  words?: Word[]
+}
+
 export type WSMessage =
   | WSSegmentsBatch
   | WSRefinedTranscription
   | WSFinalTranscription
   | WSError
+  | WSPartialSegment
 
 /* ----- Health endpoint ----- */
 

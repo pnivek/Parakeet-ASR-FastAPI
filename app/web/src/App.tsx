@@ -3,6 +3,7 @@ import type { TranscriptionResponse } from './lib/api'
 import { setAudioFile, useAudioContainer, useCurrentTime } from './lib/playback'
 import { computePeaks } from './lib/peaks'
 import type { LoadedAudio } from './lib/download'
+import type { WhisperSegment, Word } from './lib/types'
 import { Header } from './components/Header'
 import { HeroRow, type HeroState } from './components/HeroRow'
 import { TranscriptSection } from './components/TranscriptSection'
@@ -17,6 +18,12 @@ export default function App() {
   const [peaks, setPeaks] = useState<number[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  /** Engine's in-flight sentence (uncommitted tokens). Streams in
+   * during live mic so the UI shows text while the model is still
+   * deciding where the sentence ends. Cleared when the matching
+   * sentence-bounded segments_batch lands. */
+  const [partialSegment, setPartialSegment] = useState<WhisperSegment | null>(null)
+  const [partialWords, setPartialWords] = useState<Word[]>([])
   /** True while we're receiving partials (mid-stream). False on final result
    * or no result. Drives the word-by-word reveal animation in the
    * transcript view — static results should not animate. */
@@ -134,6 +141,8 @@ export default function App() {
     setResult(null)
     setError(null)
     setLive(false)
+    setPartialSegment(null)
+    setPartialWords([])
     arrivalRef.current = new Map()
     wordArrivalRef.current = new Map()
     maxSeenSegIdRef.current = -1
@@ -141,6 +150,11 @@ export default function App() {
     // Don't clear peaks here — the effect above will reset/decode based on
     // the next `loaded.file` change. Clearing now would create a flicker
     // when the same file is re-transcribed.
+  }
+
+  const handlePartialSegment = (segment: WhisperSegment | null, words: Word[]) => {
+    setPartialSegment(segment)
+    setPartialWords(words)
   }
 
   /** Live peaks for the hero waveform. Currently driven by the mic's
@@ -206,6 +220,8 @@ export default function App() {
             live={live}
             segmentArrivals={arrivalRef.current}
             wordArrivals={wordArrivalRef.current}
+            partialSegment={partialSegment}
+            partialWords={partialWords}
           />
         </div>
         <aside className="shell__side">
@@ -219,6 +235,7 @@ export default function App() {
             onSessionStart={handleSessionStart}
             onAudioReady={handleAudioReady}
             onPeaks={handlePeaks}
+            onPartialSegment={handlePartialSegment}
           />
         </aside>
       </main>

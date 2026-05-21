@@ -34,6 +34,9 @@ interface Props {
    * waveform's peaks array. Lets mic mode draw bars as the user speaks
    * instead of waiting for final_transcription + blob decode. */
   onPeaks?: (peaks: number[], cumulative: boolean) => void
+  /** Read-only peek of the engine's in-flight sentence buffer. Null
+   * clears it (e.g., the sentence just committed). */
+  onPartialSegment?: (segment: WhisperSegment | null, words: Word[]) => void
 }
 
 const FORMATS: { id: ResponseFormat; label: string }[] = [
@@ -69,7 +72,7 @@ const MicIcon = ({ size = 22 }: { size?: number }) => (
   </svg>
 )
 
-export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBusyChange, onSessionStart, onAudioReady, onPeaks }: Props) {
+export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBusyChange, onSessionStart, onAudioReady, onPeaks, onPartialSegment }: Props) {
   const s = useSettings()
   const [tab, setTab] = useState<SidebarTab>('source')
   const [advOpen, setAdvOpen] = useState(false)
@@ -211,11 +214,19 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           if (msg.words && msg.words.length > 0) {
             wordsRef.current = [...wordsRef.current, ...msg.words]
           }
+          // The committed segments include whatever was previously in
+          // the partial buffer — clear the in-flight partial so the
+          // text doesn't appear twice (once as partial, once as real).
+          onPartialSegment?.(null, [])
           schedulePartial()
           break
         }
+        case 'partial_segment':
+          onPartialSegment?.(msg.segment, msg.words ?? [])
+          break
         case 'refined_transcription':
           cancelPendingPartial()
+          onPartialSegment?.(null, [])
           segmentsRef.current = msg.segments
           if (msg.words) wordsRef.current = msg.words
           onPartial({
@@ -234,6 +245,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           break
         case 'final_transcription': {
           cancelPendingPartial()
+          onPartialSegment?.(null, [])
           const blob = new Blob(chunksRef.current, { type: MIC_MIME_TYPE })
           const file = new File([blob], `mic-${Date.now()}.webm`, { type: MIC_MIME_TYPE })
           onResult(
@@ -270,7 +282,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           break
       }
     },
-    [onPartial, onResult, onError, schedulePartial, cancelPendingPartial],
+    [onPartial, onResult, onError, schedulePartial, cancelPendingPartial, onPartialSegment],
   )
 
   const mic = useMic({
@@ -686,7 +698,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             setVadConsecutive={(v) => s.set('vadConsecutive', v ?? 3)}
             setVadHangoverMs={(v) => s.set('vadHangoverMs', v ?? 500)}
             setVadPadMinGap={(v) => s.set('vadPadMinGapMs', v ?? 400)}
-            setVadPadDuration={(v) => s.set('vadPadDurationMs', v ?? 250)}
+            setVadPadDuration={(v) => s.set('vadPadDurationMs', v ?? 0)}
             setHpfHz={(v) => s.set('hpfHz', v ?? 100)}
             setNoiseSuppression={(v) => s.set('noiseSuppression', v)}
             ChevIcon={ChevIcon}
@@ -1078,7 +1090,7 @@ function EnginePane({
             <NumKv k="vad_consecutive" v={vadConsecutive} placeholder={3} onSet={setVadConsecutive} />
             <NumKv k="vad_hangover_ms" v={vadHangoverMs} placeholder={500} suffix="ms" onSet={setVadHangoverMs} />
             <NumKv k="vad_pad_min_gap_ms" v={vadPadMinGapMs} placeholder={400} suffix="ms" onSet={setVadPadMinGap} />
-            <NumKv k="vad_pad_duration_ms" v={vadPadDurationMs} placeholder={250} suffix="ms" onSet={setVadPadDuration} />
+            <NumKv k="vad_pad_duration_ms" v={vadPadDurationMs} placeholder={0} suffix="ms" onSet={setVadPadDuration} />
             <NumKv k="hpf_hz" v={hpfHz} placeholder={100} suffix="Hz" onSet={setHpfHz} />
             <ToggleKv k="noise_suppression (browser)" v={noiseSuppression} onSet={setNoiseSuppression} />
           </div>

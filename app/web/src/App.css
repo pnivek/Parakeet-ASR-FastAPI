@@ -153,6 +153,35 @@ body {
   will-change: opacity, filter, transform;
 }
 
+/* In-flight partial — words from the engine's uncommitted sentence
+ * buffer. Lighter colour + a soft pulse so the user can tell it's
+ * not finalized yet. Replaced by real words when the sentence
+ * commits. */
+.editorial-partial { display: inline; }
+.editorial-word--partial {
+  color: var(--muted);
+  opacity: 0.72;
+  font-style: italic;
+}
+@keyframes partialPulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 0.85; }
+}
+.segs-row--partial,
+.editorial-word--partial { animation: partialPulse 2.4s ease-in-out infinite; }
+.segs-row--partial {
+  border-style: dashed !important;
+  opacity: 0.85;
+}
+.segs-row__text--partial {
+  font-style: italic;
+  color: var(--muted);
+}
+.words-cell--partial {
+  opacity: 0.6;
+  font-style: italic;
+}
+
 /* Subtle underline reveal on header links. */
 .ma-link { position: relative; cursor: pointer; }
 .ma-link::after {

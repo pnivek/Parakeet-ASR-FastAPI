@@ -34,9 +34,9 @@ test('Maison v6 UI — boots, tabs switch, modes switch, strategy gate enforced'
   await expect(outputTab).toBeVisible()
   await expect(engineTab).toBeVisible()
 
-  // Source tab — Input dropdown defaults to file → drop zone shown
+  // Source tab — Input dropdown defaults to file → file card shown
   await sourceTab.click()
-  await expect(page.getByText(/Drop file/i)).toBeVisible()
+  await expect(page.getByText(/Drop a file or browse/i)).toBeVisible()
 
   // Switch to URL mode via the Input dropdown
   await page.getByLabel('Input source').click()

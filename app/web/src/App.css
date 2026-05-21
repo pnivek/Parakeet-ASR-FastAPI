@@ -71,10 +71,16 @@ body {
 }
 .label-eyebrow {
   font-family: var(--font-mono);
-  font-size: 9.5px;
+  font-size: 11px;
   color: var(--muted-deep);
   letter-spacing: 1.6px;
   text-transform: uppercase;
+}
+.label-eyebrow--sm {
+  /* Smaller variant for stacked panel labels (sidebar SBLabel, footer
+   * stats etc) where the 11px reads too loud. */
+  font-size: 9.5px;
+  letter-spacing: 1.6px;
 }
 .label-eyebrow-row {
   display: flex;
@@ -267,6 +273,12 @@ body {
   padding: 4px 10px;
   font-size: 10px;
   gap: 5px;
+}
+.ma-pill--lg {
+  padding: 9px 18px;
+  font-size: 12px;
+  letter-spacing: 0.8px;
+  gap: 8px;
 }
 .ma-pill:disabled,
 .ma-pill[disabled] {
@@ -623,18 +635,19 @@ body {
 .hero__position {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: 10px;
 }
 .hero__position-l {
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: 11px;
   color: var(--muted-deep);
-  letter-spacing: 1.4px;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
 }
 .hero__position-v {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  font-size: 18px;
+  font-size: 20px;
   color: var(--fg);
   letter-spacing: 0.3px;
   line-height: 1;
@@ -643,21 +656,21 @@ body {
 .hero__position-v--dim {
   color: var(--muted);
   font-weight: 400;
-  font-size: 14px;
+  font-size: 15px;
 }
 .hero__title {
   font-family: var(--font-serif);
   font-style: italic;
   letter-spacing: -0.02em;
-  font-size: 56px;
-  line-height: 1.0;
+  font-size: 60px;
+  line-height: 0.98;
   color: var(--fg);
   margin: 0 0 12px;
   word-break: break-word;
 }
 @media (max-width: 1100px) {
   .hero__title {
-    font-size: 40px;
+    font-size: 42px;
   }
 }
 .hero__meta {
@@ -713,28 +726,30 @@ body {
   background: var(--muted);
 }
 
-/* Waveform timeline labels */
+/* Waveform timeline labels — uppercase mono mutedDeep, generous
+ * marginTop so the labels don't crowd the playhead. */
 .hero__wf-times {
   display: flex;
   justify-content: space-between;
-  margin-top: 6px;
+  margin-top: 22px;
   font-family: var(--font-mono);
-  font-size: 9.5px;
+  font-size: 11px;
   color: var(--muted-deep);
-  letter-spacing: 0.4px;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
 }
 
 /* Transport row */
 .transport {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   flex-wrap: wrap;
 }
 .transport__play {
   /* uses ma-pill ma-pill--active; only sets size override */
-  width: 44px;
-  height: 44px;
+  width: 54px;
+  height: 54px;
   padding: 0 !important;
   gap: 0;
 }
@@ -743,18 +758,19 @@ body {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 1px;
+  gap: 3px;
 }
 .transport__progress-l {
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: 10px;
   color: var(--muted-deep);
-  letter-spacing: 1.4px;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
 }
 .transport__progress-v {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  font-size: 13px;
+  font-size: 18px;
   color: var(--accent);
   letter-spacing: 0.3px;
   line-height: 1;
@@ -1026,32 +1042,81 @@ body {
 .sb__commit .ma-pill--primary {
   width: 100%;
 }
-.sb__file-info {
-  margin-top: 16px;
-  padding: 12px 14px;
-  border: 1px dashed var(--rule);
-  border-radius: 8px;
+/* ── File picker card ───────────────────────────────────────────
+ * Single dashed card with a file-icon tile + name + meta. Also acts
+ * as the drop target. Below it: Browse / Remove pill buttons, then a
+ * mono hint listing accepted formats. Mirrors the design's SourceFile
+ * layout. */
+.sb__file-card {
   display: flex;
-  align-items: baseline;
-  gap: 10px;
-  font-family: var(--font-mono);
-  white-space: nowrap;
-  overflow: hidden;
+  align-items: center;
+  gap: 12px;
+  padding: 14px;
+  border: 1px dashed var(--rule);
+  border-radius: 10px;
+  background: transparent;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
 }
-.sb__file-info-name {
+.sb__file-card:hover,
+.sb__file-card--drag {
+  border-color: color-mix(in oklch, var(--accent) 55%, transparent);
+  background: color-mix(in oklch, var(--accent) 6%, transparent);
+}
+.sb__file-card__icon {
+  width: 38px;
+  height: 38px;
+  border-radius: 8px;
+  flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--rule);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-dim);
+}
+.sb__file-card__body {
+  flex: 1;
+  min-width: 0;
+}
+.sb__file-card__name {
+  font-family: var(--font-mono);
   font-size: 13px;
   color: var(--fg);
   letter-spacing: 0.2px;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.sb__file-info-meta {
+.sb__file-card__name--empty {
+  color: var(--muted);
+}
+.sb__file-card__meta {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   font-size: 10.5px;
   color: var(--muted);
   letter-spacing: 0.3px;
-  margin-left: auto;
+  margin-top: 2px;
+}
+.sb__file-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+.sb__file-actions .ma-pill {
+  flex: 0 1 auto;
+}
+.sb__file-actions .ma-pill--grow {
+  flex: 1;
+}
+.sb__file-formats {
+  margin-top: 12px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--muted-deep);
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
 }
 .sb__url-input {
   margin-top: 16px;

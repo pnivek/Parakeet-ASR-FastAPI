@@ -19,25 +19,25 @@ interface Props {
   language?: string
 }
 
-const PlayIcon = ({ size = 16 }: { size?: number }) => (
+const PlayIcon = ({ size = 20 }: { size?: number }) => (
   <svg viewBox="0 0 24 24" width={size} height={size} fill="currentColor" aria-hidden>
     <path d="M8 5.5v13a.5.5 0 0 0 .77.42l10-6.5a.5.5 0 0 0 0-.84l-10-6.5A.5.5 0 0 0 8 5.5z" />
   </svg>
 )
-const PauseIcon = ({ size = 16 }: { size?: number }) => (
+const PauseIcon = ({ size = 20 }: { size?: number }) => (
   <svg viewBox="0 0 24 24" width={size} height={size} fill="currentColor" aria-hidden>
     <rect x="6" y="5" width="4" height="14" rx="1" />
     <rect x="14" y="5" width="4" height="14" rx="1" />
   </svg>
 )
 const ResetIcon = () => (
-  <svg viewBox="0 0 24 24" width={11} height={11} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" aria-hidden>
+  <svg viewBox="0 0 24 24" width={13} height={13} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" aria-hidden>
     <path d="M19 12a7 7 0 1 1-2-4.9" />
     <path d="M19 4v5h-5" />
   </svg>
 )
 const DownloadIcon = () => (
-  <svg viewBox="0 0 24 24" width={11} height={11} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+  <svg viewBox="0 0 24 24" width={13} height={13} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
     <path d="M12 4v12M12 16l-4-4M12 16l4-4" />
     <path d="M4 20h16" />
   </svg>
@@ -127,12 +127,12 @@ export function HeroRow({ loaded, peaks, state, language = 'en' }: Props) {
           {playing ? <PauseIcon /> : <PlayIcon />}
         </button>
 
-        <button type="button" className="ma-pill" onClick={resetPlayback} disabled={!loaded}>
+        <button type="button" className="ma-pill ma-pill--lg" onClick={resetPlayback} disabled={!loaded}>
           <ResetIcon />
           Reset
         </button>
         {loaded && (
-          <button type="button" className="ma-pill" onClick={() => downloadAudio(loaded)}>
+          <button type="button" className="ma-pill ma-pill--lg" onClick={() => downloadAudio(loaded)}>
             <DownloadIcon />
             .{ext}
           </button>

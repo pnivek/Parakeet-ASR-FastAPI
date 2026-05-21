@@ -727,7 +727,7 @@ function SourcePane({
   mode,
   onModeChange,
   pickedFile,
-  setPickedFile: _setPickedFile,
+  setPickedFile,
   dragOver,
   setDragOver,
   fileInputRef,
@@ -771,9 +771,9 @@ function SourcePane({
       />
 
       {mode === 'file' && (
-        <>
+        <div style={{ marginTop: 16 }}>
           <div
-            className={dragOver ? 'sb__drop sb__drop--active' : 'sb__drop'}
+            className={dragOver ? 'sb__file-card sb__file-card--drag' : 'sb__file-card'}
             onClick={() => fileInputRef.current?.click()}
             onDragEnter={(e) => {
               e.preventDefault()
@@ -795,10 +795,39 @@ function SourcePane({
               if (e.key === 'Enter' || e.key === ' ') fileInputRef.current?.click()
             }}
           >
-            <div className="sb__drop-title">
-              Drop file · or <span className="sb__drop-browse">browse</span>
+            <div className="sb__file-card__icon">
+              <svg
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden
+              >
+                <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+                <path d="M14 3v5h5" />
+              </svg>
             </div>
-            <div className="sb__drop-hint">wav · mp3 · flac · m4a · ogg · webm</div>
+            <div className="sb__file-card__body">
+              {pickedFile ? (
+                <>
+                  <div className="sb__file-card__name">{pickedFile.name}</div>
+                  <div className="sb__file-card__meta">
+                    {formatBytes(pickedFile.size)} · {pickedFile.type || 'audio'}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="sb__file-card__name sb__file-card__name--empty">
+                    Drop a file or browse
+                  </div>
+                  <div className="sb__file-card__meta">No file selected</div>
+                </>
+              )}
+            </div>
           </div>
           <input
             ref={fileInputRef}
@@ -807,15 +836,44 @@ function SourcePane({
             hidden
             onChange={(e) => onFiles(e.target.files)}
           />
-          {pickedFile && (
-            <div className="sb__file-info">
-              <span className="sb__file-info-name">{pickedFile.name}</span>
-              <span className="sb__file-info-meta">
-                {formatBytes(pickedFile.size)} · {pickedFile.type || 'audio'}
-              </span>
-            </div>
-          )}
-        </>
+          <div className="sb__file-actions">
+            <button
+              type="button"
+              className="ma-pill ma-pill--grow"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              Browse…
+            </button>
+            {pickedFile && (
+              <button
+                type="button"
+                className="ma-pill"
+                aria-label="Remove file"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setPickedFile(null)
+                  if (fileInputRef.current) fileInputRef.current.value = ''
+                }}
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  width="11"
+                  height="11"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.7"
+                  strokeLinecap="round"
+                  aria-hidden
+                >
+                  <path d="M19 6L6 19M6 6l13 13" />
+                </svg>
+              </button>
+            )}
+          </div>
+          <div className="sb__file-formats">
+            Accepts .wav .mp3 .flac .m4a .ogg .webm
+          </div>
+        </div>
       )}
 
       {mode === 'mic' && (

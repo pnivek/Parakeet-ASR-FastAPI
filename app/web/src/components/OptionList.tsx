@@ -1,8 +1,9 @@
 /**
- * Vertical option list — each option is a clickable row. Active row
- * gets a 2px accent left-bar + accent text + a filled dot indicator
- * on the right. Always-visible, replaces the dropdowns we had for
- * Input / Format / Strategy.
+ * Vertical option list — the vertical version of .ma-tabs. Each
+ * option is a click-to-select pill inside a rounded track. The active
+ * pill fills with accent; matches the source/output/engine tabs at
+ * the top of the sidebar so the whole selector vocabulary reads as
+ * one consistent system.
  */
 
 export interface OptionListItem<T extends string> {
@@ -16,26 +17,16 @@ export function OptionList<T extends string>({
   value,
   options,
   onChange,
-  mono = false,
 }: {
   value: T
   options: OptionListItem<T>[]
   onChange: (next: T) => void
-  /** Render labels in mono lowercase (used for Strategy / Format which
-   * are technical identifiers; Input mode reads better in sans). */
-  mono?: boolean
 }) {
   return (
     <div className="ma-option-list" role="radiogroup">
       {options.map((o) => {
         const active = o.id === value
-        const cls = [
-          'ma-option',
-          mono ? 'ma-option--mono' : '',
-          active ? 'ma-option--active' : '',
-        ]
-          .filter(Boolean)
-          .join(' ')
+        const cls = active ? 'ma-option ma-option--active' : 'ma-option'
         return (
           <button
             key={o.id}
@@ -50,8 +41,7 @@ export function OptionList<T extends string>({
               if (!active) onChange(o.id)
             }}
           >
-            <span>{o.label}</span>
-            <span className="ma-option__dot" aria-hidden />
+            {o.label}
           </button>
         )
       })}

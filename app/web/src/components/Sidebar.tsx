@@ -708,9 +708,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             setUrlInput={setUrlInput}
             mic={mic}
             recording={recording}
-            micBusy={micBusy}
             recordElapsed={recordElapsed}
-            startMic={startMic}
             micCaptureMode={s.micCaptureMode}
             setMicCaptureMode={(v) => s.set('micCaptureMode', v)}
           />
@@ -809,9 +807,7 @@ function SourcePane({
   setUrlInput,
   mic,
   recording,
-  micBusy,
   recordElapsed,
-  startMic,
   micCaptureMode,
   setMicCaptureMode,
 }: {
@@ -827,9 +823,7 @@ function SourcePane({
   setUrlInput: (v: string) => void
   mic: MicReturn
   recording: boolean
-  micBusy: boolean
   recordElapsed: number
-  startMic: (captureMode: 'live' | 'record') => Promise<void>
   micCaptureMode: 'live' | 'record'
   setMicCaptureMode: (v: 'live' | 'record') => void
 }) {
@@ -959,7 +953,7 @@ function SourcePane({
             value={micCaptureMode}
             options={[
               { id: 'live', label: 'Live transcription' },
-              { id: 'record', label: 'Record (transcribe after)' },
+              { id: 'record', label: 'Recording' },
             ]}
             onChange={setMicCaptureMode}
           />
@@ -979,20 +973,6 @@ function SourcePane({
               </span>
             </div>
           </div>
-
-          <button
-            type="button"
-            className={recording ? 'ma-pill ma-pill--active mic-card__btn' : 'ma-pill mic-card__btn'}
-            onClick={() => (recording ? mic.stop() : startMic(micCaptureMode))}
-            disabled={micBusy}
-          >
-            <span className={recording ? 'mic-card__dot mic-card__dot--rec' : 'mic-card__dot'} />
-            {recording
-              ? 'Stop recording'
-              : pickedFile && micCaptureMode === 'record'
-                ? 'Re-record'
-                : 'Start recording'}
-          </button>
 
           {!recording && pickedFile && micCaptureMode === 'record' && (
             <div className="sb__file-card" style={{ marginTop: 10 }}>
@@ -1107,7 +1087,6 @@ function OutputPane({
       <SBLabel>Format</SBLabel>
       <OptionList<ResponseFormat>
         value={format}
-        mono
         options={FORMATS.map((f) => ({ id: f.id, label: f.label }))}
         onChange={setFormat}
       />
@@ -1244,7 +1223,6 @@ function EnginePane({
       <SBLabel>Strategy</SBLabel>
       <OptionList<Strategy>
         value={strategy}
-        mono
         options={STRATEGIES.map((id) => ({
           id,
           label: id,

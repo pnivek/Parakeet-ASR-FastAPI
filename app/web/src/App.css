@@ -504,80 +504,51 @@ body {
 }
 
 /* ── Option list ──────────────────────────────────────────────────
- * Vertical column of click-to-select option rows. Each row has a
- * small dot indicator on the right that fills accent when active,
- * and a 2px accent bar on the left edge of the active row. Used for
- * Input / Format / Strategy selectors instead of the previous
- * dropdowns — wastes less of the sidebar's vertical space and lets
- * the user see all options at a glance. */
+ * Vertical version of .ma-tabs — same pill-track shell, same
+ * accent-fill active state. Used for Input / Format / Strategy
+ * selectors. Each option is a click-to-select pill that fills with
+ * accent when active. */
 .ma-option-list {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  padding: 3px;
+  background: rgba(255, 255, 255, 0.022);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 14px;
 }
 .ma-option {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  justify-content: center;
   width: 100%;
-  border: 0;
+  padding: 8px 12px;
+  border-radius: 999px;
   background: transparent;
+  border: 1px solid transparent;
   cursor: pointer;
-  padding: 8px 8px 8px 14px;
-  position: relative;
-  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
   color: var(--ma-fgDim);
-  font-family: var(--font-sans);
-  font-size: 13px;
-  letter-spacing: 0.1px;
-  transition: color 0.18s ease, background 0.18s ease;
+  transition: color 0.18s ease, background 0.18s ease, border-color 0.18s ease;
 }
-.ma-option::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 7px;
-  bottom: 7px;
-  width: 2px;
-  background: transparent;
-  transition: background 0.18s ease;
-  border-radius: 1px;
-}
-.ma-option:hover:not([disabled]) {
+.ma-option:hover:not([disabled]):not(.ma-option--active) {
   color: var(--ma-fg);
-}
-.ma-option:hover:not([disabled])::before {
-  background: rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.04);
 }
 .ma-option--active {
   color: var(--ma-accent);
+  background: color-mix(in oklch, var(--ma-accent) 12%, transparent);
+  border-color: color-mix(in oklch, var(--ma-accent) 38%, transparent);
 }
-.ma-option--active::before {
-  background: var(--ma-accent);
-}
-.ma-option--mono {
-  font-family: var(--font-mono);
-  text-transform: lowercase;
-  letter-spacing: 0.3px;
-  font-size: 12px;
+.ma-option--active:hover {
+  background: color-mix(in oklch, var(--ma-accent) 16%, transparent);
 }
 .ma-option[disabled] {
   cursor: not-allowed;
   opacity: 0.4;
-}
-.ma-option__dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 99px;
-  background: transparent;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  flex-shrink: 0;
-  transition: background 0.18s ease, border-color 0.18s ease;
-}
-.ma-option--active .ma-option__dot {
-  background: currentColor;
-  border-color: currentColor;
 }
 
 /* ── Advanced KV list (always-visible) ─────────────────────────────

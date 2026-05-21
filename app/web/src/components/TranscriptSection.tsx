@@ -223,6 +223,7 @@ const Word = memo(function Word({
   active,
   past,
   reveal,
+  partial,
   isLast,
 }: {
   word: string
@@ -230,18 +231,32 @@ const Word = memo(function Word({
   active: boolean
   past: boolean
   reveal: boolean
+  partial: boolean
   isLast: boolean
 }) {
-  const color = active ? 'var(--accent)' : past ? 'var(--fg)' : 'var(--muted)'
+  // Inline color is only set for committed words — it tracks playback
+  // position (active/past). Partial words let .editorial-word--partial
+  // drive their color so the CSS transition between partial→committed
+  // can animate it.
+  const color = partial
+    ? undefined
+    : active
+      ? 'var(--accent)'
+      : past
+        ? 'var(--fg)'
+        : 'var(--muted)'
+  const classes = ['editorial-word']
+  if (partial) classes.push('editorial-word--partial')
+  if (reveal) classes.push('word-reveal')
   return (
     <>
       <span
-        className={reveal ? 'editorial-word word-reveal' : 'editorial-word'}
+        className={classes.join(' ')}
         onClick={() => {
           seek(start)
           play()
         }}
-        style={{ color }}
+        style={color ? { color } : undefined}
       >
         {word}
         {active && <span className="editorial-word__under" />}
@@ -265,58 +280,44 @@ function PlainText({
   /** True only while transcripts are arriving mid-stream — drives the
    * arrival-based fade-in. False for finalized results. */
   live: boolean
-  /** Per-word-index arrival timestamps for the live reveal. The CSS
-   * fade runs on first mount; we only need to know whether a word has
-   * an arrival stamp so we apply the class for ones that should fade. */
   wordArrivals: Map<number, number>
   /** In-flight words from the engine's uncommitted sentence buffer.
-   * Rendered after the committed words with a dimmed style. Replaced
-   * by real committed words when the sentence terminates. */
+   * Rendered at the end of the same word list with stable indices so
+   * a partial→committed transition reuses the same DOM element and
+   * animates via CSS transition instead of unmount + remount. */
   partialWords: Word[]
 }) {
   const committed = body.words ?? []
   if (committed.length === 0 && partialWords.length === 0) {
     return <div className="editorial-body">{body.text}</div>
   }
-  const total = committed.length
-  const lastCommittedIsActuallyLast = partialWords.length === 0
+  // ONE combined list. Stable keys by position. When a word transitions
+  // from partial (index i was partial) to committed (index i is now in
+  // committed), React keeps the same <span> — only the className flips,
+  // and CSS handles the smooth styling change.
+  const committedCount = committed.length
+  const total = committedCount + partialWords.length
   return (
     <div className="editorial-body">
-      {committed.map((w, i) => {
-        const active = i === activeWordIdx
-        const past = i < activeWordIdx
-        const isLast = i === total - 1 && lastCommittedIsActuallyLast
+      {Array.from({ length: total }).map((_unused, i) => {
+        const isPartial = i >= committedCount
+        const w = isPartial ? partialWords[i - committedCount] : committed[i]
+        const active = !isPartial && i === activeWordIdx
+        const past = !isPartial && i < activeWordIdx
+        const isLast = i === total - 1
         return (
           <Word
-            key={`${i}-${w.start}`}
+            key={i}
             word={w.word}
             start={w.start}
             active={active}
             past={past}
-            reveal={live && wordArrivals.has(i)}
+            partial={isPartial}
+            reveal={!isPartial && live && wordArrivals.has(i)}
             isLast={isLast}
           />
         )
       })}
-      {partialWords.length > 0 && (
-        <span className="editorial-partial">
-          {/* Separating space when there are committed words before. */}
-          {committed.length > 0 && ' '}
-          {partialWords.map((w, i) => (
-            <span
-              key={`partial-${i}-${w.start}`}
-              className="editorial-word editorial-word--partial"
-              onClick={() => {
-                seek(w.start)
-                play()
-              }}
-            >
-              {w.word}
-              {i < partialWords.length - 1 && ' '}
-            </span>
-          ))}
-        </span>
-      )}
     </div>
   )
 }
@@ -353,14 +354,27 @@ function SegmentRows({
     play()
   }
 
+  // Combined list. The partial's id is `next_seg_id` — the same id the
+  // committed segment will use when the sentence terminates — so when
+  // partial → committed happens React reuses the same <div>; only the
+  // className and content update, and the CSS transition on .segs-row
+  // smoothly animates the styling change.
+  type Row = { seg: WhisperSegment; partial: boolean; activeIdx: number }
+  const rows: Row[] = segments.map((s, i) => ({ seg: s, partial: false, activeIdx: i }))
+  if (partialSegment) {
+    rows.push({ seg: partialSegment, partial: true, activeIdx: -1 })
+  }
+
   return (
     <div className="segs-list">
-      {segments.map((s, i) => {
-        const active = i === activeIdx
-        const open = openId === s.id
-        const reveal = live && segmentArrivals.has(s.id)
+      {rows.map(({ seg: s, partial, activeIdx: i }) => {
+        const active = !partial && i === activeIdx
+        const open = !partial && openId === s.id
+        const reveal = !partial && live && segmentArrivals.has(s.id)
         const cls = [
-          active ? 'segs-row segs-row--active' : 'segs-row',
+          'segs-row',
+          active ? 'segs-row--active' : '',
+          partial ? 'segs-row--partial' : '',
           reveal ? 'seg-reveal' : '',
         ]
           .filter(Boolean)
@@ -380,7 +394,10 @@ function SegmentRows({
             }}
           >
             <span className="segs-row__t">
-              {formatTime(s.start)} <span className="segs-row__t-end">→ {formatTime(s.end)}</span>
+              {formatTime(s.start)}{' '}
+              <span className="segs-row__t-end">
+                → {partial ? '…' : formatTime(s.end)}
+              </span>
             </span>
             <div>
               <div className="segs-row__text">{s.text}</div>
@@ -398,23 +415,6 @@ function SegmentRows({
           </div>
         )
       })}
-      {partialSegment && (
-        <div
-          className="segs-row segs-row--partial"
-          onClick={() => {
-            seek(partialSegment.start)
-            play()
-          }}
-        >
-          <span className="segs-row__t">
-            {formatTime(partialSegment.start)}{' '}
-            <span className="segs-row__t-end">→ …</span>
-          </span>
-          <div>
-            <div className="segs-row__text segs-row__text--partial">{partialSegment.text}</div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }
@@ -447,40 +447,36 @@ function WordsGrid({
       </div>
     )
   }
+  // Combined list with stable index keys so a partial-to-committed
+  // transition reuses the same <button>; only its className flips,
+  // CSS transition handles the smooth visual change.
+  const committedCount = committed.length
+  const total = committedCount + partialWords.length
   return (
     <div className="words-grid">
-      {committed.map((w, i) => (
-        <button
-          key={`${i}-${w.start}`}
-          type="button"
-          className={i === activeIdx ? 'words-cell words-cell--active' : 'words-cell'}
-          onClick={() => {
-            seek(w.start)
-            play()
-          }}
-        >
-          <span className="words-cell__word">{w.word}</span>
-          <span className="words-cell__t num">
-            {w.start.toFixed(2)} → {w.end.toFixed(2)}
-          </span>
-        </button>
-      ))}
-      {partialWords.map((w, i) => (
-        <button
-          key={`partial-${i}-${w.start}`}
-          type="button"
-          className="words-cell words-cell--partial"
-          onClick={() => {
-            seek(w.start)
-            play()
-          }}
-        >
-          <span className="words-cell__word">{w.word}</span>
-          <span className="words-cell__t num">
-            {w.start.toFixed(2)} → {w.end.toFixed(2)}
-          </span>
-        </button>
-      ))}
+      {Array.from({ length: total }).map((_unused, i) => {
+        const isPartial = i >= committedCount
+        const w = isPartial ? partialWords[i - committedCount] : committed[i]
+        const classes = ['words-cell']
+        if (!isPartial && i === activeIdx) classes.push('words-cell--active')
+        if (isPartial) classes.push('words-cell--partial')
+        return (
+          <button
+            key={i}
+            type="button"
+            className={classes.join(' ')}
+            onClick={() => {
+              seek(w.start)
+              play()
+            }}
+          >
+            <span className="words-cell__word">{w.word}</span>
+            <span className="words-cell__t num">
+              {w.start.toFixed(2)} → {w.end.toFixed(2)}
+            </span>
+          </button>
+        )
+      })}
     </div>
   )
 }

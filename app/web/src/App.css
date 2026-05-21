@@ -153,33 +153,33 @@ body {
   will-change: opacity, filter, transform;
 }
 
-/* In-flight partial — words from the engine's uncommitted sentence
- * buffer. Lighter colour + a soft pulse so the user can tell it's
- * not finalized yet. Replaced by real words when the sentence
- * commits. */
-.editorial-partial { display: inline; }
+/* In-flight partial — words/segments from the engine's uncommitted
+ * sentence buffer. The CSS transitions on the base classes let a
+ * partial→committed style flip animate smoothly because we keep the
+ * same DOM node (combined render in TranscriptSection.tsx uses stable
+ * keys). When the model commits the sentence, the --partial class is
+ * removed and the color/opacity glide back to committed style. */
+.editorial-word {
+  transition: color 240ms ease-out, opacity 240ms ease-out;
+}
 .editorial-word--partial {
   color: var(--muted);
-  opacity: 0.72;
-  font-style: italic;
+  opacity: 0.7;
 }
-@keyframes partialPulse {
-  0%, 100% { opacity: 0.55; }
-  50% { opacity: 0.85; }
+.segs-row {
+  transition: opacity 240ms ease-out, color 240ms ease-out;
 }
-.segs-row--partial,
-.editorial-word--partial { animation: partialPulse 2.4s ease-in-out infinite; }
 .segs-row--partial {
-  border-style: dashed !important;
-  opacity: 0.85;
+  opacity: 0.8;
 }
-.segs-row__text--partial {
-  font-style: italic;
+.segs-row--partial .segs-row__text {
   color: var(--muted);
+}
+.words-cell {
+  transition: opacity 240ms ease-out;
 }
 .words-cell--partial {
   opacity: 0.6;
-  font-style: italic;
 }
 
 /* Subtle underline reveal on header links. */

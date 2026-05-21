@@ -5,7 +5,7 @@
  */
 
 const MicLogo = () => (
-  <svg viewBox="0 0 32 32" width="34" height="34" fill="none" aria-label="mic">
+  <svg viewBox="0 0 32 32" width="40" height="40" fill="none" aria-label="mic">
     <defs>
       <linearGradient id="ma-mic-cap" x1="0" y1="0" x2="0" y2="1">
         <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.95" />
@@ -38,7 +38,7 @@ export function Header() {
     <header className="header">
       <div className="header__brand">
         <MicLogo />
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+        <div className="header__wordmark">
           <span className="header__name">Parakeet</span>
           <span className="header__sub">playground</span>
         </div>

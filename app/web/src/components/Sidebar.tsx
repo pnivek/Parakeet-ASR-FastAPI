@@ -1366,32 +1366,38 @@ function NumKv({
   onSet: (v: number | null) => void
 }) {
   return (
-    <div className="sb__kv">
-      <span className="sb__kv-k">{k}</span>
-      <input
-        type="number"
-        value={v ?? ''}
-        placeholder={`${placeholder}${suffix ?? ''}`}
-        step={step ?? 1}
-        onChange={(e) => onSet(e.target.value === '' ? null : Number(e.target.value))}
-        className="sb__kv-v"
-        style={{ background: 'transparent' }}
-      />
+    <div className="ma-kv">
+      <span className="ma-kv__k">{k}</span>
+      <span className="ma-kv__v">
+        <input
+          type="number"
+          className="ma-kv__input"
+          value={v ?? ''}
+          placeholder={`${placeholder}`}
+          step={step ?? 1}
+          spellCheck={false}
+          onChange={(e) => onSet(e.target.value === '' ? null : Number(e.target.value))}
+        />
+        <span className="ma-kv__unit">{suffix ?? ''}</span>
+      </span>
     </div>
   )
 }
 
 function ToggleKv({ k, v, onSet }: { k: string; v: boolean; onSet: (v: boolean) => void }) {
   return (
-    <div className="sb__kv">
-      <span className="sb__kv-k">{k}</span>
-      <button
-        type="button"
-        className={v ? 'sb__kv-v sb__kv-v--toggle is-on' : 'sb__kv-v sb__kv-v--toggle'}
-        onClick={() => onSet(!v)}
-      >
-        {v ? 'on' : 'off'}
-      </button>
+    <div className="ma-kv">
+      <span className="ma-kv__k">{k}</span>
+      <span className="ma-kv__v" style={{ paddingRight: 16 }}>
+        <button
+          type="button"
+          className={v ? 'ma-switch ma-switch--on' : 'ma-switch'}
+          onClick={() => onSet(!v)}
+          aria-pressed={v}
+        >
+          <span className="ma-switch__knob" />
+        </button>
+      </span>
     </div>
   )
 }

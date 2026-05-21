@@ -147,25 +147,11 @@ export interface WSError {
   error: string
 }
 
-/** Progressive PCM peaks for the hero waveform. Server emits one entry
- * per engine chunk so the bars grow with the recording (mic) or fill in
- * within seconds of starting (file + progressive). Values are raw
- * absolute amplitudes in [0, 1] — the client normalizes for display.
- *
- * `cumulative=true` means peaks REPLACES the existing array; `false`
- * means it appends. Current server always emits append-mode.  */
-export interface WSPeaks {
-  type: 'peaks'
-  peaks: number[]
-  cumulative: boolean
-}
-
 export type WSMessage =
   | WSSegmentsBatch
   | WSRefinedTranscription
   | WSFinalTranscription
   | WSError
-  | WSPeaks
 
 /* ----- Health endpoint ----- */
 

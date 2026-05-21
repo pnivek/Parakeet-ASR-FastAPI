@@ -90,7 +90,18 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   const [dragOver, setDragOver] = useState(false)
   const onFiles = (files: FileList | null) => {
     if (!files || files.length === 0) return
-    setPickedFile(files[0])
+    const file = files[0]
+    setPickedFile(file)
+    // Wire the audio source + kick off peaks decode immediately. We
+    // already have the entire audio locally — no reason to wait for the
+    // user to click Transcribe. The waveform fades in as soon as
+    // decodeAudioData resolves.
+    onAudioReady?.({
+      kind: 'file',
+      title: file.name.replace(/\.[^.]+$/, ''),
+      source: `${formatBytes(file.size)} · ${file.type || 'audio'}`,
+      file,
+    })
   }
 
   // URL state
@@ -537,16 +548,34 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   // record/stop path via mic.stop() — handled inside transcribe().
   const cancelInFlight = useCallback(() => {
     if (wsRef.current && mode !== 'mic') {
-      // file + progressive — closes WS with code 1000; onClose resets busy.
-      wsRef.current.abort()
+      // file + progressive. Close the WS with code 1000; even if onClose
+      // doesn't fire in time (server taking a beat to ack), we force the
+      // UI back to idle below.
+      try {
+        wsRef.current.abort()
+      } catch (e) {
+        console.warn('cancelInFlight: WS abort failed', e)
+      }
       wsRef.current = null
     }
     if (restAbortRef.current) {
-      // file/url REST — XHR.abort() rejects with AbortError; finally clears busy.
-      restAbortRef.current.abort()
+      // file/url REST — XHR.abort() rejects with AbortError; the
+      // promise's `finally` would normally clear busy, but explicitly
+      // doing it here keeps the button responsive.
+      try {
+        restAbortRef.current.abort()
+      } catch (e) {
+        console.warn('cancelInFlight: REST abort failed', e)
+      }
       restAbortRef.current = null
     }
-  }, [mode])
+    // Force the UI back to idle. The onClose handler also runs setBusyAll(false)
+    // but we don't want to wait for the server to ack the close frame —
+    // the user clicked Stop, the UI should respond now.
+    cancelPendingPartial()
+    setBusyAll(false)
+    setProgress(null)
+  }, [mode, setBusyAll, cancelPendingPartial])
 
   const transcribeLabel = (() => {
     if (busy) return mode === 'mic' ? 'Working…' : 'Stop ▣'

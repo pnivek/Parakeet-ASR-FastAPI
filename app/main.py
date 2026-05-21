@@ -1405,6 +1405,16 @@ async def handle_streaming_pcm(
         )
 
         total_engine_chunks = 0
+        # Force the engine to flush its partial sentence buffer if nothing
+        # has committed in this many seconds. The engine only commits
+        # segments on terminal '.!?' tokens; without this fallback, a
+        # speaker who doesn't pause between sentences sees nothing until
+        # they stop (the EOF flush). 3s is short enough to feel live but
+        # long enough that normal punctuated speech still gets clean
+        # sentence-bounded segments.
+        PARTIAL_FLUSH_INTERVAL_S = 3.0
+        import time as _time
+        last_emit_at = _time.monotonic()
         try:
             while True:
                 item = await chunk_queue.get()
@@ -1420,22 +1430,11 @@ async def handle_streaming_pcm(
                 )
                 await _run_on_asr_executor(engine.feed_float32, samples_np)
                 total_engine_chunks += 1
-                # Hero waveform: emit one peak per engine chunk. Cheap
-                # (single max over the chunk's float32 PCM) and means the
-                # client doesn't have to wait for decodeAudioData on the
-                # blob to draw bars. Raw amplitude in [0, 1]; client
-                # normalizes when rendering.
-                if websocket.application_state == WebSocketState.CONNECTED:
-                    try:
-                        peak = float(np.abs(samples_np).max()) if samples_np.size else 0.0
-                        await websocket.send_json({
-                            "type": "peaks",
-                            "peaks": [round(peak, 4)],
-                            "cumulative": False,
-                        })
-                    except Exception:
-                        pass  # waveform is non-critical, don't break the stream
                 new_segs = engine.pop_committed_segments()
+                if not new_segs and (_time.monotonic() - last_emit_at) > PARTIAL_FLUSH_INTERVAL_S:
+                    # Long enough without a sentence boundary — flush whatever
+                    # tokens are buffered so the UI doesn't stall.
+                    new_segs = engine.flush_partial_sentence()
                 if new_segs and websocket.application_state == WebSocketState.CONNECTED:
                     try:
                         # When VAD is on, engine timestamps are speech-clock —
@@ -1450,6 +1449,7 @@ async def handle_streaming_pcm(
                             "words": new_words,
                         })
                         sent_segments_pcm.extend(new_segs)
+                        last_emit_at = _time.monotonic()
                     except Exception as e_send:
                         logger.warning(f"({session_id}) Stream: segment send failed: {e_send}")
 

@@ -432,11 +432,35 @@ class StreamingPrevBatchedEngine:
     def pop_final_segments(self) -> List[dict]:
         """At EOF — flush any in-progress sentence as the last segment."""
         committed = self.pop_committed_segments()
+        partial = self._flush_partial_buffer()
+        committed.extend(partial)
+        return committed
+
+    def flush_partial_sentence(self) -> List[dict]:
+        """Force-flush the in-progress sentence buffer as a partial segment,
+        without waiting for a terminal '.!?'. The consumer calls this on
+        a timer during live streaming so users see incremental segments
+        even when their speech doesn't have clean sentence boundaries
+        (the model only commits on terminal punctuation otherwise).
+
+        Returns a list (possibly empty) of newly-emitted segments. Safe
+        to call repeatedly; subsequent calls return [] until more tokens
+        accumulate.
+        """
+        # Drain any newly-committed sentence-bounded tokens first, then
+        # flush whatever's in the running sentence buffer.
+        committed = self.pop_committed_segments()
+        partial = self._flush_partial_buffer()
+        committed.extend(partial)
+        return committed
+
+    def _flush_partial_buffer(self) -> List[dict]:
+        out: List[dict] = []
         if self._sentence_buffer_ids:
             text = self.tokenizer.ids_to_text(self._sentence_buffer_ids).strip()
             if text:
                 has_lps = any(x is not None for x in self._sentence_buffer_logprobs)
-                committed.append(_whisper_segment(
+                out.append(_whisper_segment(
                     self._next_seg_id,
                     self._sentence_buffer_start or 0.0,
                     self._sentence_buffer_last_t,
@@ -450,7 +474,7 @@ class StreamingPrevBatchedEngine:
             self._sentence_buffer_logprobs = []
             self._sentence_buffer_times = []
             self._sentence_buffer_start = None
-        return committed
+        return out
 
     @property
     def asr_time_s(self) -> float:

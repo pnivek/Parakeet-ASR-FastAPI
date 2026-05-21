@@ -35,15 +35,6 @@ export default function App() {
    * increasing ids; words are append-only by index. */
   const maxSeenSegIdRef = useRef<number>(-1)
   const wordArrivalCountRef = useRef<number>(0)
-  /** The blob whose peaks are currently in state. Prevents the duplicate
-   * decode where handleAudioReady fires one (decode 1) and handleResult
-   * later fires another (decode 2) on the SAME file — which would clear
-   * peaks=null on decode 2 start and make the waveform vanish + reappear
-   * at the end of transcription. */
-  const peaksForBlobRef = useRef<Blob | null>(null)
-  /** Promise of the in-flight decode for the current blob, so handleResult
-   * can join it instead of starting a fresh decode. */
-  const peaksInFlightRef = useRef<Promise<void> | null>(null)
 
   // Hidden host for the singleton <audio>.
   const audioMountRef = useRef<HTMLDivElement>(null)
@@ -52,45 +43,43 @@ export default function App() {
 
   // decodeAudioData allocates ~10x the compressed file size in PCM — a 3hr
   // mp3 (≈180MB on disk) would need ~1.5GB of float32 PCM and may OOM the
-  // tab. Skip the decode for huge files and leave peaks null (the Waveform
-  // component renders placeholder bars).
-  const PEAKS_MAX_BYTES = 200 * 1024 * 1024 // 200 MB compressed input ceiling
+  // tab. Skip the decode for huge files and leave peaks null.
+  const PEAKS_MAX_BYTES = 200 * 1024 * 1024
 
-  /** Decode peaks for a blob. Idempotent: if we already started a decode
-   * for this exact blob, return the same promise — no double-work, no
-   * peaks-flicker. Caller can ignore the returned promise. */
-  const computePeaksFor = (blob: Blob): Promise<void> => {
-    if (peaksForBlobRef.current === blob && peaksInFlightRef.current) {
-      return peaksInFlightRef.current
+  // Decode peaks for whichever file is currently loaded. One source of
+  // truth: any time `loaded.file` becomes a new blob (file picked, mic
+  // recording finalized, etc.), kick off a decode. We DON'T clear peaks
+  // at the start of the decode — any prior peaks (from a live mic
+  // session, or a previous file) stay visible until the new decode
+  // resolves, avoiding a flash of empty bars. Cancellation flag prevents
+  // a stale decode from clobbering a newer file's peaks.
+  const loadedFile = loaded?.kind === 'file' ? loaded.file : null
+  useEffect(() => {
+    if (!loadedFile) {
+      setPeaks(null)
+      return
     }
-    if (peaksForBlobRef.current === blob) {
-      // Already decoded; peaks state still reflects this blob.
-      return Promise.resolve()
-    }
-    peaksForBlobRef.current = blob
-    setPeaks(null)
-    if (blob.size > PEAKS_MAX_BYTES) {
+    if (loadedFile.size > PEAKS_MAX_BYTES) {
       console.warn(
-        `Peaks decode skipped: ${(blob.size / 1024 / 1024).toFixed(0)} MB > ${PEAKS_MAX_BYTES / 1024 / 1024} MB cap.`,
+        `Peaks decode skipped: ${(loadedFile.size / 1024 / 1024).toFixed(0)} MB > ${PEAKS_MAX_BYTES / 1024 / 1024} MB cap.`,
       )
-      peaksInFlightRef.current = null
-      return Promise.resolve()
+      return
     }
-    const run = async (): Promise<void> => {
-      try {
-        const peaks = await computePeaks(blob, 220)
-        if (peaksForBlobRef.current === blob) setPeaks(peaks)
-      } catch (e) {
+    let cancelled = false
+    computePeaks(loadedFile, 220).then(
+      (p) => {
+        if (!cancelled) setPeaks(p)
+      },
+      (e) => {
         console.warn('Peaks decode failed:', e)
-        if (peaksForBlobRef.current === blob) setPeaks(null)
-      }
+        if (!cancelled) setPeaks(null)
+      },
+    )
+    return () => {
+      cancelled = true
     }
-    const promise = run().finally(() => {
-      if (peaksInFlightRef.current === promise) peaksInFlightRef.current = null
-    })
-    peaksInFlightRef.current = promise
-    return promise
-  }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadedFile])
 
   const handleResult = (l: LoadedAudio, r: TranscriptionResponse) => {
     setLoaded(l)
@@ -103,11 +92,10 @@ export default function App() {
     wordArrivalCountRef.current = 0
     if (l.kind === 'file') {
       setAudioFile(l.file)
-      computePeaksFor(l.file)
+      // peaks decode runs in the useEffect above when loaded.file changes.
     } else {
       // URL ingest: we don't have the bytes locally, so no playback / peaks.
       setAudioFile(null)
-      setPeaks(null)
     }
   }
 
@@ -152,13 +140,13 @@ export default function App() {
     setResult(null)
     setError(null)
     setLive(false)
-    setPeaks(null)
-    peaksForBlobRef.current = null
-    peaksInFlightRef.current = null
     arrivalRef.current = new Map()
     wordArrivalRef.current = new Map()
     maxSeenSegIdRef.current = -1
     wordArrivalCountRef.current = 0
+    // Don't clear peaks here — the effect above will reset/decode based on
+    // the next `loaded.file` change. Clearing now would create a flicker
+    // when the same file is re-transcribed.
   }
 
   /** Live peaks for the hero waveform. Currently driven by the mic's
@@ -179,17 +167,16 @@ export default function App() {
   }
 
   /**
-   * Wire the picked file into the audio player + peak waveform early in a
-   * streaming session (e.g. file + progressive over WS), so the user can
-   * scrub and play while transcription is still arriving. Does NOT set
-   * `result` — partials drive the transcript view; final result comes
-   * through `handleResult`.
+   * Wire the picked file into the audio player early in a streaming
+   * session (e.g. file + progressive over WS), so the user can scrub and
+   * play while transcription is still arriving. Setting `loaded` triggers
+   * the peaks-decode effect above. Does NOT set `result` — partials
+   * drive the transcript view; final result comes through `handleResult`.
    */
   const handleAudioReady = (l: LoadedAudio) => {
     setLoaded(l)
     if (l.kind === 'file') {
       setAudioFile(l.file)
-      computePeaksFor(l.file)
     }
   }
 

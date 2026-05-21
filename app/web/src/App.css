@@ -153,18 +153,29 @@ body {
   will-change: opacity, filter, transform;
 }
 
-/* In-flight partial — words/segments from the engine's uncommitted
- * sentence buffer. The CSS transitions on the base classes let a
- * partial→committed style flip animate smoothly because we keep the
- * same DOM node (combined render in TranscriptSection.tsx uses stable
- * keys). When the model commits the sentence, the --partial class is
- * removed and the color/opacity glide back to committed style. */
+/* Committed vs partial text.
+ *   - Committed = solid `--fg` (near-white) — what the model has
+ *     finalized for the user's transcript.
+ *   - Partial   = `--muted` (warm grey) — the engine's in-flight
+ *     sentence buffer, peeked but not yet committed at a `.!?`.
+ *
+ * The CSS transitions on the base classes let a partial→committed
+ * style flip animate smoothly because we keep the same DOM node
+ * (combined render in TranscriptSection.tsx uses stable index keys).
+ * When the model commits the sentence, the --partial class is removed
+ * and the color glides back to committed white.
+ *
+ * Playback position is NOT signalled by recoloring individual words —
+ * a single moving underline beneath the text tracks it (see
+ * .text-playhead and the underline element rendered by PlainText).
+ * That's deliberate: per-word recoloring jittered because real
+ * per-token timestamps from the engine overlap or have small gaps. */
 .editorial-word {
-  transition: color 240ms ease-out, opacity 240ms ease-out;
+  color: var(--fg);
+  transition: color 240ms ease-out;
 }
 .editorial-word--partial {
   color: var(--muted);
-  opacity: 0.7;
 }
 .segs-row {
   transition: opacity 240ms ease-out, color 240ms ease-out;
@@ -646,20 +657,14 @@ body {
   letter-spacing: 0.005em;
   color: var(--fg);
 }
+/* Per-word base layout — colors set above by .editorial-word and
+ * .editorial-word--partial. Position relative kept so future per-word
+ * affordances (focus rings etc) can anchor. No per-word underline:
+ * playback position is tracked by the .text-playhead element. */
 .editorial-word {
   position: relative;
   cursor: pointer;
   display: inline-block;
-  transition: color 0.25s ease;
-}
-.editorial-word__under {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: -3px;
-  height: 1.5px;
-  background: var(--accent);
-  opacity: 0.85;
 }
 
 /* Segments rows — single-line timestamps in their own column */

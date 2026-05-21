@@ -1,4 +1,4 @@
-import { memo, useMemo, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { TranscriptionResponse } from '../lib/api'
 import type { VerboseJsonResponse, WhisperSegment, Word } from '../lib/types'
 import { play, seek } from '../lib/playback'
@@ -170,9 +170,28 @@ function VerboseBody({
   partialSegment: WhisperSegment | null
   partialWords: Word[]
 }) {
+  // Monotonic active-word lookup: the LAST word whose start time is
+  // <= currentTime. This avoids the flicker we'd get from
+  // `start <= t <= end` when adjacent words have overlapping or gappy
+  // timestamps (the engine's 80ms encoder-stride quantization makes
+  // overlaps common in the real per-token output).
   const activeWordIdx = useMemo(() => {
-    if (!body.words) return -1
-    return body.words.findIndex((w) => currentTime >= w.start && currentTime <= w.end)
+    const words = body.words
+    if (!words || words.length === 0) return -1
+    if (currentTime < words[0].start) return -1
+    let lo = 0,
+      hi = words.length - 1,
+      found = -1
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      if (words[mid].start <= currentTime) {
+        found = mid
+        lo = mid + 1
+      } else {
+        hi = mid - 1
+      }
+    }
+    return found
   }, [body.words, currentTime])
   const activeSegIdx = useMemo(
     () => body.segments.findIndex((s) => currentTime >= s.start && currentTime <= s.end),
@@ -217,34 +236,32 @@ function VerboseBody({
 // NOT replay. Stable keys (`${i}-${w.start}`) also keep React from
 // unmounting + remounting elements as new partials arrive.
 
+/**
+ * Per-word render. Two states:
+ *   - committed: solid `--fg` (white). Drives no per-word highlight or
+ *     underline — playback position is tracked by a single moving
+ *     underline element in PlainText below, not by recoloring words.
+ *   - partial:  `--muted` (grey) via the `--partial` class.
+ *
+ * The data-word-idx attribute lets PlainText's underline effect look
+ * up the active word's DOM rect without ref management (which would
+ * defeat memo).
+ */
 const Word = memo(function Word({
+  idx,
   word,
   start,
-  active,
-  past,
   reveal,
   partial,
   isLast,
 }: {
+  idx: number
   word: string
   start: number
-  active: boolean
-  past: boolean
   reveal: boolean
   partial: boolean
   isLast: boolean
 }) {
-  // Inline color is only set for committed words — it tracks playback
-  // position (active/past). Partial words let .editorial-word--partial
-  // drive their color so the CSS transition between partial→committed
-  // can animate it.
-  const color = partial
-    ? undefined
-    : active
-      ? 'var(--accent)'
-      : past
-        ? 'var(--fg)'
-        : 'var(--muted)'
   const classes = ['editorial-word']
   if (partial) classes.push('editorial-word--partial')
   if (reveal) classes.push('word-reveal')
@@ -252,14 +269,13 @@ const Word = memo(function Word({
     <>
       <span
         className={classes.join(' ')}
+        data-word-idx={idx}
         onClick={() => {
           seek(start)
           play()
         }}
-        style={color ? { color } : undefined}
       >
         {word}
-        {active && <span className="editorial-word__under" />}
       </span>
       {!isLast && ' '}
     </>
@@ -268,7 +284,7 @@ const Word = memo(function Word({
 
 function PlainText({
   body,
-  currentTime: _currentTime,
+  currentTime,
   activeWordIdx,
   live,
   wordArrivals,
@@ -281,43 +297,110 @@ function PlainText({
    * arrival-based fade-in. False for finalized results. */
   live: boolean
   wordArrivals: Map<number, number>
-  /** In-flight words from the engine's uncommitted sentence buffer.
-   * Rendered at the end of the same word list with stable indices so
-   * a partial→committed transition reuses the same DOM element and
-   * animates via CSS transition instead of unmount + remount. */
   partialWords: Word[]
 }) {
   const committed = body.words ?? []
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const [underline, setUnderline] = useState<{ x: number; y: number; w: number } | null>(null)
+
+  // Track the active word's bounding rect and translate to a position
+  // relative to the editorial body. The single moving underline below
+  // is a CSS-transitioned div — much smoother than per-word reactive
+  // highlight flips, and it gracefully handles overlapping word
+  // timestamps because there's only ever one underline on screen.
+  useLayoutEffect(() => {
+    const container = containerRef.current
+    if (!container || activeWordIdx < 0) {
+      setUnderline(null)
+      return
+    }
+    const wordEl = container.querySelector<HTMLSpanElement>(
+      `[data-word-idx="${activeWordIdx}"]`,
+    )
+    if (!wordEl) {
+      setUnderline(null)
+      return
+    }
+    const cRect = container.getBoundingClientRect()
+    const wRect = wordEl.getBoundingClientRect()
+    setUnderline({
+      x: wRect.left - cRect.left,
+      y: wRect.bottom - cRect.top,
+      w: wRect.width,
+    })
+  }, [activeWordIdx, body.words])
+
+  // Re-measure the underline on window resize so it follows line wraps
+  // when the user resizes their window mid-playback.
+  useEffect(() => {
+    const onResize = () => {
+      const container = containerRef.current
+      if (!container || activeWordIdx < 0) return
+      const wordEl = container.querySelector<HTMLSpanElement>(
+        `[data-word-idx="${activeWordIdx}"]`,
+      )
+      if (!wordEl) return
+      const cRect = container.getBoundingClientRect()
+      const wRect = wordEl.getBoundingClientRect()
+      setUnderline({
+        x: wRect.left - cRect.left,
+        y: wRect.bottom - cRect.top,
+        w: wRect.width,
+      })
+    }
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [activeWordIdx])
+
   if (committed.length === 0 && partialWords.length === 0) {
     return <div className="editorial-body">{body.text}</div>
   }
-  // ONE combined list. Stable keys by position. When a word transitions
-  // from partial (index i was partial) to committed (index i is now in
-  // committed), React keeps the same <span> — only the className flips,
-  // and CSS handles the smooth styling change.
+
+  // ONE combined list. Stable keys by position so a word transitioning
+  // from partial→committed reuses its DOM <span>; only the className
+  // flips, and CSS handles the smooth styling change.
   const committedCount = committed.length
   const total = committedCount + partialWords.length
+  // Show the moving underline only when playback has actually advanced
+  // past the first word — at currentTime=0 the underline at index 0
+  // would just sit there waiting, which is noise.
+  const showUnderline = currentTime > 0 && underline !== null
   return (
-    <div className="editorial-body">
+    <div className="editorial-body" ref={containerRef} style={{ position: 'relative' }}>
       {Array.from({ length: total }).map((_unused, i) => {
         const isPartial = i >= committedCount
         const w = isPartial ? partialWords[i - committedCount] : committed[i]
-        const active = !isPartial && i === activeWordIdx
-        const past = !isPartial && i < activeWordIdx
         const isLast = i === total - 1
         return (
           <Word
             key={i}
+            idx={i}
             word={w.word}
             start={w.start}
-            active={active}
-            past={past}
             partial={isPartial}
             reveal={!isPartial && live && wordArrivals.has(i)}
             isLast={isLast}
           />
         )
       })}
+      {showUnderline && (
+        <span
+          aria-hidden
+          className="text-playhead"
+          style={{
+            position: 'absolute',
+            left: underline.x,
+            top: underline.y + 2,
+            width: underline.w,
+            height: 2,
+            background: 'var(--accent)',
+            borderRadius: 2,
+            pointerEvents: 'none',
+            transition:
+              'left 220ms cubic-bezier(0.22,0.61,0.36,1), top 220ms cubic-bezier(0.22,0.61,0.36,1), width 220ms cubic-bezier(0.22,0.61,0.36,1), opacity 220ms ease-out',
+          }}
+        />
+      )}
     </div>
   )
 }

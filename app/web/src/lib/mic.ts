@@ -176,6 +176,10 @@ export function useMic({
       const PEAK_SAMPLE_INTERVAL_MS = 100
       let lastPeakSampleMs = performance.now()
       let runningPeakSinceLastSample = 0
+      // Smoothed value fed to the hero waveform. Starts at 0 so the first
+      // emitted bar eases up from silence (soft onset, no leading spike)
+      // and adjacent bars don't jump — a "bit smoother" scope.
+      let emaPeak = 0
       const tick = () => {
         if (!analyserRef.current) return
         analyserRef.current.getByteTimeDomainData(buf as unknown as Uint8Array<ArrayBuffer>)
@@ -196,7 +200,13 @@ export function useMic({
           // fake spike).
           const WARMUP_MS = 300
           if (emitPeaksRef.current && now - emitPeaksSinceRef.current >= WARMUP_MS) {
-            onPeakSample?.(Math.min(1, runningPeakSinceLastSample * 3))
+            const raw = Math.min(1, runningPeakSinceLastSample * 3)
+            // Light EMA: fast enough to track speech, smooth enough to
+            // round off lone-sample transients between bars.
+            emaPeak += (raw - emaPeak) * 0.55
+            onPeakSample?.(emaPeak)
+          } else {
+            emaPeak = 0 // keep the smoother reset during warmup/preview
           }
           runningPeakSinceLastSample = 0
           lastPeakSampleMs = now

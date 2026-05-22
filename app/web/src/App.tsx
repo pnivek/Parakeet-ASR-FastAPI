@@ -193,20 +193,27 @@ export default function App() {
     setPartialWords(words)
   }
 
-  /** Live peaks for the hero waveform. Currently driven by the mic's
-   * AnalyserNode (via Sidebar's onPeakSample → onPeaks) at ~10 Hz. We
-   * cap the array to a sliding window so a long mic recording doesn't
-   * grow the peaks array (and the rendered SVG rects) without bound —
-   * when handleResult fires we'll replace with a properly-binned
-   * computePeaks on the final blob. */
-  const PEAKS_LIVE_WINDOW = 300 // ~30s at 10 Hz, plenty of feedback
+  /** Live peaks for the hero waveform, driven by the mic's AnalyserNode
+   * (via Sidebar's onPeakSample → onPeaks) at ~10 Hz.
+   *
+   * We keep a FIXED-LENGTH buffer (not a growing array): the Waveform
+   * stretches its viewBox to 100% width based on element count, so a
+   * growing array makes every bar's position drift as it fills — which
+   * read as "a spike stuck in place while the rest slides". A constant
+   * length means bar positions never move; new audio scrolls in from the
+   * right and old audio scrolls off the left, like an oscilloscope. The
+   * buffer starts as a flat silent line and fills smoothly as you speak.
+   * On final_transcription handleResult replaces it with a binned
+   * computePeaks of the blob (same length → no jump). */
+  const PEAKS_LIVE_BARS = 220
   const handlePeaks = (newPeaks: number[], cumulative: boolean) => {
     setPeaks((prev) => {
-      if (cumulative || prev === null) return newPeaks.slice(-PEAKS_LIVE_WINDOW)
-      const merged = prev.concat(newPeaks)
-      return merged.length > PEAKS_LIVE_WINDOW
-        ? merged.slice(merged.length - PEAKS_LIVE_WINDOW)
-        : merged
+      // Server-pushed cumulative peaks (non-mic) — replace wholesale.
+      if (cumulative) return newPeaks.slice(-PEAKS_LIVE_BARS)
+      const base =
+        prev && prev.length === PEAKS_LIVE_BARS ? prev : new Array(PEAKS_LIVE_BARS).fill(0)
+      const next = base.concat(newPeaks)
+      return next.slice(next.length - PEAKS_LIVE_BARS)
     })
   }
 

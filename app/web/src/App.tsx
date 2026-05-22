@@ -164,7 +164,7 @@ export default function App() {
   /** Clear prior session state right before a new transcribe / record fires.
    * Keeps the UI from flashing the previous transcript while the new one is
    * in flight. */
-  const handleSessionStart = () => {
+  const handleSessionStart = (opts?: { resetHero?: boolean }) => {
     setResult(null)
     setError(null)
     setLive(false)
@@ -177,13 +177,15 @@ export default function App() {
     wordArrivalRef.current = new Map()
     maxSeenSegIdRef.current = -1
     wordArrivalCountRef.current = 0
-    // Full reset of the hero identity + waveform so a new session
-    // doesn't show the previous recording's title/waveform. For
-    // file/url paths the caller re-sets `loaded` immediately via
-    // onAudioReady (no flash, same render tick). For mic the hero
-    // shows a "Recording…" placeholder until the final blob lands.
-    setLoaded(null)
-    setPeaks(null)
+    // Only wipe the hero waveform/identity when explicitly asked (mic =
+    // fresh recording, url = new source). File mode keeps the already-
+    // decoded waveform: clearing it here would null `loaded`, re-trigger
+    // the decode effect (file→null→file), and flash — and a cancelled
+    // re-decode is exactly why the waveform sometimes never came back.
+    if (opts?.resetHero) {
+      setLoaded(null)
+      setPeaks(null)
+    }
   }
 
   const handlePartialSegment = (segment: WhisperSegment | null, words: Word[]) => {

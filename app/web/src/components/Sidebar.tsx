@@ -25,9 +25,12 @@ interface Props {
   onPartial: (result: TranscriptionResponse) => void
   onError: (message: string) => void
   onBusyChange: (busy: boolean) => void
-  /** Called right before a new mic recording starts. Use to clear prior
-   * result/loaded/peaks so the UI doesn't show the previous session. */
-  onSessionStart?: () => void
+  /** Called right before a new transcription/recording starts. Clears
+   * prior transcript state. Pass `{ resetHero: true }` to also wipe the
+   * hero waveform/identity — used by mic (fresh recording) and url; file
+   * mode omits it so an already-decoded waveform persists (no flash /
+   * no redundant re-decode). */
+  onSessionStart?: (opts?: { resetHero?: boolean }) => void
   /** Called early in a streaming session to wire the audio source without
    * setting the final result (so the user can scrub/play during streaming). */
   onAudioReady?: (loaded: LoadedAudio) => void
@@ -358,7 +361,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
 
   const startMic = useCallback(
     async (captureMode: 'live' | 'record' = s.micCaptureMode) => {
-      onSessionStart?.()
+      onSessionStart?.({ resetHero: true })
       cancelPendingPartial()
       segmentsRef.current = []
       wordsRef.current = []
@@ -578,7 +581,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       }
     } else if (mode === 'url') {
       if (!urlInput.trim() || urlInput === 'https://') return
-      onSessionStart?.()
+      onSessionStart?.({ resetHero: true })
       setBusyAll(true)
       const ac = new AbortController()
       restAbortRef.current = ac
@@ -619,7 +622,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       // Record sub-mode with a staged blob: upload via REST so the
       // user gets the full pipeline (auto strategy, refinement, etc).
       if (s.micCaptureMode === 'record' && micBlob) {
-        onSessionStart?.()
+        onSessionStart?.({ resetHero: true })
         setBusyAll(true)
         setProgress(0)
         const ac = new AbortController()

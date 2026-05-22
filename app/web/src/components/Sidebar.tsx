@@ -31,6 +31,9 @@ interface Props {
   /** Called early in a streaming session to wire the audio source without
    * setting the final result (so the user can scrub/play during streaming). */
   onAudioReady?: (loaded: LoadedAudio) => void
+  /** Called when the user removes the staged source (✕ on the file card)
+   * — wipes the hero waveform/metadata/transcript. */
+  onClearSource?: () => void
   /** Progressive PCM peaks from the server — append or replace the hero
    * waveform's peaks array. Lets mic mode draw bars as the user speaks
    * instead of waiting for final_transcription + blob decode. */
@@ -49,7 +52,7 @@ const FORMATS: { id: ResponseFormat; label: string }[] = [
 ]
 const STRATEGIES: Strategy[] = ['auto', 'full', 'chunked', 'progressive']
 
-export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBusyChange, onSessionStart, onAudioReady, onPeaks, onPartialSegment }: Props) {
+export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBusyChange, onSessionStart, onAudioReady, onClearSource, onPeaks, onPartialSegment }: Props) {
   const s = useSettings()
   const [tab, setTab] = useState<SidebarTab>('source')
   const [busy, setBusy] = useState(false)
@@ -768,6 +771,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             onModeChange={onModeChange}
             pickedFile={pickedFile}
             setPickedFile={setPickedFile}
+            onClearSource={onClearSource}
             micBlob={micBlob}
             setMicBlob={setMicBlob}
             dragOver={dragOver}
@@ -883,6 +887,7 @@ function SourcePane({
   onModeChange,
   pickedFile,
   setPickedFile,
+  onClearSource,
   micBlob,
   setMicBlob,
   dragOver,
@@ -901,6 +906,7 @@ function SourcePane({
   onModeChange: (m: InputMode) => void
   pickedFile: File | null
   setPickedFile: (f: File | null) => void
+  onClearSource?: () => void
   micBlob: File | null
   setMicBlob: (f: File | null) => void
   dragOver: boolean
@@ -1012,6 +1018,7 @@ function SourcePane({
                   e.stopPropagation()
                   setPickedFile(null)
                   if (fileInputRef.current) fileInputRef.current.value = ''
+                  onClearSource?.()
                 }}
               >
                 <svg

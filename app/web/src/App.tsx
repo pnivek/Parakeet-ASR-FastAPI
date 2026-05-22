@@ -222,6 +222,21 @@ export default function App() {
     }
   }
 
+  /** Wipe the hero (waveform + metadata + transcript) when the user
+   * removes the staged source — e.g. clicking ✕ on the file card. */
+  const handleClearSource = () => {
+    setLoaded(null)
+    setResult(null)
+    setError(null)
+    setLive(false)
+    setPartialSegment(null)
+    setPartialWords([])
+    setPeaks(null)
+    setTtfs(null)
+    ttfsRef.current = null
+    setAudioFile(null)
+  }
+
   useEffect(() => {
     if (error) setBusy(false)
   }, [error])
@@ -268,6 +283,7 @@ export default function App() {
             onBusyChange={setBusy}
             onSessionStart={handleSessionStart}
             onAudioReady={handleAudioReady}
+            onClearSource={handleClearSource}
             onPeaks={handlePeaks}
             onPartialSegment={handlePartialSegment}
           />

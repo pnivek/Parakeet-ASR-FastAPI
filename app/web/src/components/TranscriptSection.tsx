@@ -49,62 +49,46 @@ export function TranscriptSection({
 }: Props) {
   const [view, setView] = useState<View>('text')
   const bodyRef = useRef<HTMLDivElement | null>(null)
-  // `stuck` = pinned to the bottom (auto-follow). The user scrolling up
-  // breaks the pin; the Follow button (or scrolling back to the bottom)
-  // restores it. `stuckRef` mirrors it for the rAF loop; `programmaticRef`
-  // marks our own scroll writes so onScroll doesn't mistake them for the
-  // user scrolling.
+  // `stuck` = pinned to the bottom (auto-follow). Scrolling up breaks
+  // the pin; scrolling back to the bottom (or the Follow button) restores
+  // it. `lastTopRef` lets us tell a user scroll-up from our own writes:
+  // auto-follow only ever scrolls DOWN, so any decrease in scrollTop is
+  // the user.
   const [stuck, setStuck] = useState(true)
-  const stuckRef = useRef(true)
-  const programmaticRef = useRef(false)
-  const pin = (v: boolean) => {
-    stuckRef.current = v
-    setStuck(v)
+  const lastTopRef = useRef(0)
+  const followBottom = () => {
+    const el = bodyRef.current
+    if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
   }
 
   // Re-pin whenever a fresh live stream begins.
   useEffect(() => {
-    if (live) pin(true)
+    if (live) setStuck(true)
   }, [live])
 
-  // Smooth auto-follow: ease scrollTop toward the bottom every frame
-  // while pinned + live. Decoupling the scroll from the per-partial
-  // cadence (which arrives ~4×/s in lumpy chunks) removes the bumpy
-  // teleport-on-every-update; the bottom is a moving target the easing
-  // glides toward.
+  // Follow new content while streaming + pinned. One smooth scroll per
+  // update (~4×/s) toward the *real* bottom — so it can't fall behind,
+  // and there's no per-frame reflow to jank the render.
   useEffect(() => {
-    if (!live) return
-    let raf = 0
-    const step = () => {
-      const el = bodyRef.current
-      if (el && stuckRef.current) {
-        const target = el.scrollHeight - el.clientHeight
-        const diff = target - el.scrollTop
-        if (diff > 0.5) {
-          programmaticRef.current = true
-          // ease ~22%/frame, with a small floor so it always closes the
-          // last pixel or two instead of crawling asymptotically.
-          el.scrollTop += diff > 6 ? diff * 0.22 : diff
-        }
-      }
-      raf = requestAnimationFrame(step)
-    }
-    raf = requestAnimationFrame(step)
-    return () => cancelAnimationFrame(raf)
-  }, [live])
+    if (live && stuck) followBottom()
+  }, [live, stuck, result, partialSegment, partialWords, view])
 
   const onBodyScroll = () => {
     const el = bodyRef.current
     if (!el) return
-    // Ignore the easing loop's own writes — only react to user scrolls.
-    if (programmaticRef.current) {
-      programmaticRef.current = false
-      return
+    const cur = el.scrollTop
+    const dist = el.scrollHeight - cur - el.clientHeight
+    if (cur < lastTopRef.current - 6) {
+      setStuck(false) // user dragged up
+    } else if (dist < 40) {
+      setStuck(true) // back at the bottom
     }
-    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
-    pin(distFromBottom < 40)
+    lastTopRef.current = cur
   }
-  const snapToBottom = () => pin(true) // the rAF loop eases it down smoothly
+  const snapToBottom = () => {
+    setStuck(true)
+    followBottom()
+  }
 
   // Empty state — nothing committed and nothing streaming yet.
   if (!result && !partialSegment) {

@@ -1635,6 +1635,36 @@ async def _watch_request_disconnect(
         logger.warning(f"({request_id}) REST: disconnect watcher error: {e}")
 
 
+async def _watch_ws_disconnect(
+    websocket: WebSocket,
+    cancel_event: threading.Event,
+    session_id: str,
+) -> None:
+    """Set `cancel_event` when the WS client goes away mid-inference.
+
+    Same idea as the REST watcher: a disconnected client shouldn't leave a
+    long offline transcription running to completion holding the model
+    lock. Detected by awaiting receive() — a closed socket yields a
+    `websocket.disconnect` message (or raises once already closed).
+    Only run AFTER the accumulate loop has stopped receiving, so there's
+    no competing reader.
+    """
+    try:
+        while not cancel_event.is_set():
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                cancel_event.set()
+                logger.info(f"({session_id}) WS: client disconnected — cancelling in-flight transcription.")
+                return
+            # Ignore any stray frames sent after EOF.
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        # receive() raises once the socket is gone — treat as disconnect.
+        cancel_event.set()
+        logger.info(f"({session_id}) WS: receive ended — cancelling in-flight transcription.")
+
+
 async def _transcribe_chunked(
     waveform: torch.Tensor,
     audio_duration_s: float,
@@ -2294,8 +2324,15 @@ async def _ws_accumulate_then_process(
         f"Duration={audio_duration_s:.2f}s, long-audio={long_audio_active}, strategy={resolved_strategy.value}"
     )
 
+    # Watch for a mid-inference disconnect so a cancelled job doesn't run
+    # to completion holding the model lock (mirrors the REST path). The
+    # chunked engine polls cancel_event between chunks and bails.
+    cancel_event = threading.Event()
+    ws_watcher = asyncio.create_task(_watch_ws_disconnect(websocket, cancel_event, session_id))
     try:
         if resolved_strategy == ProcessingStrategy.FULL:
+            # FULL is a single pass — not cooperatively cancellable, but the
+            # watcher still lets us skip the final send below.
             segments, asr_t = await _transcribe_full(
                 waveform=waveform,
                 audio_duration_s=audio_duration_s,
@@ -2307,8 +2344,10 @@ async def _ws_accumulate_then_process(
                 audio_duration_s=audio_duration_s,
                 client_config=client_config,
                 request_id=f"WS-{session_id}",
+                cancel_event=cancel_event,
             )
     finally:
+        ws_watcher.cancel()
         # Revert under the lock owner's lifecycle (we are still inside the lock).
         await _revert_model_to_global_original_state(
             long_audio_settings_were_active_for_session=long_audio_active,
@@ -2316,7 +2355,7 @@ async def _ws_accumulate_then_process(
             request_id=f"{session_id}-{log_prefix.lower().replace(' ', '_')}_revert",
         )
 
-    if websocket.application_state != WebSocketState.CONNECTED:
+    if cancel_event.is_set() or websocket.application_state != WebSocketState.CONNECTED:
         logger.info(f"({session_id}) {log_prefix}: client disconnected before final transcription.")
         return None
 

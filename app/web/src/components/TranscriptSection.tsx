@@ -48,68 +48,80 @@ export function TranscriptSection({
   partialWords,
 }: Props) {
   const [view, setView] = useState<View>('text')
+  const bodyRef = useRef<HTMLDivElement | null>(null)
+  // `stuck` = pinned to the bottom (auto-follow). The user scrolling up
+  // breaks the pin; the Follow button (and reaching the bottom again)
+  // restores it.
+  const [stuck, setStuck] = useState(true)
 
-  // No committed transcript yet — but if the engine is already
-  // streaming an in-flight partial, render that. Otherwise show the
-  // empty state.
-  if (!result) {
-    if (!partialSegment) {
-      return (
-        <section className="transcript">
-          <div className="transcript__head">
-            <div className="transcript__head-l">
-              <span className="label-eyebrow">TRANSCRIPT</span>
-            </div>
-          </div>
-          <div className="empty">Pick a source on the right to begin.</div>
-        </section>
-      )
-    }
-    const partialOnlyBody: VerboseJsonResponse = {
-      task: 'transcribe',
-      language: 'en',
-      duration: partialSegment.end,
-      text: '',
-      segments: [],
-      words: [],
-      strategy: 'progressive',
-      transcription_time_seconds: 0,
-    }
+  // Re-pin whenever a fresh live stream begins.
+  useEffect(() => {
+    if (live) setStuck(true)
+  }, [live])
+
+  // Follow new content while streaming + pinned. Runs on every partial
+  // (result identity changes per dispatch) and on view switches.
+  useEffect(() => {
+    if (!live || !stuck) return
+    const el = bodyRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [live, stuck, result, partialSegment, partialWords, view])
+
+  const onBodyScroll = () => {
+    const el = bodyRef.current
+    if (!el) return
+    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+    setStuck(distFromBottom < 40)
+  }
+  const snapToBottom = () => {
+    const el = bodyRef.current
+    if (el) el.scrollTop = el.scrollHeight
+    setStuck(true)
+  }
+
+  // Empty state — nothing committed and nothing streaming yet.
+  if (!result && !partialSegment) {
     return (
       <section className="transcript">
         <div className="transcript__head">
           <div className="transcript__head-l">
             <span className="label-eyebrow">TRANSCRIPT</span>
-            <span className="format-pill">verbose_json</span>
           </div>
         </div>
-        <div className="transcript__body">
-          <VerboseBody
-            body={partialOnlyBody}
-            view={view}
-            currentTime={currentTime}
-            filename={filename}
-            live={live}
-            segmentArrivals={segmentArrivals}
-            wordArrivals={wordArrivals}
-            partialSegment={partialSegment}
-            partialWords={partialWords ?? []}
-          />
-        </div>
+        <div className="empty">Pick a source on the right to begin.</div>
       </section>
     )
   }
 
-  const isVerbose = result.format === 'verbose_json'
+  // Verbose body: a committed verbose result, or a synthetic body when
+  // only an in-flight partial exists (so the view tabs are usable from
+  // the very first streamed token).
+  const verboseBody: VerboseJsonResponse | null =
+    result?.format === 'verbose_json'
+      ? result.body
+      : !result && partialSegment
+        ? {
+            task: 'transcribe',
+            language: 'en',
+            duration: partialSegment.end,
+            text: '',
+            segments: [],
+            words: [],
+            strategy: 'progressive',
+            transcription_time_seconds: 0,
+          }
+        : null
+
+  const formatLabel = result ? result.format : 'verbose_json'
 
   return (
     <section className="transcript">
       <div className="transcript__head">
         <div className="transcript__head-l">
           <span className="label-eyebrow">TRANSCRIPT</span>
-          <span className="format-pill">{result.format}</span>
+          <span className="format-pill">{formatLabel}</span>
         </div>
-        {isVerbose && (
+        {verboseBody && (
           <div className="ma-segmented">
             {VIEWS.map((v) => (
               <button
@@ -124,16 +136,16 @@ export function TranscriptSection({
           </div>
         )}
       </div>
-      <div className="transcript__body">
-        {result.format === 'json' && (
+      <div className="transcript__body" ref={bodyRef} onScroll={onBodyScroll}>
+        {result?.format === 'json' && (
           <Code text={JSON.stringify(result.body, null, 2)} filename={filename} />
         )}
-        {result.format === 'text' && <div className="editorial-body">{result.body}</div>}
-        {result.format === 'srt' && <Code text={result.body} filename={filename} />}
-        {result.format === 'vtt' && <Code text={result.body} filename={filename} />}
-        {isVerbose && (
+        {result?.format === 'text' && <div className="editorial-body">{result.body}</div>}
+        {result?.format === 'srt' && <Code text={result.body} filename={filename} />}
+        {result?.format === 'vtt' && <Code text={result.body} filename={filename} />}
+        {verboseBody && (
           <VerboseBody
-            body={result.body}
+            body={verboseBody}
             view={view}
             currentTime={currentTime}
             filename={filename}
@@ -145,6 +157,14 @@ export function TranscriptSection({
           />
         )}
       </div>
+      {live && !stuck && (
+        <button type="button" className="transcript__follow" onClick={snapToBottom}>
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <path d="M12 5v14M5 12l7 7 7-7" />
+          </svg>
+          Follow
+        </button>
+      )}
     </section>
   )
 }

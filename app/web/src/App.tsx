@@ -114,6 +114,13 @@ export default function App() {
       // URL ingest: we don't have the bytes locally, so no playback / peaks.
       setAudioFile(null)
     }
+    // Duration fallback from the server's reported duration. Mic
+    // recordings are WebM/Opus blobs whose <audio> element duration is
+    // unreliable (often Infinity/0), which left the hero timeline stuck
+    // at 0:00. setAudioFile above resets the hint, so set it after.
+    if (r.format === 'verbose_json' && r.body.duration > 0) {
+      setDurationHint(r.body.duration)
+    }
   }
 
   /** One-shot capture of time-to-first-segment, the first time a

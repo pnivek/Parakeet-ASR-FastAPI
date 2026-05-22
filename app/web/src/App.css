@@ -891,6 +891,33 @@ body {
   padding-top: 22px;
   display: flex;
   flex-direction: column;
+  position: relative;
+}
+/* "Follow" pill — appears when the user scrolls up mid-stream; clicking
+   re-pins the transcript to the bottom and resumes auto-follow. */
+.transcript__follow {
+  position: absolute;
+  bottom: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--bg);
+  background: var(--accent);
+  border: none;
+  cursor: pointer;
+  box-shadow: 0 6px 20px -6px rgba(0, 0, 0, 0.6);
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+.transcript__follow:hover {
+  background: color-mix(in oklch, var(--accent) 88%, white);
 }
 .transcript__head {
   display: flex;

@@ -176,23 +176,27 @@ export async function fastWavPeaks(file: Blob, bins = 220): Promise<number[]> {
   const framesPerBin = Math.floor(totalFrames / bins)
   if (framesPerBin === 0) return new Array(bins).fill(0)
 
-  // Stride within each bin: cap at ~256 reads per bin. For a 3hr 16kHz
-  // mono file that's frames_per_bin ≈ 785k → stride ≈ 3070 → ~256
-  // samples sampled per bin, ~56k total. Plenty for visual peaks.
-  const stride = Math.max(1, Math.floor(framesPerBin / 256))
-
+  // CRITICAL: only read a small representative WINDOW at the start of
+  // each bin — NOT the whole bin. Reading the entire bin range means
+  // reading the whole file (220 bins × framesPerBin = totalFrames),
+  // which for a multi-hour WAV is hundreds of MB across 220 parallel
+  // arrayBuffer() allocations → OOM/hang and no waveform. A 2048-frame
+  // window per bin keeps total reads to ~900 KB regardless of length.
+  const WINDOW_FRAMES = 2048
   const readBin = async (b: number): Promise<number> => {
     const frameStart = b * framesPerBin
-    const framesToRead = Math.min(framesPerBin, totalFrames - frameStart)
+    const framesAvail = Math.min(framesPerBin, totalFrames - frameStart)
+    const framesToRead = Math.min(WINDOW_FRAMES, framesAvail)
+    if (framesToRead <= 0) return 0
     const byteStart = dataOffset + frameStart * bytesPerFrame
     const byteEnd = byteStart + framesToRead * bytesPerFrame
     const buf = await file.slice(byteStart, byteEnd).arrayBuffer()
     const view = new DataView(buf)
     let peak = 0
     if (formatCode === 1 && bitsPerSample === 16) {
-      // Fast path: 16-bit PCM via Int16Array. Channel 0 only.
+      // 16-bit PCM via Int16Array. Channel 0 only (step by channels).
       const samples = new Int16Array(buf)
-      for (let i = 0; i < samples.length; i += stride * channels) {
+      for (let i = 0; i < samples.length; i += channels) {
         const v = Math.abs(samples[i])
         if (v > peak) peak = v
       }
@@ -200,32 +204,30 @@ export async function fastWavPeaks(file: Blob, bins = 220): Promise<number[]> {
     }
     if (formatCode === 1 && bitsPerSample === 24) {
       // 24-bit little-endian PCM, channel 0 only.
-      const sampleBytes = 3
-      for (let f = 0; f < framesToRead; f += stride) {
+      for (let f = 0; f < framesToRead; f++) {
         const o = f * bytesPerFrame
-        // Sign-extend 24-bit value.
+        if (o + 3 > buf.byteLength) break
         const lo = view.getUint8(o)
         const mid = view.getUint8(o + 1)
-        const hi = view.getInt8(o + 2)
+        const hi = view.getInt8(o + 2) // sign-extends
         const v = Math.abs((hi << 16) | (mid << 8) | lo)
         if (v > peak) peak = v
-        if (o + sampleBytes > buf.byteLength - 1) break
       }
       return peak / (1 << 23)
     }
     if (formatCode === 3 && bitsPerSample === 32) {
       // IEEE float32, channel 0 only.
       const samples = new Float32Array(buf)
-      for (let i = 0; i < samples.length; i += stride * channels) {
+      for (let i = 0; i < samples.length; i += channels) {
         const v = Math.abs(samples[i])
         if (v > peak) peak = v
       }
       return peak
     }
     if (formatCode === 1 && bitsPerSample === 32) {
-      // 32-bit PCM (rare). Treat as Int32Array.
+      // 32-bit PCM (rare). Int32Array.
       const samples = new Int32Array(buf)
-      for (let i = 0; i < samples.length; i += stride * channels) {
+      for (let i = 0; i < samples.length; i += channels) {
         const v = Math.abs(samples[i])
         if (v > peak) peak = v
       }

@@ -247,6 +247,11 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
               },
             },
           )
+          // Final result is in — tear the socket down promptly rather
+          // than waiting for the server's close frame. abort() closes
+          // with code 1000 so the own-checked onClose won't error-toast.
+          wsRef.current?.abort()
+          wsRef.current = null
           break
         }
         // 'peaks' messages from the server are ignored here. Mic-mode
@@ -359,7 +364,8 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       // Live mode: open the WS, then start the mic.
       const wsStrategy: Strategy =
         s.strategy === 'auto' || s.strategy === 'progressive' ? 'progressive' : s.strategy
-      const ws = connectLiveWS(
+      let liveWs: LiveWSHandle
+      liveWs = connectLiveWS(
         {
           sample_rate: MIC_SAMPLE_RATE,
           channels: 1,
@@ -381,11 +387,15 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             if (code !== 1000 && code !== 1005) {
               onError(`WebSocket closed: code=${code} reason=${reason || 'no reason'}`)
             }
-            wsRef.current = null
+            // Only clear the ref if it still points at THIS socket — a
+            // newer recording may have already replaced it. Without this
+            // guard a late close from a previous session nulls the live
+            // socket and chunks stop being forwarded.
+            if (wsRef.current === liveWs) wsRef.current = null
           },
         },
       )
-      wsRef.current = ws
+      wsRef.current = liveWs
       await mic.start()
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -423,7 +433,8 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         setBusyAll(true)
         try {
           const fileExt = pickedFile.name.split('.').pop()?.toLowerCase() || 'wav'
-          const ws = streamFileViaWS(
+          let fileWs: LiveWSHandle
+          fileWs = streamFileViaWS(
             pickedFile,
             {
               sample_rate: 16000,
@@ -499,12 +510,12 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
                 if (code !== 1000 && code !== 1005) {
                   onError(`WebSocket closed: code=${code} reason=${reason || 'no reason'}`)
                 }
-                wsRef.current = null
+                if (wsRef.current === fileWs) wsRef.current = null
                 setBusyAll(false)
               },
             },
           )
-          wsRef.current = ws
+          wsRef.current = fileWs
         } catch (e) {
           onError(e instanceof Error ? e.message : String(e))
           setBusyAll(false)
@@ -682,8 +693,15 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   const transcribeIsAccent = busy || recording
   const transcribeShowsIcon = transcribeLabel === 'Transcribe'
   const onCommitClick = () => {
-    if (busy && mode !== 'mic') {
+    // Anything in flight (REST upload for file / url / mic-record, or a
+    // file+progressive WS stream) → the button acts as a hard cancel.
+    if (busy) {
       cancelInFlight()
+      return
+    }
+    // A live mic recording → Stop means "finish & transcribe the rest".
+    if (mode === 'mic' && recording) {
+      mic.stop()
       return
     }
     void transcribe()
@@ -762,8 +780,6 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             mode={mode}
             micCaptureMode={s.micCaptureMode}
             longAudioThreshold={s.longAudioThreshold}
-            batchSize={s.batchSize}
-            chunkLength={s.chunkLength}
             liveLatency={s.liveLatency}
             progressiveRefinement={s.progressiveRefinement}
             vadEnabled={s.vadEnabled}
@@ -775,8 +791,6 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             hpfHz={s.hpfHz}
             noiseSuppression={s.noiseSuppression}
             setLong={(v) => s.set('longAudioThreshold', v)}
-            setBatch={(v) => s.set('batchSize', v)}
-            setChunkLen={(v) => s.set('chunkLength', v)}
             setLiveLatency={(v) => s.set('liveLatency', v)}
             setProgRefine={(v) => s.set('progressiveRefinement', v)}
             setVadEnabled={(v) => s.set('vadEnabled', v)}
@@ -1255,8 +1269,6 @@ function EnginePane({
   mode,
   micCaptureMode,
   longAudioThreshold,
-  batchSize,
-  chunkLength,
   liveLatency,
   progressiveRefinement,
   vadEnabled,
@@ -1268,8 +1280,6 @@ function EnginePane({
   hpfHz,
   noiseSuppression,
   setLong,
-  setBatch,
-  setChunkLen,
   setLiveLatency,
   setProgRefine,
   setVadEnabled,
@@ -1286,8 +1296,6 @@ function EnginePane({
   mode: InputMode
   micCaptureMode: 'live' | 'record'
   longAudioThreshold: number | null
-  batchSize: number | null
-  chunkLength: number | null
   liveLatency: boolean
   progressiveRefinement: boolean
   vadEnabled: boolean
@@ -1299,8 +1307,6 @@ function EnginePane({
   hpfHz: number | null
   noiseSuppression: boolean
   setLong: (v: number | null) => void
-  setBatch: (v: number | null) => void
-  setChunkLen: (v: number | null) => void
   setLiveLatency: (v: boolean) => void
   setProgRefine: (v: boolean) => void
   setVadEnabled: (v: boolean) => void
@@ -1312,14 +1318,21 @@ function EnginePane({
   setHpfHz: (v: number | null) => void
   setNoiseSuppression: (v: boolean) => void
 }) {
-  // Each setting only shows in the modes where it actually matters.
-  // - `file`, `url`, and `mic+record` all go through the REST file
-  //   upload path, so they share batch/chunk/threshold/refinement.
-  // - `mic+live` is the only path that uses live_latency, VAD, and
-  //   the browser-side mic-input quality knobs (hpf, noise_supp).
+  // Each setting only shows on the path that actually uses it, so we
+  // never present a knob that silently does nothing.
+  //
+  // Two server paths:
+  //  - STREAMING (WebSocket): mic+live, and file+progressive. Processes
+  //    audio chunk-by-chunk as it arrives. Uses progressive_refinement
+  //    (+ live_latency / VAD for mic). Does NOT use batch_size /
+  //    chunk_length / long_audio_threshold — those are batch knobs.
+  //  - REST UPLOAD: file (chunked/full/auto), url, mic+record. The
+  //    whole file is decoded server-side, so batch_size / chunk_length
+  //    / long_audio_threshold apply here.
   const isMicLive = mode === 'mic' && micCaptureMode === 'live'
   const isMicAny = mode === 'mic'
-  const isRestPath = !isMicLive
+  const isStreaming = isMicLive || (mode === 'file' && strategy === 'progressive')
+  const isRestUpload = !isStreaming
   return (
     <div>
       <SBLabel>Strategy</SBLabel>
@@ -1342,15 +1355,20 @@ function EnginePane({
 
       <SBLabel top={22}>Advanced</SBLabel>
       <div className="sb__adv-list">
-        {isRestPath && (
+        {isRestUpload && (
           <>
+            {/* long_audio_threshold is the only offline knob the engine
+                actually honors (picks long-audio model settings). The
+                chunked engine processes sequentially at a fixed internal
+                chunk size, so client batch_size / chunk_length had no
+                effect — removed rather than ship dead controls. */}
             <NumKv k="long_audio_threshold" v={longAudioThreshold} placeholder={480} suffix="s" onSet={setLong} />
-            <NumKv k="batch_size" v={batchSize} placeholder={4} onSet={setBatch} />
-            <NumKv k="chunk_length" v={chunkLength} placeholder={30} suffix="s" onSet={setChunkLen} />
           </>
         )}
         {isMicLive && <ToggleKv k="live_latency" v={liveLatency} onSet={setLiveLatency} />}
-        <ToggleKv k="progressive_refinement" v={progressiveRefinement} onSet={setProgRefine} />
+        {isStreaming && (
+          <ToggleKv k="progressive_refinement" v={progressiveRefinement} onSet={setProgRefine} />
+        )}
 
         {isMicAny && (
           <>

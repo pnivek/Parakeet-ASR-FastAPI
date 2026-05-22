@@ -80,7 +80,10 @@ export function HeroRow({ loaded, peaks, state, language = 'en' }: Props) {
           </div>
         </div>
         <h1 className="hero__title">
-          {loaded?.title || 'Drop audio, paste a URL, or record to begin.'}
+          {loaded?.title ||
+            (state === 'streaming'
+              ? 'Recording…'
+              : 'Drop audio, paste a URL, or record to begin.')}
         </h1>
         <div className="hero__meta">
           {loaded?.source && (

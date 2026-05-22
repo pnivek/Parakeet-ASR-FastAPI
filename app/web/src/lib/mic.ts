@@ -96,6 +96,11 @@ export function useMic({
    * shouldn't populate the hero waveform. Mutable so the single tick
    * loop survives a listen→record upgrade without restarting. */
   const emitPeaksRef = useRef<boolean>(false)
+  /** Timestamp (performance.now) when peak emission was enabled. The
+   * first ~300ms of mic/recorder startup is a transient that shows up
+   * as a fake spike at the start of the waveform — we skip emitting
+   * peaks until it settles. */
+  const emitPeaksSinceRef = useRef<number>(0)
 
   const cleanup = useCallback(() => {
     if (rafRef.current !== null) {
@@ -181,8 +186,11 @@ export function useMic({
         }
         const now = performance.now()
         if (now - lastPeakSampleMs >= PEAK_SAMPLE_INTERVAL_MS) {
-          // Only feed the hero waveform while actually recording.
-          if (emitPeaksRef.current) {
+          // Only feed the hero waveform while actually recording, and
+          // skip the startup transient (else the waveform opens with a
+          // fake spike).
+          const WARMUP_MS = 300
+          if (emitPeaksRef.current && now - emitPeaksSinceRef.current >= WARMUP_MS) {
             onPeakSample?.(Math.min(1, runningPeakSinceLastSample * 3))
           }
           runningPeakSinceLastSample = 0
@@ -239,6 +247,7 @@ export function useMic({
       const stream = streamRef.current ?? (await acquireStream())
       streamRef.current = stream
       emitPeaksRef.current = true
+      emitPeaksSinceRef.current = performance.now()
       attachAnalyser(stream)
 
       const recorder = new MediaRecorder(stream, { mimeType: MIC_MIME_TYPE })

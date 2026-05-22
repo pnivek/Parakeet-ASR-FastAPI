@@ -237,9 +237,19 @@ export function connectLiveWS(config: WSConfig, callbacks: WSCallbacks): LiveWSH
   const socket = new WebSocket(wsUrl)
 
   let configSent = false
+  // Binary chunks that arrived before the socket finished opening. The
+  // FIRST MediaRecorder chunk carries the WebM initialization segment —
+  // if it's dropped during the connect race the server's decoder gets a
+  // headerless stream and produces no audio (hence no segments). Queue
+  // anything early and flush in order once the config frame is sent.
+  const pending: (Blob | ArrayBuffer)[] = []
+  let finishRequested = false
   socket.onopen = () => {
     socket.send(JSON.stringify(config))
     configSent = true
+    for (const chunk of pending) socket.send(chunk)
+    pending.length = 0
+    if (finishRequested) socket.send(new ArrayBuffer(0))
     callbacks.onOpen?.()
   }
   socket.onmessage = (ev) => {
@@ -256,14 +266,21 @@ export function connectLiveWS(config: WSConfig, callbacks: WSCallbacks): LiveWSH
 
   return {
     sendBinary(data) {
+      // Queue until the config frame is out, then the onopen handler
+      // flushes in arrival order — never drop the init segment.
       if (!configSent) {
-        console.warn('connectLiveWS: dropped binary chunk — WS not open yet')
+        pending.push(data)
         return
       }
       socket.send(data)
     },
     finish() {
-      // Empty binary frame is the documented EOF signal in the WS protocol.
+      // Empty binary frame is the documented EOF signal. If the socket
+      // hasn't opened yet, defer it so it's sent after the queued chunks.
+      if (!configSent) {
+        finishRequested = true
+        return
+      }
       try {
         socket.send(new ArrayBuffer(0))
       } catch (e) {

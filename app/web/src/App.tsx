@@ -64,6 +64,7 @@ export default function App() {
   useEffect(() => {
     if (!loadedFile) {
       setPeaks(null)
+      setDurationHint(0)
       return
     }
     let cancelled = false
@@ -153,9 +154,13 @@ export default function App() {
     wordArrivalRef.current = new Map()
     maxSeenSegIdRef.current = -1
     wordArrivalCountRef.current = 0
-    // Don't clear peaks here — the effect above will reset/decode based on
-    // the next `loaded.file` change. Clearing now would create a flicker
-    // when the same file is re-transcribed.
+    // Full reset of the hero identity + waveform so a new session
+    // doesn't show the previous recording's title/waveform. For
+    // file/url paths the caller re-sets `loaded` immediately via
+    // onAudioReady (no flash, same render tick). For mic the hero
+    // shows a "Recording…" placeholder until the final blob lands.
+    setLoaded(null)
+    setPeaks(null)
   }
 
   const handlePartialSegment = (segment: WhisperSegment | null, words: Word[]) => {

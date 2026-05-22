@@ -50,6 +50,36 @@ body {
   background: color-mix(in oklch, var(--accent) 32%, transparent);
 }
 
+/* ── Themed scrollbars ────────────────────────────────────────────
+ * Thin, transparent track, hairline thumb that brightens on hover.
+ * The transparent border + padding-box clip insets the thumb so it
+ * reads as a slim pill rather than a chunky native bar. Firefox uses
+ * the scrollbar-* shorthands. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.13);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.26);
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
 .mono {
   font-family: var(--font-mono);
 }

@@ -66,6 +66,10 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   // File state
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [pickedFile, setPickedFile] = useState<File | null>(null)
+  // Mic *recording* staged blob — kept separate from `pickedFile` so a
+  // file chosen in upload mode never shows up as a staged recording in
+  // the mic pane (and vice versa).
+  const [micBlob, setMicBlob] = useState<File | null>(null)
   const [dragOver, setDragOver] = useState(false)
   const onFiles = (files: FileList | null) => {
     if (!files || files.length === 0) return
@@ -97,15 +101,24 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   const recordStartRef = useRef<number>(0)
   const [recordElapsed, setRecordElapsed] = useState(0)
 
-  // ── Auto-drop progressive when mode is URL ───────────────────
-  // progressive is available for mic (WS) and file (WS-stream). URL mode
-  // uses server-side fetch over REST, so progressive isn't supported.
+  // ── Keep the engine (strategy) valid for the current source ──
+  // Backend reality:
+  //  - mic + live  → live partials come ONLY from the progressive
+  //    streaming path, so live transcription IS progressive. Lock it.
+  //  - url / mic+record → REST upload; progressive isn't available
+  //    (URL is server-fetched; a finished recording is a plain blob).
+  // file keeps the full choice (progressive streams over WS).
   useEffect(() => {
-    if (mode === 'url' && s.strategy === 'progressive') {
+    if (mode === 'mic' && s.micCaptureMode === 'live') {
+      if (s.strategy !== 'progressive') s.set('strategy', 'progressive')
+    } else if (
+      (mode === 'url' || (mode === 'mic' && s.micCaptureMode === 'record')) &&
+      s.strategy === 'progressive'
+    ) {
       s.set('strategy', 'auto')
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode])
+  }, [mode, s.micCaptureMode])
   // Strategy actually sent over REST (file-non-progressive / URL). If the
   // user has progressive selected but we're falling back to REST (URL
   // mode), map to chunked so the backend doesn't 400.
@@ -282,12 +295,12 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         return
       }
       // Record mode: build a File from the accumulated chunks and
-      // stage it as pickedFile. The user clicks Transcribe to send it
+      // stage it as `micBlob`. The user clicks Transcribe to send it
       // through the REST upload path.
       if (chunksRef.current.length === 0) return
       const blob = new Blob(chunksRef.current, { type: MIC_MIME_TYPE })
       const file = new File([blob], `recording-${Date.now()}.webm`, { type: MIC_MIME_TYPE })
-      setPickedFile(file)
+      setMicBlob(file)
     },
     onError: (err) => {
       onError(err.message)
@@ -351,13 +364,13 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       setRecordElapsed(0)
       // Record mode skips the WS entirely — useMic still records to
       // chunksRef, and the onStop handler stages the resulting blob
-      // as pickedFile + routes through the REST file path on
+      // as `micBlob` + routes through the REST file path on
       // Transcribe click.
       if (captureMode === 'record') {
         // Make sure any prior recording / WS is cleared so the new
         // blob can be staged cleanly.
         wsRef.current = null
-        setPickedFile(null)
+        setMicBlob(null)
         await mic.start()
         return
       }
@@ -602,7 +615,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       }
       // Record sub-mode with a staged blob: upload via REST so the
       // user gets the full pipeline (auto strategy, refinement, etc).
-      if (s.micCaptureMode === 'record' && pickedFile) {
+      if (s.micCaptureMode === 'record' && micBlob) {
         onSessionStart?.()
         setBusyAll(true)
         setProgress(0)
@@ -610,7 +623,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         restAbortRef.current = ac
         try {
           const r = await postTranscription(
-            pickedFile,
+            micBlob,
             {
               response_format: s.responseFormat,
               timestamp_granularities: s.timestampGranularities,
@@ -627,7 +640,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
               kind: 'file',
               title: `recording — ${new Date().toLocaleTimeString()}`,
               source: 'mic · recorded',
-              file: pickedFile,
+              file: micBlob,
             },
             r,
           )
@@ -643,7 +656,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       }
       startMic(s.micCaptureMode).catch((e) => onError(e instanceof Error ? e.message : String(e)))
     }
-  }, [mode, pickedFile, urlInput, s, recording, mic, startMic, onResult, onPartial, onError, setBusyAll, onSessionStart, onAudioReady])
+  }, [mode, pickedFile, micBlob, urlInput, s, recording, mic, startMic, onResult, onPartial, onError, setBusyAll, onSessionStart, onAudioReady])
 
   // Tear down whatever's in flight for file/url. Mic uses its own
   // record/stop path via mic.stop() — handled inside transcribe().
@@ -685,7 +698,11 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
     if (busy) return mode === 'mic' ? 'Working' : 'Stop'
     if (mode === 'mic') {
       if (recording) return 'Stop'
-      if (s.micCaptureMode === 'record' && pickedFile) return 'Transcribe'
+      // Live mode transcribes as it streams — the button starts the
+      // live session, so it reads "Transcribe", not "Record".
+      if (s.micCaptureMode === 'live') return 'Transcribe'
+      // Record mode: "Transcribe" once a clip is staged, else "Record".
+      if (micBlob) return 'Transcribe'
       return 'Record'
     }
     return 'Transcribe'
@@ -751,6 +768,8 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             onModeChange={onModeChange}
             pickedFile={pickedFile}
             setPickedFile={setPickedFile}
+            micBlob={micBlob}
+            setMicBlob={setMicBlob}
             dragOver={dragOver}
             setDragOver={setDragOver}
             fileInputRef={fileInputRef}
@@ -864,6 +883,8 @@ function SourcePane({
   onModeChange,
   pickedFile,
   setPickedFile,
+  micBlob,
+  setMicBlob,
   dragOver,
   setDragOver,
   fileInputRef,
@@ -880,6 +901,8 @@ function SourcePane({
   onModeChange: (m: InputMode) => void
   pickedFile: File | null
   setPickedFile: (f: File | null) => void
+  micBlob: File | null
+  setMicBlob: (f: File | null) => void
   dragOver: boolean
   setDragOver: (b: boolean) => void
   fileInputRef: React.RefObject<HTMLInputElement | null>
@@ -1007,7 +1030,7 @@ function SourcePane({
             )}
           </div>
           <div className="sb__file-formats">
-            .wav · .mp3 · .flac · .m4a · .ogg · .webm
+            wav · mp3 · flac · m4a · ogg · webm
           </div>
         </div>
       )}
@@ -1026,9 +1049,8 @@ function SourcePane({
 
           <div className="mic-card" style={{ marginTop: 16 }}>
             <MicCardBars
-              level={mic.level}
-              recording={recording}
-              captureMode={micCaptureMode}
+              getAnalyser={mic.getAnalyser}
+              active={recording || micCaptureMode === 'live'}
             />
             <div className="mic-card__row">
               <span className="mic-card__status">
@@ -1052,7 +1074,7 @@ function SourcePane({
             </div>
           </div>
 
-          {!recording && pickedFile && micCaptureMode === 'record' && (
+          {!recording && micBlob && micCaptureMode === 'record' && (
             <div className="sb__file-card" style={{ marginTop: 10 }}>
               <div className="sb__file-card__icon">
                 <svg
@@ -1071,9 +1093,9 @@ function SourcePane({
                 </svg>
               </div>
               <div className="sb__file-card__body">
-                <div className="sb__file-card__name">{pickedFile.name}</div>
+                <div className="sb__file-card__name">{micBlob.name}</div>
                 <div className="sb__file-card__meta">
-                  {formatBytes(pickedFile.size)} · WebM Opus
+                  {formatBytes(micBlob.size)} · WebM Opus
                 </div>
               </div>
               <button
@@ -1082,7 +1104,7 @@ function SourcePane({
                 aria-label="Discard recording"
                 onClick={(e) => {
                   e.stopPropagation()
-                  setPickedFile(null)
+                  setMicBlob(null)
                 }}
               >
                 ✕
@@ -1124,51 +1146,99 @@ function SourcePane({
           <div className="sb__url-status">
             <span className={urlValid ? 'sb__url-dot sb__url-dot--on' : 'sb__url-dot'} />
             <span className="sb__url-status-label">
-              {urlValid ? 'Ready to fetch' : 'Enter a media URL'}
+              {urlValid ? 'Ready to fetch' : 'Enter direct link to media'}
             </span>
           </div>
-          <div className="sb__file-formats">Direct link to an audio or video file</div>
         </div>
       )}
     </div>
   )
 }
 
-/** Bar meter inside the mic card. Real audio only — driven by
- * mic.level (the AnalyserNode peak), not a synthetic animation. The
- * meter is "active" both while recording AND while previewing (live
- * mode opens the mic before the user hits Record), so it reflects
- * actual speech in both cases:
+const MIC_BARS = 28
+
+/** Bar meter inside the mic card — a real frequency spectrum read live
+ * from the AnalyserNode (getByteFrequencyData), folded into 28
+ * log-spaced bands so each bar tracks a different part of the voice.
  *
- *   - recording, OR live-mode preview → bars scale with level.
- *   - record-mode idle               → bars sit flat (mic not open).
+ * "Active" both while recording AND while previewing (live mode opens
+ * the mic before the user hits Record), so it reflects actual speech in
+ * both cases; record-mode idle sits flat (mic closed).
  *
- * Each bar has a static center-hump envelope + per-bar texture so the
- * meter reads as a wave rather than a flat block; the overall
- * amplitude tracks loudness. Quiet input = short bars, speech = tall. */
+ * Smoothing keeps it from looking jittery/sharp: the analyser already
+ * smooths between frames, then each band rises quickly but falls
+ * gently (attack/release lerp) and is lightly averaged with its
+ * neighbours. */
 function MicCardBars({
-  level,
-  recording,
-  captureMode,
+  getAnalyser,
+  active,
 }: {
-  level: number
-  recording: boolean
-  captureMode: 'live' | 'record'
+  getAnalyser: () => AnalyserNode | null
+  active: boolean
 }) {
-  const N = 28
-  const active = recording || captureMode === 'live'
-  const drive = active ? Math.min(1, level * 2.4) : 0
+  const [bands, setBands] = useState<number[]>(() => new Array(MIC_BARS).fill(0))
+  const dispRef = useRef<Float32Array>(new Float32Array(MIC_BARS))
+
+  useEffect(() => {
+    if (!active) {
+      dispRef.current.fill(0)
+      setBands(new Array(MIC_BARS).fill(0))
+      return
+    }
+    let raf = 0
+    let freq: Uint8Array | null = null
+    const loop = () => {
+      const analyser = getAnalyser()
+      if (analyser) {
+        if (!freq || freq.length !== analyser.frequencyBinCount) {
+          freq = new Uint8Array(analyser.frequencyBinCount)
+        }
+        analyser.getByteFrequencyData(freq as unknown as Uint8Array<ArrayBuffer>)
+        // Log-spaced band edges across the voice-relevant range (skip
+        // the DC bins; cap well below Nyquist where there's no energy).
+        const minBin = 2
+        const maxBin = Math.min(freq.length - 1, 300)
+        const ratio = maxBin / minBin
+        const disp = dispRef.current
+        const raw = new Float32Array(MIC_BARS)
+        for (let b = 0; b < MIC_BARS; b++) {
+          const lo = Math.floor(minBin * Math.pow(ratio, b / MIC_BARS))
+          const hi = Math.max(lo + 1, Math.floor(minBin * Math.pow(ratio, (b + 1) / MIC_BARS)))
+          let sum = 0
+          let n = 0
+          for (let k = lo; k < hi && k < freq.length; k++) {
+            sum += freq[k]
+            n++
+          }
+          const avg = n > 0 ? sum / n / 255 : 0
+          raw[b] = Math.pow(avg, 0.7) // gentle curve so quiet detail shows
+        }
+        for (let b = 0; b < MIC_BARS; b++) {
+          // Light spatial smoothing with neighbours.
+          const prev = raw[b - 1] ?? raw[b]
+          const next = raw[b + 1] ?? raw[b]
+          const target = (prev + 2 * raw[b] + next) / 4
+          // Fast attack, gentle release — natural meter feel, not sharp.
+          const k = target > disp[b] ? 0.35 : 0.12
+          disp[b] += (target - disp[b]) * k
+        }
+        setBands(Array.from(disp))
+      }
+      raf = requestAnimationFrame(loop)
+    }
+    raf = requestAnimationFrame(loop)
+    return () => cancelAnimationFrame(raf)
+  }, [active, getAnalyser])
+
   return (
     <div className="mic-card__bars">
-      {Array.from({ length: N }).map((_, i) => {
-        const envelope = 0.45 + 0.55 * Math.sin((i / (N - 1)) * Math.PI)
-        const variety = 0.65 + 0.35 * Math.abs(Math.sin(i * 1.7 + 0.6))
-        const h = active ? Math.max(4, drive * 86 * envelope * variety) : 4
+      {bands.map((v, i) => {
+        const h = active ? Math.max(4, Math.min(96, v * 92 + 4)) : 4
         return (
           <span
             key={i}
             className={active ? 'mic-card__bar mic-card__bar--on' : 'mic-card__bar'}
-            style={{ height: `${h}%`, opacity: active ? 0.55 + 0.45 * variety : 1 }}
+            style={{ height: `${h}%`, opacity: active ? 0.55 + 0.45 * v : 1 }}
           />
         )
       })}
@@ -1338,18 +1408,36 @@ function EnginePane({
       <SBLabel>Strategy</SBLabel>
       <OptionList<Strategy>
         value={strategy}
-        options={STRATEGIES.map((id) => ({
-          id,
-          label: id,
-          disabled: id === 'progressive' && mode === 'url',
-          disabledReason: 'progressive isn’t available for URL ingest',
-        }))}
+        options={STRATEGIES.map((id) => {
+          // mic + live IS progressive streaming — lock the others out.
+          if (isMicLive) {
+            return {
+              id,
+              label: id,
+              disabled: id !== 'progressive',
+              disabledReason: 'live transcription always streams progressively',
+            }
+          }
+          // progressive needs a stream we can push: file (WS) or mic+live.
+          // URL is server-fetched and mic+record is a finished blob → REST.
+          const progDisabled =
+            id === 'progressive' && (mode === 'url' || (mode === 'mic' && micCaptureMode === 'record'))
+          return {
+            id,
+            label: id,
+            disabled: progDisabled,
+            disabledReason:
+              mode === 'url'
+                ? 'progressive isn’t available for URL ingest'
+                : 'progressive needs a live stream — record uploads the finished clip',
+          }
+        })}
         onChange={setStrategy}
       />
-      {strategy === 'progressive' && mode === 'url' && (
-        <div className="sb__hint">progressive isn’t available for URL ingest — falling back to chunked.</div>
+      {isMicLive && (
+        <div className="sb__hint">live transcription streams over a WebSocket — engine is progressive.</div>
       )}
-      {strategy === 'progressive' && mode === 'file' && (
+      {!isMicLive && strategy === 'progressive' && mode === 'file' && (
         <div className="sb__hint">file + progressive streams the audio over a WebSocket so partials arrive live.</div>
       )}
 
@@ -1362,12 +1450,31 @@ function EnginePane({
                 chunked engine processes sequentially at a fixed internal
                 chunk size, so client batch_size / chunk_length had no
                 effect — removed rather than ship dead controls. */}
-            <NumKv k="long_audio_threshold" v={longAudioThreshold} placeholder={480} suffix="s" onSet={setLong} />
+            <NumKv
+              k="Long-audio threshold"
+              hint="long_audio_threshold — switches to long-audio model settings above this duration"
+              v={longAudioThreshold}
+              placeholder={480}
+              suffix="s"
+              onSet={setLong}
+            />
           </>
         )}
-        {isMicLive && <ToggleKv k="live_latency" v={liveLatency} onSet={setLiveLatency} />}
+        {isMicLive && (
+          <ToggleKv
+            k="Low-latency mode"
+            hint="live_latency — smaller streaming chunks; faster partials, lower throughput"
+            v={liveLatency}
+            onSet={setLiveLatency}
+          />
+        )}
         {isStreaming && (
-          <ToggleKv k="progressive_refinement" v={progressiveRefinement} onSet={setProgRefine} />
+          <ToggleKv
+            k="Progressive refinement"
+            hint="progressive_refinement — re-runs finalized regions for higher accuracy as the stream advances"
+            v={progressiveRefinement}
+            onSet={setProgRefine}
+          />
         )}
 
         {isMicAny && (
@@ -1376,8 +1483,20 @@ function EnginePane({
 
             {/* Mic input quality (browser-side getUserMedia constraints +
                 ffmpeg highpass). Applies to both Live and Record. */}
-            <NumKv k="hpf_hz" v={hpfHz} placeholder={100} suffix="Hz" onSet={setHpfHz} />
-            <ToggleKv k="noise_suppression (browser)" v={noiseSuppression} onSet={setNoiseSuppression} />
+            <NumKv
+              k="High-pass filter"
+              hint="hpf_hz — ffmpeg highpass cutoff in Hz; 0 disables"
+              v={hpfHz}
+              placeholder={100}
+              suffix="Hz"
+              onSet={setHpfHz}
+            />
+            <ToggleKv
+              k="Noise suppression"
+              hint="noise_suppression — browser getUserMedia noise suppression"
+              v={noiseSuppression}
+              onSet={setNoiseSuppression}
+            />
           </>
         )}
 
@@ -1388,12 +1507,51 @@ function EnginePane({
             {/* VAD settings only apply to the live WS streaming path —
                 Record mode uploads the raw blob via REST and ffmpeg
                 doesn't touch VAD on the server. */}
-            <ToggleKv k="vad_enabled" v={vadEnabled} onSet={setVadEnabled} />
-            <NumKv k="vad_threshold" v={vadThreshold} placeholder={0.5} step={0.05} onSet={setVadThreshold} />
-            <NumKv k="vad_consecutive" v={vadConsecutive} placeholder={3} onSet={setVadConsecutive} />
-            <NumKv k="vad_hangover_ms" v={vadHangoverMs} placeholder={500} suffix="ms" onSet={setVadHangoverMs} />
-            <NumKv k="vad_pad_min_gap_ms" v={vadPadMinGapMs} placeholder={400} suffix="ms" onSet={setVadPadMinGap} />
-            <NumKv k="vad_pad_duration_ms" v={vadPadDurationMs} placeholder={0} suffix="ms" onSet={setVadPadDuration} />
+            <ToggleKv
+              k="Voice activity detection"
+              hint="vad_enabled — gates silence so the engine queue stays drained"
+              v={vadEnabled}
+              onSet={setVadEnabled}
+            />
+            <NumKv
+              k="Speech threshold"
+              hint="vad_threshold — Silero probability cutoff 0..1; higher = pickier"
+              v={vadThreshold}
+              placeholder={0.5}
+              step={0.05}
+              onSet={setVadThreshold}
+            />
+            <NumKv
+              k="Onset frames"
+              hint="vad_consecutive — sustained speech frames to flip silent→speech"
+              v={vadConsecutive}
+              placeholder={3}
+              onSet={setVadConsecutive}
+            />
+            <NumKv
+              k="Hangover"
+              hint="vad_hangover_ms — keep forwarding this long after the last loud frame"
+              v={vadHangoverMs}
+              placeholder={500}
+              suffix="ms"
+              onSet={setVadHangoverMs}
+            />
+            <NumKv
+              k="Padding min gap"
+              hint="vad_pad_min_gap_ms — onset padding fires only when prior silence exceeded this"
+              v={vadPadMinGapMs}
+              placeholder={400}
+              suffix="ms"
+              onSet={setVadPadMinGap}
+            />
+            <NumKv
+              k="Onset padding"
+              hint="vad_pad_duration_ms — low-noise padding injected at speech onset"
+              v={vadPadDurationMs}
+              placeholder={0}
+              suffix="ms"
+              onSet={setVadPadDuration}
+            />
           </>
         )}
       </div>
@@ -1403,6 +1561,7 @@ function EnginePane({
 
 function NumKv({
   k,
+  hint,
   v,
   placeholder,
   suffix,
@@ -1410,6 +1569,8 @@ function NumKv({
   onSet,
 }: {
   k: string
+  /** Hover tooltip — carries the raw server key + a short description. */
+  hint?: string
   v: number | null
   placeholder: number
   suffix?: string
@@ -1418,7 +1579,9 @@ function NumKv({
 }) {
   return (
     <div className="ma-kv">
-      <span className="ma-kv__k">{k}</span>
+      <span className="ma-kv__k" title={hint}>
+        {k}
+      </span>
       <span className="ma-kv__v">
         <input
           type="number"
@@ -1435,10 +1598,22 @@ function NumKv({
   )
 }
 
-function ToggleKv({ k, v, onSet }: { k: string; v: boolean; onSet: (v: boolean) => void }) {
+function ToggleKv({
+  k,
+  hint,
+  v,
+  onSet,
+}: {
+  k: string
+  hint?: string
+  v: boolean
+  onSet: (v: boolean) => void
+}) {
   return (
     <div className="ma-kv">
-      <span className="ma-kv__k">{k}</span>
+      <span className="ma-kv__k" title={hint}>
+        {k}
+      </span>
       <span className="ma-kv__v" style={{ justifyContent: 'flex-start' }}>
         <button
           type="button"

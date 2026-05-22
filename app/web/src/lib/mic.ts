@@ -65,6 +65,9 @@ export interface UseMicResult {
   listen: () => Promise<void>
   /** Tear down a preview-only listen (does nothing while recording). */
   stopListening: () => void
+  /** Current AnalyserNode (or null when the mic isn't open) — lets the
+   * meter read live frequency data for a real spectrum display. */
+  getAnalyser: () => AnalyserNode | null
 }
 
 /**
@@ -162,7 +165,9 @@ export function useMic({
       const source = ctx.createMediaStreamSource(stream)
       const analyser = ctx.createAnalyser()
       analyser.fftSize = 1024
-      analyser.smoothingTimeConstant = 0.4
+      // Higher smoothing so the spectrum meter eases between frames
+      // instead of snapping (the component adds its own lerp on top).
+      analyser.smoothingTimeConstant = 0.6
       source.connect(analyser)
       analyserRef.current = analyser
 
@@ -303,5 +308,7 @@ export function useMic({
     [cleanup],
   )
 
-  return { state, error, level, start, stop, listen, stopListening }
+  const getAnalyser = useCallback(() => analyserRef.current, [])
+
+  return { state, error, level, start, stop, listen, stopListening, getAnalyser }
 }

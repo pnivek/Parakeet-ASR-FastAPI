@@ -1537,6 +1537,7 @@ body {
   color: var(--muted-deep);
   letter-spacing: 1.4px;
   text-transform: uppercase;
+  text-align: center;
 }
 
 /* Mic block in sidebar (legacy — only kept for fallback styling) */

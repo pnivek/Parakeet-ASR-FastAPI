@@ -894,7 +894,9 @@ body {
   position: relative;
 }
 /* "Follow" pill — appears when the user scrolls up mid-stream; clicking
-   re-pins the transcript to the bottom and resumes auto-follow. */
+   re-pins the transcript to the bottom and resumes auto-follow. Matches
+   the accent-pill vocabulary (active tab / format pill), with a solid
+   backdrop so it stays legible floating over the transcript text. */
 .transcript__follow {
   position: absolute;
   bottom: 14px;
@@ -903,21 +905,22 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 7px 14px;
+  padding: 6px 14px;
   border-radius: 999px;
   font-family: var(--font-mono);
   font-size: 10.5px;
   letter-spacing: 0.8px;
   text-transform: uppercase;
-  color: var(--bg);
-  background: var(--accent);
-  border: none;
+  color: var(--accent);
+  background: color-mix(in oklch, var(--accent) 14%, var(--bg));
+  border: 1px solid color-mix(in oklch, var(--accent) 38%, transparent);
   cursor: pointer;
-  box-shadow: 0 6px 20px -6px rgba(0, 0, 0, 0.6);
-  transition: transform 0.15s ease, background 0.15s ease;
+  box-shadow: 0 6px 20px -8px rgba(0, 0, 0, 0.6);
+  transition: background 0.15s ease, border-color 0.15s ease;
 }
 .transcript__follow:hover {
-  background: color-mix(in oklch, var(--accent) 88%, white);
+  background: color-mix(in oklch, var(--accent) 22%, var(--bg));
+  border-color: color-mix(in oklch, var(--accent) 55%, transparent);
 }
 .transcript__head {
   display: flex;

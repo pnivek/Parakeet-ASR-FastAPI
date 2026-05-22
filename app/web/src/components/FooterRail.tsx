@@ -7,6 +7,9 @@ interface Props {
   result: TranscriptionResponse | null
   /** Time-to-first-segment in seconds (click → first segment), or null. */
   ttfs: number | null
+  /** The currently-selected engine — shown until a result reports the
+   * resolved one, so STRATEGY is never blank. */
+  activeStrategy: string
 }
 
 /**
@@ -14,7 +17,7 @@ interface Props {
  * the right (resolved strategy, ASR time, RTFx, time-to-first-segment,
  * segments, words). When no result yet, the metric values show "—".
  */
-export function FooterRail({ loaded, result, ttfs }: Props) {
+export function FooterRail({ loaded, result, ttfs, activeStrategy }: Props) {
   const dur = useDuration()
   const verbose = result?.format === 'verbose_json' ? result.body : null
   const asr = verbose?.transcription_time_seconds
@@ -23,7 +26,9 @@ export function FooterRail({ loaded, result, ttfs }: Props) {
   const words = verbose?.words?.length ?? '—'
   const asrLabel = asr ? `${asr.toFixed(2)}s` : '—'
   const ttfsLabel = ttfs != null ? `${ttfs.toFixed(2)}s` : '—'
-  const strategy = verbose?.strategy ?? '—'
+  // Resolved strategy from the result wins; otherwise show the active
+  // engine so STRATEGY is always populated (live mic, pre-result, etc).
+  const strategy = verbose?.strategy || activeStrategy
 
   return (
     <div className="footer">

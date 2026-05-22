@@ -9,6 +9,7 @@ import { HeroRow, type HeroState } from './components/HeroRow'
 import { TranscriptSection } from './components/TranscriptSection'
 import { Sidebar, type InputMode } from './components/Sidebar'
 import { FooterRail } from './components/FooterRail'
+import { useSettings } from './lib/settings'
 import './App.css'
 
 export default function App() {
@@ -269,6 +270,15 @@ export default function App() {
   const language =
     result?.format === 'verbose_json' ? result.body.language || 'en' : 'en'
 
+  // Active strategy for the footer — there's always one. mic+live is
+  // locked to progressive; otherwise the chosen engine setting (already
+  // kept valid per mode by the sidebar). The footer prefers the result's
+  // resolved strategy when present, falling back to this.
+  const strategy = useSettings((st) => st.strategy)
+  const micCaptureMode = useSettings((st) => st.micCaptureMode)
+  const activeStrategy =
+    mode === 'mic' && micCaptureMode === 'live' ? 'progressive' : strategy
+
   return (
     <div className="app">
       <div className="glows" aria-hidden />
@@ -306,7 +316,7 @@ export default function App() {
         </aside>
       </main>
 
-      <FooterRail loaded={loaded} result={result} ttfs={ttfs} />
+      <FooterRail loaded={loaded} result={result} ttfs={ttfs} activeStrategy={activeStrategy} />
 
       <div
         ref={audioMountRef}

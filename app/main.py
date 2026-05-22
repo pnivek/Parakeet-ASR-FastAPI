@@ -1603,11 +1603,44 @@ async def handle_streaming_pcm(
             logger.warning(f"({session_id}) Streaming: Could not put sentinel in queue during final pipeline cleanup (queue full or other error).")
 
 
+class _RestCancelled(Exception):
+    """Internal sentinel — the REST client disconnected mid-transcription;
+    unwind to the 499 response without logging it as a server error."""
+
+
+async def _watch_request_disconnect(
+    request: Request,
+    cancel_event: threading.Event,
+    request_id: str,
+    poll_s: float = 0.4,
+) -> None:
+    """Poll for an HTTP client disconnect and set `cancel_event`.
+
+    uvicorn keeps an endpoint coroutine running after the client goes
+    away (the request body was already received), so a long offline
+    transcription would otherwise run to completion holding the model
+    lock — blocking every subsequent request. Setting the event lets the
+    chunked engine bail between chunks and free the lock promptly.
+    """
+    try:
+        while not cancel_event.is_set():
+            if await request.is_disconnected():
+                cancel_event.set()
+                logger.info(f"({request_id}) REST: client disconnected — cancelling in-flight transcription.")
+                return
+            await asyncio.sleep(poll_s)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.warning(f"({request_id}) REST: disconnect watcher error: {e}")
+
+
 async def _transcribe_chunked(
     waveform: torch.Tensor,
     audio_duration_s: float,
     client_config: dict,
     request_id: str = "chunked",
+    cancel_event: Optional["threading.Event"] = None,
 ) -> Tuple[List[dict], float]:
     """
     Offline chunked transcription using `StreamingPrevBatchedEngine`.
@@ -1642,9 +1675,14 @@ async def _transcribe_chunked(
             left_context_secs=left_secs,
             right_context_secs=right_secs,
             request_id=request_id,
+            cancel_check=(cancel_event.is_set if cancel_event is not None else None),
         )
         try:
             engine.feed_float32(waveform_np)
+            # If cancellation fired mid-feed, don't flush/emit — the caller
+            # discards the (orphaned) request.
+            if engine.cancelled:
+                return [], engine.asr_time_s
             engine.flush()
             segs = engine.pop_final_segments()
             return segs, engine.asr_time_s
@@ -2051,22 +2089,45 @@ async def transcribe_endpoint_rest(
                         )
                         logger.info(f"({request_id}) REST: ASR model settings applied for session. Long audio specific settings active: {long_audio_settings_applied_this_session}.")
 
-                        if resolved_strategy == ProcessingStrategy.CHUNKED:
-                            segments, asr_processing_time_s = await _transcribe_chunked(
-                                waveform=waveform_tensor,
-                                audio_duration_s=total_audio_duration_s,
-                                client_config=client_config_rest,
-                                request_id=f"REST-{request_id}",
-                            )
-                        else:
-                            # FULL: single-pass through encoder + decoding_computer.
-                            # Bypasses NeMo's transcribe() wrapper to dodge the
-                            # short-audio CUDA-graph bug (see _transcribe_full).
-                            segments, asr_processing_time_s = await _transcribe_full(
-                                waveform=waveform_tensor,
-                                audio_duration_s=total_audio_duration_s,
-                                request_id=f"REST-{request_id}",
-                            )
+                        # Watch for a client disconnect during the (possibly
+                        # long) inference. uvicorn keeps this coroutine running
+                        # after the client cancels, so without this a cancelled
+                        # big-file job would hold the model lock to completion
+                        # and block every later request. The chunked engine
+                        # polls cancel_event between chunks and bails.
+                        rest_cancel_event = threading.Event()
+                        rest_watcher = asyncio.create_task(
+                            _watch_request_disconnect(request, rest_cancel_event, request_id)
+                        )
+                        try:
+                            if resolved_strategy == ProcessingStrategy.CHUNKED:
+                                segments, asr_processing_time_s = await _transcribe_chunked(
+                                    waveform=waveform_tensor,
+                                    audio_duration_s=total_audio_duration_s,
+                                    client_config=client_config_rest,
+                                    request_id=f"REST-{request_id}",
+                                    cancel_event=rest_cancel_event,
+                                )
+                            else:
+                                # FULL: single-pass through encoder + decoding_computer.
+                                # Bypasses NeMo's transcribe() wrapper to dodge the
+                                # short-audio CUDA-graph bug (see _transcribe_full).
+                                # (Single pass — not cooperatively cancellable.)
+                                segments, asr_processing_time_s = await _transcribe_full(
+                                    waveform=waveform_tensor,
+                                    audio_duration_s=total_audio_duration_s,
+                                    request_id=f"REST-{request_id}",
+                                )
+                        finally:
+                            rest_watcher.cancel()
+
+                        if rest_cancel_event.is_set():
+                            # Client went away mid-transcription — discard the
+                            # aborted result; the lock is already releasing.
+                            logger.info(f"({request_id}) REST: client disconnected; discarding cancelled result.")
+                            response_status_code = 499
+                            final_response_content = {"error": "Client disconnected; transcription cancelled."}
+                            raise _RestCancelled()
 
                         full_transcribed_text = " ".join(s['text'] for s in segments).strip()
                         total_server_processing_time_s = round(time.time() - start_time_total_request_processing, 3)
@@ -2114,6 +2175,10 @@ async def transcribe_endpoint_rest(
                             f"Duration: {total_audio_duration_s:.2f}s, ASR time: {asr_processing_time_s:.2f}s, segments: {len(segments)}."
                         )
 
+            except _RestCancelled:
+                # Normal cancellation (client disconnected) — the 499 body is
+                # already set; just unwind to the finally (model revert).
+                pass
             except Exception as e_locked_rest_processing:
                 import traceback
                 tb_str = traceback.format_exc()

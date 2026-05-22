@@ -43,9 +43,10 @@ Design notes vs the old StreamingTdtEngine:
 from __future__ import annotations
 
 import gzip
+import logging
 import math
 import time
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -55,6 +56,8 @@ from nemo.collections.asr.parts.utils.streaming_utils import (
     ContextSize,
     StreamingBatchedAudioBuffer,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _make_divisible_by(value: int, factor: int) -> int:
@@ -287,12 +290,18 @@ class StreamingPrevBatchedEngine:
         left_context_secs: float,
         right_context_secs: float,
         request_id: str = "stream-v2",
+        cancel_check: Optional[Callable[[], bool]] = None,
     ):
         self.asr_model = asr_model_instance
         self.request_id = request_id
         self.chunk_secs = float(chunk_secs)
         self.left_context_secs = float(left_context_secs)
         self.right_context_secs = float(right_context_secs)
+        # Optional cooperative-cancellation hook. Polled between chunks in
+        # feed_float32 so a long offline transcription can bail promptly
+        # (e.g. the REST client disconnected). None = never cancels.
+        self._cancel_check = cancel_check
+        self.cancelled = False
 
         # Read invariants from the model config (mirrors the reference script).
         model_cfg = asr_model_instance._cfg
@@ -396,6 +405,13 @@ class StreamingPrevBatchedEngine:
         chunk_samples = self.context_samples.chunk
         right_samples = self.context_samples.right
         while True:
+            # Cooperative cancellation — bail between chunks if the caller
+            # signalled (e.g. the REST client disconnected). Leaves the
+            # engine in a consistent state; the caller should reset().
+            if self._cancel_check is not None and self._cancel_check():
+                self.cancelled = True
+                logger.info(f"({self.request_id}) StreamingPrevBatchedEngine: cancel requested — stopping feed.")
+                return
             needed = (chunk_samples + right_samples) if self._chunk_index == 0 else chunk_samples
             if self._pcm_buffer.numel() < needed:
                 break

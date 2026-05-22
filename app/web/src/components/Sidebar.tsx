@@ -1434,9 +1434,6 @@ function EnginePane({
         })}
         onChange={setStrategy}
       />
-      {isMicLive && (
-        <div className="sb__hint">live transcription streams over a WebSocket — engine is progressive.</div>
-      )}
       {!isMicLive && strategy === 'progressive' && mode === 'file' && (
         <div className="sb__hint">file + progressive streams the audio over a WebSocket so partials arrive live.</div>
       )}
@@ -1470,7 +1467,7 @@ function EnginePane({
         )}
         {isStreaming && (
           <ToggleKv
-            k="Progressive refinement"
+            k="Refinement"
             hint="progressive_refinement — re-runs finalized regions for higher accuracy as the stream advances"
             v={progressiveRefinement}
             onSet={setProgRefine}
@@ -1508,7 +1505,7 @@ function EnginePane({
                 Record mode uploads the raw blob via REST and ffmpeg
                 doesn't touch VAD on the server. */}
             <ToggleKv
-              k="Voice activity detection"
+              k="Voice detection"
               hint="vad_enabled — gates silence so the engine queue stays drained"
               v={vadEnabled}
               onSet={setVadEnabled}

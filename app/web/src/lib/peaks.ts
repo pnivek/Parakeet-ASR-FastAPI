@@ -19,6 +19,26 @@
 /** Files larger than this skip the decodeAudioData path. WAV bypasses it. */
 const COMPRESSED_DECODE_CAP_BYTES = 200 * 1024 * 1024
 
+/**
+ * Cap the first/last bin to their inner neighbour, then normalize to
+ * [0,1]. A decode pre-skip or recording-start click lands in sample 0
+ * and, since we normalize by the max bin, would otherwise show as a
+ * giant leading spike AND crush the rest of the waveform. Clamping the
+ * edge bins to the adjacent real content removes that deterministic
+ * spike without touching the interior. Mutates + returns `peaks`.
+ */
+function finalizePeaks(peaks: number[]): number[] {
+  const n = peaks.length
+  if (n >= 2) {
+    peaks[0] = Math.min(peaks[0], peaks[1])
+    peaks[n - 1] = Math.min(peaks[n - 1], peaks[n - 2])
+  }
+  let max = 0
+  for (const p of peaks) if (p > max) max = p
+  if (max > 0) for (let i = 0; i < n; i++) peaks[i] /= max
+  return peaks
+}
+
 export async function computePeaks(file: Blob, bins = 220): Promise<number[]> {
   // Sniff the first 12 bytes for the RIFF/WAVE (or RIFX) magic so the
   // fast path runs for ANY wav — regardless of filename or MIME type.
@@ -241,12 +261,7 @@ export async function fastWavPeaks(file: Blob, bins = 220): Promise<number[]> {
   const peaks = await Promise.all(
     Array.from({ length: bins }, (_, b) => readBin(b)),
   )
-  let maxPeak = 0
-  for (const p of peaks) if (p > maxPeak) maxPeak = p
-  if (maxPeak > 0) {
-    for (let i = 0; i < peaks.length; i++) peaks[i] = peaks[i] / maxPeak
-  }
-  return peaks
+  return finalizePeaks(peaks)
 }
 
 /**
@@ -266,7 +281,6 @@ async function decodedPeaks(file: Blob, bins: number): Promise<number[]> {
     const samplesPerBin = Math.max(1, Math.floor(ch.length / bins))
     const stride = Math.max(1, Math.floor(samplesPerBin / 256))
     const peaks = new Array<number>(bins).fill(0)
-    let maxPeak = 0
     for (let b = 0; b < bins; b++) {
       let peak = 0
       const start = b * samplesPerBin
@@ -276,12 +290,8 @@ async function decodedPeaks(file: Blob, bins: number): Promise<number[]> {
         if (v > peak) peak = v
       }
       peaks[b] = peak
-      if (peak > maxPeak) maxPeak = peak
     }
-    if (maxPeak > 0) {
-      for (let i = 0; i < peaks.length; i++) peaks[i] = peaks[i] / maxPeak
-    }
-    return peaks
+    return finalizePeaks(peaks)
   } finally {
     if (ctx.state !== 'closed') ctx.close().catch(() => {})
   }

@@ -716,7 +716,7 @@ body {
   overflow: hidden;
 }
 .shell__side {
-  padding: 28px 36px 24px 24px;
+  padding: 28px 24px 24px 24px;
   border-left: 1px solid var(--rule);
   display: flex;
   flex-direction: column;

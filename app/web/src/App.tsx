@@ -24,6 +24,12 @@ export default function App() {
    * sentence-bounded segments_batch lands. */
   const [partialSegment, setPartialSegment] = useState<WhisperSegment | null>(null)
   const [partialWords, setPartialWords] = useState<Word[]>([])
+  /** Time-to-first-segment (seconds) — wall clock from the transcribe /
+   * record click to the first segment landing. `ttfsRef` guards the
+   * one-shot capture against state-update races. */
+  const [ttfs, setTtfs] = useState<number | null>(null)
+  const ttfsRef = useRef<number | null>(null)
+  const sessionStartRef = useRef<number>(0)
   /** True while we're receiving partials (mid-stream). False on final result
    * or no result. Drives the word-by-word reveal animation in the
    * transcript view — static results should not animate. */
@@ -90,6 +96,9 @@ export default function App() {
   }, [loadedFile])
 
   const handleResult = (l: LoadedAudio, r: TranscriptionResponse) => {
+    // Non-streaming paths (REST) deliver everything at once — capture
+    // TTFS here too if no partial beat us to it.
+    if (r.format === 'verbose_json') markFirstSegment(r.body.segments.length)
     setLoaded(l)
     setResult(r)
     setError(null)
@@ -107,7 +116,18 @@ export default function App() {
     }
   }
 
+  /** One-shot capture of time-to-first-segment, the first time a
+   * response carries at least one segment after a session start. */
+  const markFirstSegment = (segCount: number) => {
+    if (ttfsRef.current === null && segCount > 0) {
+      const t = (performance.now() - sessionStartRef.current) / 1000
+      ttfsRef.current = t
+      setTtfs(t)
+    }
+  }
+
   const handlePartial = (r: TranscriptionResponse) => {
+    if (r.format === 'verbose_json') markFirstSegment(r.body.segments.length)
     // Stamp any newly-seen segments + words with their arrival time.
     // Segments are emitted with monotonically increasing ids and words
     // are append-only, so we only need to walk the NEW tail — not the
@@ -150,6 +170,9 @@ export default function App() {
     setLive(false)
     setPartialSegment(null)
     setPartialWords([])
+    sessionStartRef.current = performance.now()
+    ttfsRef.current = null
+    setTtfs(null)
     arrivalRef.current = new Map()
     wordArrivalRef.current = new Map()
     maxSeenSegIdRef.current = -1
@@ -251,7 +274,7 @@ export default function App() {
         </aside>
       </main>
 
-      <FooterRail loaded={loaded} result={result} />
+      <FooterRail loaded={loaded} result={result} ttfs={ttfs} />
 
       <div
         ref={audioMountRef}

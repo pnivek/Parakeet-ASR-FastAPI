@@ -1434,9 +1434,6 @@ function EnginePane({
         })}
         onChange={setStrategy}
       />
-      {!isMicLive && strategy === 'progressive' && mode === 'file' && (
-        <div className="sb__hint">file + progressive streams the audio over a WebSocket so partials arrive live.</div>
-      )}
 
       <SBLabel top={22}>Advanced</SBLabel>
       <div className="sb__adv-list">

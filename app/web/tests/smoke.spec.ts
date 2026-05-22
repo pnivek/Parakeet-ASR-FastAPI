@@ -71,7 +71,7 @@ test('Maison v6 UI — boots, tabs switch, modes switch, strategy gate enforced'
   await expect(page.getByRole('radio', { name: 'progressive' })).toBeDisabled()
 
   // Footer rail metric labels present.
-  for (const label of ['STRATEGY', 'ASR', 'RTFx', 'SEGMENTS', 'WORDS']) {
+  for (const label of ['STRATEGY', 'ASR', 'RTFx', 'TTFS', 'SEGMENTS', 'WORDS']) {
     await expect(page.getByText(label, { exact: true })).toBeVisible()
   }
 

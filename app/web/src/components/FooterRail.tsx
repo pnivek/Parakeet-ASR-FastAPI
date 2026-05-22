@@ -5,14 +5,16 @@ import { useDuration } from '../lib/playback'
 interface Props {
   loaded: LoadedAudio | null
   result: TranscriptionResponse | null
+  /** Time-to-first-segment in seconds (click → first segment), or null. */
+  ttfs: number | null
 }
 
 /**
  * 68 px sticky footer. Currently-loaded file on the left, real metrics on
- * the right (resolved strategy, ASR time, RTFx, segments, words). When no
- * result yet, the metric values show "—".
+ * the right (resolved strategy, ASR time, RTFx, time-to-first-segment,
+ * segments, words). When no result yet, the metric values show "—".
  */
-export function FooterRail({ loaded, result }: Props) {
+export function FooterRail({ loaded, result, ttfs }: Props) {
   const dur = useDuration()
   const verbose = result?.format === 'verbose_json' ? result.body : null
   const asr = verbose?.transcription_time_seconds
@@ -20,6 +22,7 @@ export function FooterRail({ loaded, result }: Props) {
   const segs = verbose ? verbose.segments.length : '—'
   const words = verbose?.words?.length ?? '—'
   const asrLabel = asr ? `${asr.toFixed(2)}s` : '—'
+  const ttfsLabel = ttfs != null ? `${ttfs.toFixed(2)}s` : '—'
   const strategy = verbose?.strategy ?? '—'
 
   return (
@@ -42,6 +45,7 @@ export function FooterRail({ loaded, result }: Props) {
         <Metric label="STRATEGY" v={strategy} />
         <Metric label="ASR" v={asrLabel} />
         <Metric label="RTFx" v={rtfx} hot />
+        <Metric label="TTFS" v={ttfsLabel} />
         <Metric label="SEGMENTS" v={segs} />
         <Metric label="WORDS" v={words} />
       </div>

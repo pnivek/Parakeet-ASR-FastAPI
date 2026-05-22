@@ -1228,6 +1228,7 @@ body {
   color: var(--muted-deep);
   letter-spacing: 1.4px;
   text-transform: uppercase;
+  text-align: center;
 }
 /* URL ingest — bordered field with a link icon, validity dot, hint. */
 .sb__url-field {
@@ -1259,6 +1260,7 @@ body {
 .sb__url-status {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 8px;
   margin-top: 10px;
 }

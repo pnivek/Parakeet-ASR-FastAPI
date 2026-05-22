@@ -71,23 +71,16 @@ export function Waveform({
           />
         )
       })}
-      {/* Playhead — only once playback has actually moved. At progress 0
-          (live recording, or a loaded-but-unplayed file) a full-height
-          line at x=0 reads like a planted peak bar at the very start, so
-          we omit it; the played/unplayed bar coloring already conveys
-          position. */}
-      {progress > 0 && (
-        <line
-          x1={progress * totalW}
-          x2={progress * totalW}
-          y1={-4}
-          y2={height + 4}
-          stroke={accent}
-          strokeWidth={1.5}
-          strokeLinecap="round"
-          opacity={0.9}
-        />
-      )}
+      <line
+        x1={progress * totalW}
+        x2={progress * totalW}
+        y1={-4}
+        y2={height + 4}
+        stroke={accent}
+        strokeWidth={1.5}
+        strokeLinecap="round"
+        opacity={0.9}
+      />
     </svg>
   )
 }

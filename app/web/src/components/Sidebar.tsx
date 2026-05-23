@@ -880,14 +880,21 @@ function EngineStrategyOutput({
   update,
   granDisabled,
   toggleGran,
+  /** When true, render the Strategy section even with engine=websocket,
+   * disabling each option (with a tooltip). Lets the Record tab keep the
+   * Strategy slot visible across engine switches so users see the option
+   * exists rather than having it disappear. */
+  alwaysShowStrategy = false,
 }: {
   modality: Modality
   m: CommonModality
   update: (patch: Partial<CommonModality>) => void
   granDisabled: boolean
   toggleGran: (g: TimestampGranularity) => void
+  alwaysShowStrategy?: boolean
 }) {
   const isRest = m.engine === 'rest'
+  const showStrategy = isRest || alwaysShowStrategy
   return (
     <>
       <SBLabel top={22}>Engine</SBLabel>
@@ -896,7 +903,7 @@ function EngineStrategyOutput({
         engine={m.engine}
         setEngine={(e) => update({ engine: e })}
       />
-      {isRest && (
+      {showStrategy && (
         <>
           <SBLabel top={22}>Strategy</SBLabel>
           <OptionList<StrategyOverride>
@@ -904,7 +911,10 @@ function EngineStrategyOutput({
             options={STRATEGY_OVERRIDES.map((o) => ({
               id: o.id,
               label: o.label,
-              disabledReason: o.hint,
+              disabled: !isRest,
+              disabledReason: isRest
+                ? o.hint
+                : 'Strategy override only applies to the REST engine.',
             }))}
             onChange={(v) => update({ strategyOverride: v })}
           />
@@ -1242,6 +1252,7 @@ function RecordPane({
         update={update}
         granDisabled={granDisabled}
         toggleGran={toggleGran}
+        alwaysShowStrategy
       />
 
       <SBLabel top={22}>Advanced</SBLabel>

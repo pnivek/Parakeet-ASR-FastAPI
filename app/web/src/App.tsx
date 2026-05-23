@@ -1,6 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
 import type { TranscriptionResponse } from './lib/api'
-import { setAudioFile, setAudioUrl, setDurationHint, useAudioContainer, useCurrentTime } from './lib/playback'
+import {
+  getPlaybackAnalyser,
+  setAudioFile,
+  setAudioUrl,
+  setDurationHint,
+  useAudioContainer,
+  useCurrentTime,
+  useIsPlaying,
+} from './lib/playback'
 import { computePeaks, readWavDuration } from './lib/peaks'
 import type { LoadedAudio } from './lib/download'
 import type { WhisperSegment, Word } from './lib/types'
@@ -56,6 +64,7 @@ export default function App() {
   const audioMountRef = useRef<HTMLDivElement>(null)
   useAudioContainer(audioMountRef)
   const currentTime = useCurrentTime()
+  const audioPlaying = useIsPlaying()
 
   // Decode peaks for whichever file is currently loaded. One source of
   // truth: any time `loaded.file` becomes a new blob (file picked, mic
@@ -228,6 +237,40 @@ export default function App() {
       return next.slice(next.length - PEAKS_LIVE_BARS)
     })
   }
+
+  // Rolling waveform for URL sources, driven by an AnalyserNode tapped
+  // off the playing <audio> element. File modes already get full peaks
+  // from a local decodeAudioData; mic modes drive peaks from a getUserMedia
+  // analyser. URL has neither (bytes are remote / live-streamed), so we
+  // sample the playback element while it's actually playing — bars scroll
+  // in from the right like an oscilloscope, same handlePeaks pattern.
+  //
+  // Sample rate: ~15 Hz (~one frame per 4 rAFs at 60 Hz). Faster looks
+  // jittery, slower looks coarse. handlePeaks rolls into the 220-bar buffer.
+  useEffect(() => {
+    if (loaded?.kind !== 'url' || !audioPlaying) return
+    const analyser = getPlaybackAnalyser()
+    if (!analyser) return
+    const buf = new Uint8Array(analyser.fftSize)
+    let raf = 0
+    let frameSkip = 0
+    const tick = () => {
+      frameSkip = (frameSkip + 1) % 4
+      if (frameSkip === 0) {
+        analyser.getByteTimeDomainData(buf as unknown as Uint8Array<ArrayBuffer>)
+        let max = 0
+        for (let i = 0; i < buf.length; i++) {
+          const v = Math.abs(buf[i] - 128) / 128
+          if (v > max) max = v
+        }
+        handlePeaks([max], false)
+      }
+      raf = requestAnimationFrame(tick)
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded?.kind, audioPlaying])
 
   /**
    * Wire the picked file into the audio player early in a streaming

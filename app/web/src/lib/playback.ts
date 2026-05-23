@@ -58,11 +58,79 @@ function ensureEl(): HTMLAudioElement {
     isPlaying = false
     notify()
   })
+  el.addEventListener('error', () => {
+    // CORS rejected our crossOrigin='anonymous' request — retry without it.
+    // Cost: playback works but the AnalyserNode samples come back as 128 (tainted),
+    // so the waveform won't fill. Better than no playback.
+    if (pendingCorsRetryUrl && el.crossOrigin) {
+      const retry = pendingCorsRetryUrl
+      pendingCorsRetryUrl = null
+      el.removeAttribute('crossorigin')
+      el.src = retry
+      el.load()
+    }
+  })
+  el.addEventListener('loadedmetadata', () => {
+    // Successful load — clear the retry marker so a later error event
+    // doesn't accidentally re-trigger.
+    pendingCorsRetryUrl = null
+  })
   audioEl = el
   return el
 }
 
+// ── Playback analyser (rolling waveform for URL sources) ──────────
+// Lazy-built on first request. Tap point: MediaElementAudioSourceNode on
+// the singleton <audio> → AnalyserNode → AudioContext.destination so the
+// audio still plays. Only one MediaElementSource is permitted per element,
+// so we keep this setup global + idempotent.
+let audioCtx: AudioContext | null = null
+let mediaSourceNode: MediaElementAudioSourceNode | null = null
+let analyserNode: AnalyserNode | null = null
+
+/** Returns the playback analyser, creating it on first call.
+ *
+ * Once this runs, the audio element's output is routed through the
+ * AudioContext. If the context is suspended (no user gesture yet), audio
+ * cuts out — so we resume it best-effort. Calls from inside a click /
+ * play handler are safe.
+ *
+ * Returns null if WebAudio setup fails entirely (rare). Cross-origin
+ * tainting doesn't fail — the analyser just returns 128 for every byte. */
+export function getPlaybackAnalyser(): AnalyserNode | null {
+  if (analyserNode) return analyserNode
+  const el = ensureEl()
+  try {
+    if (!audioCtx) {
+      type WindowWithWebkit = Window & { webkitAudioContext?: typeof AudioContext }
+      const w = window as WindowWithWebkit
+      const Ctor = window.AudioContext ?? w.webkitAudioContext
+      if (!Ctor) return null
+      audioCtx = new Ctor()
+    }
+    if (!mediaSourceNode) {
+      mediaSourceNode = audioCtx.createMediaElementSource(el)
+    }
+    const a = audioCtx.createAnalyser()
+    a.fftSize = 1024
+    a.smoothingTimeConstant = 0.3
+    mediaSourceNode.connect(a)
+    a.connect(audioCtx.destination)
+    analyserNode = a
+    if (audioCtx.state === 'suspended') {
+      void audioCtx.resume()
+    }
+    return a
+  } catch (e) {
+    console.warn('playback analyser setup failed', e)
+    return null
+  }
+}
+
 let currentBlobUrl: string | null = null
+/** URL we should retry without crossOrigin if the CORS-anonymous load fails.
+ * Cleared on successful load (loadedmetadata) or on the next `setAudioFile`. */
+let pendingCorsRetryUrl: string | null = null
 
 /** Replace the audio source. Null clears it. */
 export function setAudioFile(file: File | Blob | null) {
@@ -71,6 +139,10 @@ export function setAudioFile(file: File | Blob | null) {
     URL.revokeObjectURL(currentBlobUrl)
     currentBlobUrl = null
   }
+  // Local blob URLs don't need crossOrigin; clearing keeps the load from
+  // being treated as a CORS request.
+  el.removeAttribute('crossorigin')
+  pendingCorsRetryUrl = null
   if (!file) {
     el.removeAttribute('src')
     el.load()
@@ -94,13 +166,21 @@ export function setAudioFile(file: File | Blob | null) {
 /** Point the audio element at a remote URL — used for URL-ingested
  * sources where we don't hold the bytes locally. Browser handles
  * playback natively (Range requests for finite files, live decode for
- * streamable formats). */
+ * streamable formats).
+ *
+ * `crossOrigin='anonymous'` is set so the playback AnalyserNode can read
+ * samples for the rolling-waveform visual. Sources without CORS headers
+ * will fail to load — at that point we fall back to no-crossOrigin
+ * (audio plays, no waveform) via the `error` handler below. */
 export function setAudioUrl(url: string) {
   const el = ensureEl()
   if (currentBlobUrl) {
     URL.revokeObjectURL(currentBlobUrl)
     currentBlobUrl = null
   }
+  // Try with crossOrigin first; auto-retry without if the source rejects CORS.
+  el.crossOrigin = 'anonymous'
+  pendingCorsRetryUrl = url
   el.src = url
   el.load()
   currentTime = 0
@@ -116,6 +196,12 @@ export function seek(t: number) {
 }
 
 export function play() {
+  // Resume any suspended context (no-op if not built or already running).
+  // Required because once `getPlaybackAnalyser` runs, audio routing goes
+  // through the AudioContext — a suspended context silences playback.
+  if (audioCtx && audioCtx.state === 'suspended') {
+    void audioCtx.resume()
+  }
   ensureEl()
     .play()
     .catch(() => {})

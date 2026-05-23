@@ -228,6 +228,14 @@ async def readyz():
     return {"status": "ready", "model_loaded": True}
 
 
+@app.get("/v1/debug/last_chunked_timing")
+async def last_chunked_timing():
+    """Return the per-chunk encoder/decoder/post breakdown from the most
+    recent chunked transcription. For perf debugging — not part of the
+    public API."""
+    return _LAST_CHUNKED_TIMING or {"info": "no chunked run since startup"}
+
+
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def get_index_page():
     """Serves the main HTML page for the UI."""
@@ -368,6 +376,11 @@ except Exception as e_vad_load:
 # Asynchronous lock to ensure exclusive access to the ASR model during transcription calls.
 # This prevents concurrent modifications to model state (e.g., device, dtype, attention settings).
 model_access_lock = asyncio.Lock()
+
+# Last-chunked-run timing breakdown — populated by _transcribe_chunked,
+# read by GET /v1/debug/last_chunked_timing. Lets us measure the
+# encoder vs decoder cost split without scraping container logs.
+_LAST_CHUNKED_TIMING: Optional[dict] = None
 
 # Dedicated single-thread executor for ASR calls. CUDA graphs are stream-bound:
 # a graph captured on stream A cannot be safely replayed on stream B. Python's
@@ -1698,7 +1711,7 @@ async def _transcribe_chunked(
         else waveform.to(dtype=torch.float32).contiguous().cpu().numpy()
     )
 
-    def _run() -> Tuple[List[dict], float]:
+    def _run() -> Tuple[List[dict], float, dict]:
         engine = StreamingPrevBatchedEngine(
             asr_model_instance=asr_model,
             chunk_secs=chunk_secs,
@@ -1706,20 +1719,31 @@ async def _transcribe_chunked(
             right_context_secs=right_secs,
             request_id=request_id,
             cancel_check=(cancel_event.is_set if cancel_event is not None else None),
+            enable_timing=True,  # cheap CUDA events; aggregated once after the run
         )
         try:
             engine.feed_float32(waveform_np)
-            # If cancellation fired mid-feed, don't flush/emit — the caller
-            # discards the (orphaned) request.
             if engine.cancelled:
-                return [], engine.asr_time_s
+                return [], engine.asr_time_s, engine.aggregate_timings()
             engine.flush()
             segs = engine.pop_final_segments()
-            return segs, engine.asr_time_s
+            return segs, engine.asr_time_s, engine.aggregate_timings()
         finally:
             engine.reset()
 
-    segments, asr_time = await _run_on_asr_executor(_run)
+    segments, asr_time, chunked_timing = await _run_on_asr_executor(_run)
+    # Stash for the debug GET endpoint so we can inspect the per-chunk
+    # encoder/decoder split without parsing container logs.
+    global _LAST_CHUNKED_TIMING
+    _LAST_CHUNKED_TIMING = {
+        "request_id": request_id,
+        "audio_duration_s": round(audio_duration_s, 2),
+        "asr_time_s": round(asr_time, 2),
+        "rtfx": round(audio_duration_s / asr_time, 1) if asr_time > 0 else None,
+        "chunk_secs": chunk_secs,
+        "right_context_secs": right_secs,
+        **chunked_timing,
+    }
 
     logger.info(
         f"({request_id}) chunked: dur={audio_duration_s:.2f}s "

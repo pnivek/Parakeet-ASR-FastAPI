@@ -291,6 +291,7 @@ class StreamingPrevBatchedEngine:
         right_context_secs: float,
         request_id: str = "stream-v2",
         cancel_check: Optional[Callable[[], bool]] = None,
+        enable_timing: bool = False,
     ):
         self.asr_model = asr_model_instance
         self.request_id = request_id
@@ -302,6 +303,11 @@ class StreamingPrevBatchedEngine:
         # (e.g. the REST client disconnected). None = never cancels.
         self._cancel_check = cancel_check
         self.cancelled = False
+        # Per-chunk CUDA-event instrumentation. Off by default; the offline
+        # chunked path turns it on so we can see encoder vs decoder vs post
+        # processing split. Events are cheap; we only sync at aggregation.
+        self._timing_enabled = enable_timing and torch.cuda.is_available()
+        self._chunk_event_tuples: List = []  # list of (enc_s, enc_e, dec_e, post_e)
 
         # Read invariants from the model config (mirrors the reference script).
         model_cfg = asr_model_instance._cfg
@@ -504,6 +510,40 @@ class StreamingPrevBatchedEngine:
     def asr_time_s(self) -> float:
         return self._asr_time_s
 
+    def aggregate_timings(self) -> dict:
+        """Sync once and aggregate the per-chunk CUDA event spans into
+        encoder / decoder / post buckets. No-op if timing wasn't enabled."""
+        if not self._chunk_event_tuples:
+            return {"enabled": False, "chunks": 0}
+        torch.cuda.synchronize()
+        enc_ms = dec_ms = post_ms = 0.0
+        enc_per = []
+        dec_per = []
+        for s, after_enc, after_dec, after_post in self._chunk_event_tuples:
+            e = s.elapsed_time(after_enc)
+            d = after_enc.elapsed_time(after_dec)
+            p = after_dec.elapsed_time(after_post)
+            enc_ms += e
+            dec_ms += d
+            post_ms += p
+            enc_per.append(e)
+            dec_per.append(d)
+        n = len(self._chunk_event_tuples)
+        return {
+            "enabled": True,
+            "chunks": n,
+            "encoder_ms_total": round(enc_ms, 1),
+            "decoder_ms_total": round(dec_ms, 1),
+            "post_ms_total": round(post_ms, 1),
+            "encoder_ms_per_chunk_mean": round(enc_ms / n, 2),
+            "decoder_ms_per_chunk_mean": round(dec_ms / n, 2),
+            "post_ms_per_chunk_mean": round(post_ms / n, 2),
+            "encoder_ms_per_chunk_first": round(enc_per[0], 2),
+            "encoder_ms_per_chunk_last": round(enc_per[-1], 2),
+            "decoder_ms_per_chunk_first": round(dec_per[0], 2),
+            "decoder_ms_per_chunk_last": round(dec_per[-1], 2),
+        }
+
     @property
     def pending_token_count(self) -> int:
         """Tokens accumulated in the current sentence buffer (haven't seen
@@ -535,6 +575,16 @@ class StreamingPrevBatchedEngine:
         chunk_len = chunk_samples.shape[0]
         device = self._device
 
+        # Per-chunk timing events (encoder vs decoder vs post). Recorded
+        # only when timing is enabled; no sync until aggregate_timings().
+        ev_start = ev_after_enc = ev_after_dec = ev_after_post = None
+        if self._timing_enabled:
+            ev_start = torch.cuda.Event(enable_timing=True)
+            ev_after_enc = torch.cuda.Event(enable_timing=True)
+            ev_after_dec = torch.cuda.Event(enable_timing=True)
+            ev_after_post = torch.cuda.Event(enable_timing=True)
+            ev_start.record()
+
         with torch.inference_mode():
             audio_batch = chunk_samples.unsqueeze(0)  # [1, T]
             chunk_lengths_batch = torch.tensor([chunk_len], dtype=torch.long, device=device)
@@ -554,6 +604,8 @@ class StreamingPrevBatchedEngine:
                     input_signal_length=self.buffer.context_size_batch.total(),
                 )
             encoder_output = encoder_output.transpose(1, 2)  # [B, T, C]
+            if ev_after_enc is not None:
+                ev_after_enc.record()
             # The captured CUDA graph was warmed up during FULL transcribes
             # under NeMo's own autocast and baked in bf16 inputs for the
             # joint's project_encoder Linear. Force the model's pinned dtype
@@ -580,6 +632,8 @@ class StreamingPrevBatchedEngine:
                     out_len=out_len,
                     prev_batched_state=self.state,
                 )
+            if ev_after_dec is not None:
+                ev_after_dec.record()
 
             # Merge into running hypothesis (for end-of-stream final transcript).
             if self.current_batched_hyps is None:
@@ -624,6 +678,10 @@ class StreamingPrevBatchedEngine:
                     if t_s < 0.0:
                         t_s = 0.0
                     self._committed_tokens.append((int(tid), t_s, lp))
+
+        if ev_after_post is not None:
+            ev_after_post.record()
+            self._chunk_event_tuples.append((ev_start, ev_after_enc, ev_after_dec, ev_after_post))
 
         self._chunk_index += 1
         self._asr_time_s += time.time() - t0

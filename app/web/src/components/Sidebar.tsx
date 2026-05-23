@@ -139,25 +139,19 @@ export function Sidebar({
   const recordStartRef = useRef<number>(0)
   const [recordElapsed, setRecordElapsed] = useState(0)
 
-  // Shared VAD config — only honored on mic+ws. File / URL paths stream
-  // faster than realtime so VAD adds CPU without latency benefit there.
-  const vadConfig = () => {
-    if (mode !== 'mic') {
-      return {
-        vad_enabled: false,
-      }
-    }
-    const mic = s.mic
-    return {
-      vad_enabled: mic.vadEnabled,
-      vad_threshold: mic.vadThreshold,
-      vad_consecutive: mic.vadConsecutive,
-      vad_hangover_ms: mic.vadHangoverMs,
-      vad_pad_min_gap_ms: mic.vadPadMinGapMs,
-      vad_pad_duration_ms: mic.vadPadDurationMs,
-      hpf_hz: mic.hpfHz,
-    }
-  }
+  // VAD + HPF config block. Pulled from the active modality — all three
+  // modalities carry these fields on CommonModality, but the server only
+  // honors them on WS-streaming paths (handle_streaming_pcm /
+  // handle_streaming_url). REST paths bypass ffmpeg + VAD entirely.
+  const vadConfig = () => ({
+    vad_enabled: m.vadEnabled,
+    vad_threshold: m.vadThreshold,
+    vad_consecutive: m.vadConsecutive,
+    vad_hangover_ms: m.vadHangoverMs,
+    vad_pad_min_gap_ms: m.vadPadMinGapMs,
+    vad_pad_duration_ms: m.vadPadDurationMs,
+    hpf_hz: m.hpfHz,
+  })
 
   // Partial-message throttle — see the original Sidebar's notes; same logic.
   const PARTIAL_THROTTLE_MS = 250
@@ -324,6 +318,39 @@ export function Sidebar({
   useEffect(() => {
     return () => mic.stopListening()
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // On page unload (refresh / tab close / navigation), close any open
+  // WS and abort any in-flight REST. Without this, the server's
+  // watch_ws_disconnect doesn't see the close until uvicorn's ping
+  // timeout fires (up to 5 min), so ffmpeg keeps pulling a URL stream
+  // and the model lock stays held. `pagehide` fires reliably on real
+  // unloads (including iOS Safari, which suppresses `beforeunload`).
+  useEffect(() => {
+    const handler = () => {
+      if (wsRef.current) {
+        try {
+          wsRef.current.abort()
+        } catch {
+          /* socket already gone */
+        }
+        wsRef.current = null
+      }
+      if (restAbortRef.current) {
+        try {
+          restAbortRef.current.abort()
+        } catch {
+          /* already aborted */
+        }
+        restAbortRef.current = null
+      }
+    }
+    window.addEventListener('pagehide', handler)
+    window.addEventListener('beforeunload', handler)
+    return () => {
+      window.removeEventListener('pagehide', handler)
+      window.removeEventListener('beforeunload', handler)
+    }
   }, [])
 
   const startMic = useCallback(async () => {
@@ -949,6 +976,86 @@ function EngineStrategyOutput({
   )
 }
 
+// ── Shared WS-streaming knob block ───────────────────────────────
+// Surfaces in the Advanced section whenever engine=websocket. Server
+// only honors these on the WS-streaming dispatch path (the chunked
+// engine reading from ffmpeg). REST + WS-accumulate (full/split_full)
+// bypass ffmpeg entirely, so we hide the knobs there.
+function WSStreamingKnobs({
+  modality,
+  update,
+}: {
+  modality: CommonModality
+  update: (patch: Partial<CommonModality>) => void
+}) {
+  return (
+    <>
+      <ToggleKv
+        k="Low-latency mode"
+        hint="live_latency — 10-2-2 preset for faster partials at lower throughput"
+        v={modality.liveLatency}
+        onSet={(v) => update({ liveLatency: v })}
+      />
+      <NumKv
+        k="High-pass filter"
+        hint="hpf_hz — ffmpeg highpass cutoff in Hz; 0 disables"
+        v={modality.hpfHz}
+        placeholder={100}
+        suffix="Hz"
+        onSet={(v) => update({ hpfHz: v ?? 100 })}
+      />
+
+      <div className="sb__adv-divider" />
+
+      <ToggleKv
+        k="Voice detection"
+        hint="vad_enabled — gates silence between ffmpeg and the engine"
+        v={modality.vadEnabled}
+        onSet={(v) => update({ vadEnabled: v })}
+      />
+      <NumKv
+        k="Speech threshold"
+        hint="vad_threshold — Silero probability cutoff 0..1; higher = pickier"
+        v={modality.vadThreshold}
+        placeholder={0.5}
+        step={0.05}
+        onSet={(v) => update({ vadThreshold: v ?? 0.5 })}
+      />
+      <NumKv
+        k="Onset frames"
+        hint="vad_consecutive — sustained speech frames to flip silent→speech"
+        v={modality.vadConsecutive}
+        placeholder={3}
+        onSet={(v) => update({ vadConsecutive: v ?? 3 })}
+      />
+      <NumKv
+        k="Hangover"
+        hint="vad_hangover_ms — keep forwarding this long after the last loud frame"
+        v={modality.vadHangoverMs}
+        placeholder={500}
+        suffix="ms"
+        onSet={(v) => update({ vadHangoverMs: v ?? 500 })}
+      />
+      <NumKv
+        k="Padding min gap"
+        hint="vad_pad_min_gap_ms — onset padding fires only when prior silence exceeded this"
+        v={modality.vadPadMinGapMs}
+        placeholder={400}
+        suffix="ms"
+        onSet={(v) => update({ vadPadMinGapMs: v ?? 400 })}
+      />
+      <NumKv
+        k="Onset padding"
+        hint="vad_pad_duration_ms — low-noise padding injected at speech onset"
+        v={modality.vadPadDurationMs}
+        placeholder={0}
+        suffix="ms"
+        onSet={(v) => update({ vadPadDurationMs: v ?? 0 })}
+      />
+    </>
+  )
+}
+
 // ── Upload pane ──────────────────────────────────────────────────
 function UploadPane({
   modality,
@@ -1099,12 +1206,7 @@ function UploadPane({
           />
         )}
         {modality.engine === 'websocket' && (
-          <ToggleKv
-            k="Low-latency mode"
-            hint="live_latency — 10-2-2 preset for faster partials at lower throughput"
-            v={modality.liveLatency}
-            onSet={(v) => update({ liveLatency: v })}
-          />
+          <WSStreamingKnobs modality={modality} update={update} />
         )}
       </div>
     </div>
@@ -1183,12 +1285,7 @@ function URLPane({
           />
         )}
         {modality.engine === 'websocket' && (
-          <ToggleKv
-            k="Low-latency mode"
-            hint="live_latency — 10-2-2 preset for faster partials at lower throughput"
-            v={modality.liveLatency}
-            onSet={(v) => update({ liveLatency: v })}
-          />
+          <WSStreamingKnobs modality={modality} update={update} />
         )}
       </div>
     </div>
@@ -1291,76 +1388,29 @@ function RecordPane({
 
       <SBLabel top={22}>Advanced</SBLabel>
       <div className="sb__adv-list">
-        {isWs && (
-          <ToggleKv
-            k="Low-latency mode"
-            hint="live_latency — smaller streaming chunks; faster partials, lower throughput"
-            v={modality.liveLatency}
-            onSet={(v) => update({ liveLatency: v })}
-          />
-        )}
-        <NumKv
-          k="High-pass filter"
-          hint="hpf_hz — ffmpeg highpass cutoff in Hz; 0 disables"
-          v={modality.hpfHz}
-          placeholder={100}
-          suffix="Hz"
-          onSet={(v) => update({ hpfHz: v ?? 100 })}
-        />
+        {/* Browser getUserMedia constraint — applies to mic capture
+            regardless of engine (Live or Record). The only knob that's
+            meaningful on Mic+REST. */}
         <ToggleKv
           k="Noise suppression"
           hint="noise_suppression — browser getUserMedia noise suppression"
           v={modality.noiseSuppression}
           onSet={(v) => update({ noiseSuppression: v })}
         />
+        {!isWs && (
+          <NumKv
+            k="Long-audio threshold"
+            hint="long_audio_threshold — switches to long-audio model settings above this duration"
+            v={modality.longAudioThreshold}
+            placeholder={480}
+            suffix="s"
+            onSet={(v) => update({ longAudioThreshold: v })}
+          />
+        )}
         {isWs && (
           <>
             <div className="sb__adv-divider" />
-            <ToggleKv
-              k="Voice detection"
-              hint="vad_enabled — gates silence so the engine queue stays drained"
-              v={modality.vadEnabled}
-              onSet={(v) => update({ vadEnabled: v })}
-            />
-            <NumKv
-              k="Speech threshold"
-              hint="vad_threshold — Silero probability cutoff 0..1; higher = pickier"
-              v={modality.vadThreshold}
-              placeholder={0.5}
-              step={0.05}
-              onSet={(v) => update({ vadThreshold: v ?? 0.5 })}
-            />
-            <NumKv
-              k="Onset frames"
-              hint="vad_consecutive — sustained speech frames to flip silent→speech"
-              v={modality.vadConsecutive}
-              placeholder={3}
-              onSet={(v) => update({ vadConsecutive: v ?? 3 })}
-            />
-            <NumKv
-              k="Hangover"
-              hint="vad_hangover_ms — keep forwarding this long after the last loud frame"
-              v={modality.vadHangoverMs}
-              placeholder={500}
-              suffix="ms"
-              onSet={(v) => update({ vadHangoverMs: v ?? 500 })}
-            />
-            <NumKv
-              k="Padding min gap"
-              hint="vad_pad_min_gap_ms — onset padding fires only when prior silence exceeded this"
-              v={modality.vadPadMinGapMs}
-              placeholder={400}
-              suffix="ms"
-              onSet={(v) => update({ vadPadMinGapMs: v ?? 400 })}
-            />
-            <NumKv
-              k="Onset padding"
-              hint="vad_pad_duration_ms — low-noise padding injected at speech onset"
-              v={modality.vadPadDurationMs}
-              placeholder={0}
-              suffix="ms"
-              onSet={(v) => update({ vadPadDurationMs: v ?? 0 })}
-            />
+            <WSStreamingKnobs modality={modality} update={update} />
           </>
         )}
       </div>

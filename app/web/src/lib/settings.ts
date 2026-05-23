@@ -16,7 +16,11 @@ export type ThemeMode = 'system' | 'light' | 'dark'
 
 export type Modality = 'file' | 'url' | 'mic'
 
-/** Fields every modality carries. */
+/** Fields every modality carries.
+ *
+ * VAD + HPF are WS-streaming-path concepts server-side (they live in the
+ * ffmpeg → engine pipeline, not in the REST decoder), so they appear on
+ * every modality but are only honored when `engine === 'websocket'`. */
 export interface CommonModality {
   engine: Engine
   /** REST-only override; ignored when engine === 'websocket'. */
@@ -31,18 +35,22 @@ export interface CommonModality {
    * partial responsiveness on a bounded upload), true for `url` and `mic`
    * (realtime sources benefit from faster commits + partials). */
   liveLatency: boolean
-}
-
-/** Mic modality also carries capture-quality knobs. */
-export interface MicModality extends CommonModality {
+  /** WS-streaming only — ffmpeg highpass cutoff (Hz); 0 disables. */
   hpfHz: number
-  noiseSuppression: boolean
+  /** WS-streaming only — Silero VAD gates silence between ffmpeg and engine. */
   vadEnabled: boolean
   vadThreshold: number
   vadConsecutive: number
   vadHangoverMs: number
   vadPadMinGapMs: number
   vadPadDurationMs: number
+}
+
+/** Mic modality adds capture-quality knobs that only apply when we own
+ * the browser mic. `noiseSuppression` is a `getUserMedia` constraint;
+ * meaningless on file/URL where we don't capture audio. */
+export interface MicModality extends CommonModality {
+  noiseSuppression: boolean
 }
 
 export interface Settings {
@@ -69,20 +77,24 @@ const COMMON_DEFAULTS: CommonModality = {
   timestampGranularities: ['segment', 'word'],
   longAudioThreshold: null,
   liveLatency: false,
+  hpfHz: 100,
+  // VAD defaults off for file/URL — finite uploads usually want every
+  // sample, and live URL streams can opt in via the toggle if they have
+  // silent / music gaps. Mic overrides this in MIC_DEFAULTS.
+  vadEnabled: false,
+  vadThreshold: 0.5,
+  vadConsecutive: 3,
+  vadHangoverMs: 500,
+  vadPadMinGapMs: 400,
+  vadPadDurationMs: 0,
 }
 
 const MIC_DEFAULTS: MicModality = {
   ...COMMON_DEFAULTS,
   engine: 'websocket', // live mic only delivers partials over WS
   liveLatency: true,
-  hpfHz: 100,
   noiseSuppression: true,
-  vadEnabled: true,
-  vadThreshold: 0.5,
-  vadConsecutive: 3,
-  vadHangoverMs: 500,
-  vadPadMinGapMs: 400,
-  vadPadDurationMs: 0,
+  vadEnabled: true, // mic needs VAD to keep the engine queue drained
 }
 
 const DEFAULTS: Omit<Settings, 'set' | 'update' | 'reset'> = {

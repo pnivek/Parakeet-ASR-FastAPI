@@ -1076,7 +1076,7 @@ function UploadPane({
       </div>
       <div className="sb__file-formats">wav · mp3 · flac · m4a · ogg · webm</div>
 
-      <EngineStrategy modality="file" m={modality} update={update} />
+      <EngineStrategy modality="file" m={modality} update={update} alwaysShowStrategy />
 
       <SBLabel top={22}>Advanced</SBLabel>
       <div className="sb__adv-list">
@@ -1145,7 +1145,7 @@ function URLPane({
         </span>
       </div>
 
-      <EngineStrategy modality="url" m={modality} update={update} />
+      <EngineStrategy modality="url" m={modality} update={update} alwaysShowStrategy />
 
       <SBLabel top={22}>Advanced</SBLabel>
       <div className="sb__adv-list">

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { TranscriptionResponse } from './lib/api'
-import { setAudioFile, setDurationHint, useAudioContainer, useCurrentTime } from './lib/playback'
+import { setAudioFile, setAudioUrl, setDurationHint, useAudioContainer, useCurrentTime } from './lib/playback'
 import { computePeaks, readWavDuration } from './lib/peaks'
 import type { LoadedAudio } from './lib/download'
 import type { WhisperSegment, Word } from './lib/types'
@@ -114,8 +114,10 @@ export default function App() {
       setAudioFile(l.file)
       // peaks decode runs in the useEffect above when loaded.file changes.
     } else {
-      // URL ingest: we don't have the bytes locally, so no playback / peaks.
-      setAudioFile(null)
+      // URL ingest: point the audio element at the URL directly so the
+      // user can play / scrub. Peaks decode is gated to local blobs (see
+      // useEffect on loadedFile) — no waveform for URL sources.
+      setAudioUrl(l.url)
     }
     // Duration fallback from the server's reported duration. Mic
     // recordings are WebM/Opus blobs whose <audio> element duration is
@@ -238,6 +240,8 @@ export default function App() {
     setLoaded(l)
     if (l.kind === 'file') {
       setAudioFile(l.file)
+    } else {
+      setAudioUrl(l.url)
     }
   }
 

@@ -2529,10 +2529,16 @@ async def transcribe_endpoint_rest(
         return JSONResponse(status_code=500, content={"error": "An unexpected server error occurred in the REST endpoint.", "detail": str(e_outer_rest_handler)})
     finally:
         # Ensure file object from UploadFile is closed if FastAPI hasn't handled it.
-        if hasattr(file, 'file') and file.file and not file.file.closed:
+        if file is not None and hasattr(file, 'file') and file.file and not file.file.closed:
             await asyncio.to_thread(file.file.close)
 
-        logger.info(f"({request_id}) REST request for file '{file.filename}' completed with status code {response_status_code if 'response_status_code' in locals() else 'unknown'}.")
+        source_label = (
+            f"file '{file.filename}'" if file is not None else f"url {url!r}"
+        )
+        logger.info(
+            f"({request_id}) REST request for {source_label} completed with status code "
+            f"{response_status_code if 'response_status_code' in locals() else 'unknown'}."
+        )
 
 
 async def _ws_accumulate_then_process(

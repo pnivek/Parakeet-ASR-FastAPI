@@ -464,8 +464,9 @@ export function Sidebar({
       const urlModality = s.url
       if (urlModality.engine === 'websocket') {
         // URL-over-WS: server opens ffmpeg `-i <url>` and streams partials.
-        // The client has no local audio bytes (live stream), so the hero
-        // waveform / playback stays blank.
+        // Browser plays the URL natively in parallel so the user can scrub
+        // the live stream while transcription arrives. No waveform peaks
+        // (live stream — peaks decode would need the full bytes).
         cancelPendingPartial()
         segmentsRef.current = []
         wordsRef.current = []
@@ -478,6 +479,9 @@ export function Sidebar({
         } catch {
           staged = { kind: 'url', title: urlInput.trim(), source: 'live stream', url: urlInput.trim() }
         }
+        // Wire the audio element to the URL immediately so the user can
+        // play the stream while transcription is in flight.
+        onAudioReady?.(staged)
         setBusyAll(true)
         try {
           const urlWs: LiveWSHandle = connectLiveWS(
@@ -490,6 +494,10 @@ export function Sidebar({
               strategy: 'streaming',
               live_latency: false,
               long_audio_threshold: urlModality.longAudioThreshold ?? undefined,
+              // Disable VAD for URL streams — vadConfig() returns vad_enabled
+              // false for non-mic modalities. Server otherwise defaults VAD on,
+              // which gates network audio too aggressively.
+              ...vadConfig(),
             },
             {
               onMessage: (msg) => handleMessage(msg, { staged }),
@@ -510,7 +518,22 @@ export function Sidebar({
         }
         return
       }
-      // REST URL
+      // REST URL — wire the audio element to the URL immediately so the
+      // user can play / scrub while the server fetches + transcribes.
+      let urlName = urlInput
+      try {
+        const u = new URL(urlInput.trim())
+        urlName = u.pathname.split('/').filter(Boolean).pop() || u.host
+      } catch {
+        /* keep input */
+      }
+      const stagedUrl: LoadedAudio = {
+        kind: 'url',
+        title: urlName,
+        source: 'via URL',
+        url: urlInput.trim(),
+      }
+      onAudioReady?.(stagedUrl)
       setBusyAll(true)
       const ac = new AbortController()
       restAbortRef.current = ac
@@ -525,14 +548,7 @@ export function Sidebar({
           },
           { signal: ac.signal },
         )
-        let name = urlInput
-        try {
-          const u = new URL(urlInput)
-          name = u.pathname.split('/').filter(Boolean).pop() || u.host
-        } catch {
-          /* keep input */
-        }
-        onResult({ kind: 'url', title: name, source: 'via URL', url: urlInput.trim() }, r)
+        onResult(stagedUrl, r)
       } catch (e) {
         if (e instanceof DOMException && e.name === 'AbortError') return
         onError(e instanceof Error ? e.message : String(e))

@@ -91,6 +91,25 @@ export function setAudioFile(file: File | Blob | null) {
   notify()
 }
 
+/** Point the audio element at a remote URL — used for URL-ingested
+ * sources where we don't hold the bytes locally. Browser handles
+ * playback natively (Range requests for finite files, live decode for
+ * streamable formats). */
+export function setAudioUrl(url: string) {
+  const el = ensureEl()
+  if (currentBlobUrl) {
+    URL.revokeObjectURL(currentBlobUrl)
+    currentBlobUrl = null
+  }
+  el.src = url
+  el.load()
+  currentTime = 0
+  duration = 0
+  durationHint = 0
+  isPlaying = false
+  notify()
+}
+
 export function seek(t: number) {
   const el = ensureEl()
   el.currentTime = Math.max(0, t)

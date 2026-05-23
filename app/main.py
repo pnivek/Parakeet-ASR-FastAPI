@@ -670,13 +670,16 @@ def resolve_strategy(
 
     Explicit non-AUTO strategies from client_config win. Otherwise AUTO routes:
 
-    - Streaming  -> PROGRESSIVE  (live PCM through the v2 streaming engine)
-    - Otherwise  -> CHUNKED      (offline waveform through the same engine)
+    - Streaming                            -> PROGRESSIVE
+    - Non-streaming, duration ≤ cap        -> FULL     (one batched pass, ~3-5×
+                                              faster than CHUNKED when it fits)
+    - Non-streaming, duration > cap or None -> CHUNKED  (bounded memory)
 
-    `FULL` remains explicit-only — it's the fastest single-pass path for known-long
-    offline files but skips the per-sentence segmentation the chunked engine
-    provides. All three strategies share one encoder + `decoding_computer`
-    pipeline; the legacy `BatchedFrameASRTDT`-based engines were retired in C6.
+    The duration cap is `MAX_FULL_WAVEFORM_S` (env, default 1440s = 24min) and
+    should be tuned per deployment to whatever the GPU's verified FULL ceiling
+    is. The probe on a 128 GB DGX Spark put the real OOM at ~9.6h; an 8h
+    setting gives ~20% safety margin. All three strategies share one encoder
+    + `decoding_computer` pipeline.
     """
     requested = client_config.get("strategy", ProcessingStrategy.AUTO)
     if isinstance(requested, str):
@@ -687,6 +690,12 @@ def resolve_strategy(
 
     if is_streaming:
         return ProcessingStrategy.PROGRESSIVE
+
+    # Non-streaming AUTO prefers FULL when the audio fits under the
+    # deployment's safety cap. Above the cap we fall back to CHUNKED so a
+    # too-long file can't OOM the encoder.
+    if audio_duration_s is not None and audio_duration_s <= MAX_FULL_WAVEFORM_S:
+        return ProcessingStrategy.FULL
 
     return ProcessingStrategy.CHUNKED
 

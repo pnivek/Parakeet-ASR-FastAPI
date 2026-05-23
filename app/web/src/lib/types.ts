@@ -13,25 +13,19 @@
 
 export type ResponseFormat = 'json' | 'text' | 'srt' | 'vtt' | 'verbose_json'
 
-/** Engine — the transport / delivery axis. Mutually exclusive. */
-export type Engine = 'offline' | 'streaming'
+/** Engine — the transport axis the user picks per modality.
+ * `rest`      → HTTP POST.
+ * `websocket` → WebSocket; live partials while audio is in flight. */
+export type Engine = 'rest' | 'websocket'
 
-/** Strategy override for the offline engine. Default `auto` lets the server
- * pick `full` (≤ MAX_FULL_WAVEFORM_S) vs `split_full` (above). Explicit values
- * force a particular implementation. */
-export type StrategyOverride = 'auto' | 'full' | 'split_full' | 'chunked'
+/** Strategy override for the REST engine. Default `auto` lets the server pick
+ * `full` (≤ MAX_FULL_WAVEFORM_S) vs `split_full` (above). Explicit values force
+ * a particular implementation. */
+export type StrategyOverride = 'auto' | 'full' | 'split_full'
 
 /** Wire-level strategy enum the server's `?strategy=` param accepts. The UI
- * derives it from (engine, strategyOverride) — see Sidebar `restStrategyParam`.
- * `progressive` is a legacy alias of `streaming` accepted for one release. */
-export type Strategy =
-  | 'auto'
-  | 'offline'
-  | 'full'
-  | 'split_full'
-  | 'chunked'
-  | 'streaming'
-  | 'progressive'
+ * derives it from (engine, strategyOverride) — see Sidebar `restStrategyParam`. */
+export type Strategy = 'offline' | 'full' | 'split_full' | 'streaming'
 
 export type TimestampGranularity = 'segment' | 'word'
 
@@ -100,6 +94,9 @@ export interface WSConfig {
   bytes_per_sample: number
   /** Audio container/codec ffmpeg will be told to decode. */
   format: string
+  /** When set, the server opens `ffmpeg -i <url>` and skips the binary-frame
+   * reader. Suits HLS / icecast / RTSP / m3u8 live-stream URLs. */
+  url?: string
   strategy?: Strategy
   chunk_length?: number
   chunk_overlap?: number

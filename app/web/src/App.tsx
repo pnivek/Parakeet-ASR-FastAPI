@@ -13,7 +13,9 @@ import { useSettings } from './lib/settings'
 import './App.css'
 
 export default function App() {
-  const [mode, setMode] = useState<InputMode>('file')
+  const mode = useSettings((s) => s.mode)
+  const setSettingsMode = useSettings((s) => s.set)
+  const setMode = (m: InputMode) => setSettingsMode('mode', m)
   const [loaded, setLoaded] = useState<LoadedAudio | null>(null)
   const [result, setResult] = useState<TranscriptionResponse | null>(null)
   const [peaks, setPeaks] = useState<number[] | null>(null)
@@ -270,22 +272,16 @@ export default function App() {
   const language =
     result?.format === 'verbose_json' ? result.body.language || 'en' : 'en'
 
-  // Active strategy for the footer — there's always one. mic+live is
-  // locked to Engine=Streaming. Otherwise show the chosen engine; if
-  // it's offline + an explicit strategy override, surface the override
-  // instead (more informative). The footer prefers the resolved value
-  // from the server result when present and falls back to this.
-  const engine = useSettings((st) => st.engine)
-  const strategyOverride = useSettings((st) => st.strategyOverride)
-  const micCaptureMode = useSettings((st) => st.micCaptureMode)
+  // Active strategy for the footer — derived from the active modality's
+  // settings. The footer prefers the resolved value from the server
+  // result when present and falls back to this.
+  const modalitySettings = useSettings((st) => st[st.mode])
   const activeStrategy =
-    mode === 'mic' && micCaptureMode === 'live'
+    modalitySettings.engine === 'websocket'
       ? 'streaming'
-      : engine === 'streaming'
-        ? 'streaming'
-        : strategyOverride === 'auto'
-          ? 'offline'
-          : strategyOverride
+      : modalitySettings.strategyOverride === 'auto'
+        ? 'offline'
+        : modalitySettings.strategyOverride
 
   return (
     <div className="app">

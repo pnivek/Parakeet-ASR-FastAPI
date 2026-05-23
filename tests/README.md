@@ -34,7 +34,7 @@ number to stack against NVIDIA's 1.69%. Computed as
 `total_edits / total_reference_words` (true corpus WER, NOT mean-of-means).
 
 **Long-form WER table** — per-talk WER for each strategy on the 11 TED talks.
-Lets you see if `chunked_v2` matches `full` on a 25-min file, or if some
+Lets you see if `split_full` matches `full` on a 25-min file, or if some
 talks degrade more than others.
 
 **Long-form corpus WER** — pooled across all 11 talks. Strategy-level number
@@ -46,20 +46,18 @@ for long-form quality.
 
 | Strategy | Transport | Default short cap | Notes |
 |---|---|---|---|
-| `full` | REST POST | all 2620 | Ground-truth quality baseline |
-| `chunked` | REST POST | all 2620 | Legacy `BatchedFrameASRTDT` — known boundary artifacts on short clips |
-| `chunked_v2` | REST POST | all 2620 | NVIDIA-blessed `StreamingBatchedAudioBuffer + prev_batched_state` |
-| `progressive` | WS stream | 50 (`--ws-limit`) | Legacy streaming, partial emits via `segments_batch` |
-| `progressive_v2` | WS stream | 50 (`--ws-limit`) | Same `_v2` engine driven from ffmpeg PCM stream |
+| `full` | REST POST | all 2620 | Single-pass encode + decode of the full waveform |
+| `split_full` | REST POST | all 2620 | Sequential FULL passes over slices with seam-stitching |
+| `streaming` | WS stream | 50 (`--ws-limit`) | ffmpeg PCM stream into `StreamingPrevBatchedEngine` |
 
-WS strategies have ~30s of per-request teardown overhead (ffmpeg flush +
-right-context wait), so running them on 2620 utterances is 22h of wall time
-for no extra signal. The harness caps them at `--ws-limit` (default 50).
+WS `streaming` has ~30s of per-request teardown overhead (ffmpeg flush +
+right-context wait), so running it on 2620 utterances is 22h of wall time
+for no extra signal. The harness caps it at `--ws-limit` (default 50).
 
-For long-form, WS strategies are excluded by default (a 25-min talk through
+For long-form, WS `streaming` is excluded by default (a 25-min talk through
 WS adds 30s overhead but the talk itself takes 4+ min anyway — fine in
 theory, but not informative when we already have REST numbers). Override by
-running with `--strategies progressive_v2` explicitly.
+running with `--strategies streaming` explicitly.
 
 ## Pytest thresholds
 
@@ -68,19 +66,14 @@ running with `--strategies progressive_v2` explicitly.
 | Strategy | short (≤30s LibriSpeech) | longform (5-25 min TED talks) |
 |---|---|---|
 | `full` | 10% | 15% |
-| `chunked_v2` | 10% | 15% |
-| `progressive_v2` | 20% | 15% |
-| `chunked` (legacy) | 75% | 20% |
-| `progressive` (legacy) | 75% | 20% |
+| `split_full` | 10% | 15% |
+| `streaming` | 20% | 15% |
 
 Parakeet's NVIDIA-reported short-clip number on LibriSpeech-clean is 1.69%,
-so any short-clip failure on `full` / `_v2` indicates a real engine bug.
-The `progressive_v2` short headroom (20%) is wider because its first chunk's
+so any short-clip failure on `full` / `split_full` indicates a real engine
+bug. The `streaming` short headroom (20%) is wider because its first chunk's
 right context is silence padding, which can flip one phoneme on a 3-5s
-utterance (one wrong word = 10-15% WER at this length). Legacy
-`chunked` / `progressive` get a wide short gate because their middle-token
-merge artifacts are documented pre-existing behavior — the whole reason
-`_v2` exists.
+utterance (one wrong word = 10-15% WER at this length).
 
 For an exhaustive comparison vs NVIDIA's published number, use the harness
 CLI directly (not pytest) with no `--short-limit` — that runs all 2620
@@ -117,8 +110,8 @@ tests/fixtures/
 
 1. **`full` errors above MAX_FULL_WAVEFORM_S** (default 1440s server-side).
    The TED `BillGates` talk is 1506s — explicit `?strategy=full` against it
-   will error. `chunked_v2` handles it (capped by `STATEFUL_MAX_DURATION_S`,
-   default 1800s). The harness records the error rather than crashing.
+   will error. `split_full` handles it via sequential FULL passes. The harness
+   records the error rather than crashing.
 2. **The harness measures correctness end-to-end, not real-time pacing.**
    It feeds WS bytes as fast as the network allows; "emission lag" numbers
    reflect server processing, not realistic client throttling.

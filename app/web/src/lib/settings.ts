@@ -2,9 +2,11 @@
  * Persisted client settings. Zustand store + the `persist` middleware writes
  * to localStorage so user choices survive reloads.
  *
- * Keep all knobs the server accepts in one place — keys map to the server's
- * WS / REST field names verbatim so `settings → PostParams / WSConfig` is a
- * trivial spread.
+ * Settings are nested per-modality (`file` / `url` / `mic`) so each workflow
+ * remembers its own engine, output format, and modality-specific knobs. The
+ * active tab is persisted as `mode`. Mutate via `set(key, value)` for top-
+ * level fields or `update('file', { engine: 'websocket' })` for a per-modality
+ * patch.
  */
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
@@ -12,102 +14,77 @@ import type { Engine, ResponseFormat, StrategyOverride, TimestampGranularity } f
 
 export type ThemeMode = 'system' | 'light' | 'dark'
 
-export interface Settings {
-  // OpenAI-shape knobs
+export type Modality = 'file' | 'url' | 'mic'
+
+/** Fields every modality carries. */
+export interface CommonModality {
+  engine: Engine
+  /** REST-only override; ignored when engine === 'websocket'. */
+  strategyOverride: StrategyOverride
   responseFormat: ResponseFormat
   timestampGranularities: TimestampGranularity[]
-
-  // Two-axis transcription picker:
-  //   engine          — transport: REST upload vs WebSocket live partials.
-  //   strategyOverride — offline-engine implementation. `auto` lets the
-  //                      server pick full ≤ MAX_FULL_WAVEFORM_S, else split_full.
-  //                      Hidden in the UI when engine === 'streaming'.
-  engine: Engine
-  strategyOverride: StrategyOverride
-  chunkLength: number | null
-  chunkOverlap: number | null
-  batchSize: number | null
+  /** REST-only knob; hidden when engine === 'websocket'. */
   longAudioThreshold: number | null
+}
 
-  // Streaming (WS) knobs
+/** Mic modality also carries live + capture-quality knobs. */
+export interface MicModality extends CommonModality {
   liveLatency: boolean
-
-  // Voice activity detection + noise (mic / WS path)
-  vadEnabled: boolean
-  /** Silero probability cutoff (0..1). Higher = pickier. */
-  vadThreshold: number
-  /** Frames of sustained speech required to flip silent → speech. */
-  vadConsecutive: number
-  /** Hangover (ms) — keep forwarding for this long after last loud frame. */
-  vadHangoverMs: number
-  /** Pre-utterance padding fires only when prior silence exceeded this. */
-  vadPadMinGapMs: number
-  /** Length of the low-noise padding injected at speech onset. */
-  vadPadDurationMs: number
-  /** ffmpeg `highpass=f=N`. Set 0 to disable. */
   hpfHz: number
-  /** Forwarded to `getUserMedia({ audio: { noiseSuppression } })`. */
   noiseSuppression: boolean
+  vadEnabled: boolean
+  vadThreshold: number
+  vadConsecutive: number
+  vadHangoverMs: number
+  vadPadMinGapMs: number
+  vadPadDurationMs: number
+}
 
-  /** Mic capture mode: 'live' streams via WS during recording; 'record'
-   * just captures locally then transcribes the finished blob as a file
-   * (REST upload). Default 'live'. */
-  micCaptureMode: 'live' | 'record'
+export interface Settings {
+  /** Active modality tab. */
+  mode: Modality
 
-  // UI
+  file: CommonModality
+  url: CommonModality
+  mic: MicModality
+
   theme: ThemeMode
 
-  // Mutators
   set: <K extends keyof Settings>(key: K, value: Settings[K]) => void
+  /** Per-modality partial patcher — collapses prop-drilling of individual
+   * setters in the sidebar. */
+  update: <M extends Modality>(m: M, patch: Partial<Settings[M]>) => void
   reset: () => void
 }
 
-const DEFAULTS: Omit<Settings, 'set' | 'reset'> = {
+const COMMON_DEFAULTS: CommonModality = {
+  engine: 'rest',
+  strategyOverride: 'auto',
   responseFormat: 'verbose_json',
   timestampGranularities: ['segment', 'word'],
-  engine: 'offline',
-  strategyOverride: 'auto',
-  chunkLength: null,
-  chunkOverlap: null,
-  batchSize: null,
   longAudioThreshold: null,
-  liveLatency: true,
+}
 
+const MIC_DEFAULTS: MicModality = {
+  ...COMMON_DEFAULTS,
+  engine: 'websocket', // live mic only delivers partials over WS
+  liveLatency: true,
+  hpfHz: 100,
+  noiseSuppression: true,
   vadEnabled: true,
   vadThreshold: 0.5,
   vadConsecutive: 3,
   vadHangoverMs: 500,
   vadPadMinGapMs: 400,
   vadPadDurationMs: 0,
-  hpfHz: 100,
-  noiseSuppression: true,
-
-  micCaptureMode: 'live',
-
-  theme: 'system',
 }
 
-/** Coerce a persisted snapshot from the pre-split (single-`strategy`) era into
- * the new (engine, strategyOverride) pair. Idempotent: snapshots that already
- * carry `engine` pass through untouched. */
-function migrateLegacyStrategy(snap: Record<string, unknown>): Record<string, unknown> {
-  if (typeof snap.engine === 'string') return snap
-  const legacy = typeof snap.strategy === 'string' ? snap.strategy.toLowerCase() : 'auto'
-  const out: Record<string, unknown> = { ...snap }
-  delete out.strategy
-  delete out.progressiveRefinement
-  if (legacy === 'progressive' || legacy === 'streaming') {
-    out.engine = 'streaming'
-    out.strategyOverride = 'auto'
-  } else if (legacy === 'full' || legacy === 'chunked' || legacy === 'split_full') {
-    out.engine = 'offline'
-    out.strategyOverride = legacy as StrategyOverride
-  } else {
-    // 'auto' (or unknown) → safest default: offline + auto.
-    out.engine = 'offline'
-    out.strategyOverride = 'auto'
-  }
-  return out
+const DEFAULTS: Omit<Settings, 'set' | 'update' | 'reset'> = {
+  mode: 'file',
+  file: { ...COMMON_DEFAULTS },
+  url: { ...COMMON_DEFAULTS },
+  mic: { ...MIC_DEFAULTS },
+  theme: 'system',
 }
 
 export const useSettings = create<Settings>()(
@@ -115,18 +92,12 @@ export const useSettings = create<Settings>()(
     (set) => ({
       ...DEFAULTS,
       set: (key, value) => set({ [key]: value } as Partial<Settings>),
+      update: (m, patch) =>
+        set((s) => ({ [m]: { ...s[m], ...patch } } as Partial<Settings>)),
       reset: () => set(DEFAULTS),
     }),
     {
       name: 'parakeet-settings',
-      // When the persisted shape lacks newly-added fields (e.g. user
-      // hasn't reset since we added vadThreshold), merge DEFAULTS in so
-      // those knobs get sensible values without forcing a reset.
-      // Also coerce pre-split `strategy` snapshots into the new two-axis pair.
-      merge: (persisted, current) => ({
-        ...current,
-        ...migrateLegacyStrategy((persisted ?? {}) as Record<string, unknown>),
-      }),
     },
   ),
 )

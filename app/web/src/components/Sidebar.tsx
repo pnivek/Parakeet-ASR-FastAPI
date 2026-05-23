@@ -7,16 +7,24 @@ import {
   connectLiveWS,
   type LiveWSHandle,
 } from '../lib/api'
-import { useSettings } from '../lib/settings'
+import { useSettings, type CommonModality, type MicModality, type Modality } from '../lib/settings'
 import { MIC_FORMAT_HINT, MIC_SAMPLE_RATE, MIC_MIME_TYPE, useMic } from '../lib/mic'
 import { formatBytes } from '../lib/format'
-import type { Engine, ResponseFormat, Strategy, StrategyOverride, TimestampGranularity, WhisperSegment, Word, WSMessage } from '../lib/types'
+import type {
+  Engine,
+  ResponseFormat,
+  Strategy,
+  StrategyOverride,
+  TimestampGranularity,
+  WhisperSegment,
+  Word,
+  WSMessage,
+} from '../lib/types'
 import type { LoadedAudio } from '../lib/download'
 import { OptionList } from './OptionList'
 
-export type InputMode = 'file' | 'mic' | 'url'
-
-type SidebarTab = 'source' | 'output' | 'engine'
+/** Alias retained so App.tsx and HeroRow keep their existing type imports. */
+export type InputMode = Modality
 
 interface Props {
   mode: InputMode
@@ -25,24 +33,10 @@ interface Props {
   onPartial: (result: TranscriptionResponse) => void
   onError: (message: string) => void
   onBusyChange: (busy: boolean) => void
-  /** Called right before a new transcription/recording starts. Clears
-   * prior transcript state. Pass `{ resetHero: true }` to also wipe the
-   * hero waveform/identity — used by mic (fresh recording) and url; file
-   * mode omits it so an already-decoded waveform persists (no flash /
-   * no redundant re-decode). */
   onSessionStart?: (opts?: { resetHero?: boolean }) => void
-  /** Called early in a streaming session to wire the audio source without
-   * setting the final result (so the user can scrub/play during streaming). */
   onAudioReady?: (loaded: LoadedAudio) => void
-  /** Called when the user removes the staged source (✕ on the file card)
-   * — wipes the hero waveform/metadata/transcript. */
   onClearSource?: () => void
-  /** Progressive PCM peaks from the server — append or replace the hero
-   * waveform's peaks array. Lets mic mode draw bars as the user speaks
-   * instead of waiting for final_transcription + blob decode. */
   onPeaks?: (peaks: number[], cumulative: boolean) => void
-  /** Read-only peek of the engine's in-flight sentence buffer. Null
-   * clears it (e.g., the sentence just committed). */
   onPartialSegment?: (segment: WhisperSegment | null, words: Word[]) => void
 }
 
@@ -53,29 +47,57 @@ const FORMATS: { id: ResponseFormat; label: string }[] = [
   { id: 'srt', label: 'srt' },
   { id: 'vtt', label: 'vtt' },
 ]
-const ENGINES: { id: Engine; label: string; hint: string }[] = [
-  { id: 'offline', label: 'Offline', hint: 'REST upload, no live partials. Best for files, URLs, recordings.' },
-  { id: 'streaming', label: 'Streaming', hint: 'WebSocket with live segments as they’re transcribed. Required for mic + live.' },
-]
 
 const STRATEGY_OVERRIDES: { id: StrategyOverride; label: string; hint: string }[] = [
   { id: 'auto', label: 'Auto', hint: 'Server picks Full / Split-full based on file size.' },
   { id: 'full', label: 'Full pass', hint: 'Force a single pass. Errors if it would OOM.' },
   { id: 'split_full', label: 'Split-full', hint: 'Force sequential full passes over slices, stitched at seams.' },
-  { id: 'chunked', label: 'Chunked', hint: 'Force the chunked engine (offline, no partials). For benchmarking against streaming; slower than Full on this GPU.' },
 ]
 
+/** Per-modality tooltips for the Engine picker — explains what each engine
+ * does in the context of its modality. */
+const ENGINE_TOOLTIPS: Record<Modality, Record<Engine, string>> = {
+  file: {
+    rest: 'HTTP POST the file. Server returns one response.',
+    websocket: "Stream the file's bytes over WS. Watch segments arrive during the upload.",
+  },
+  url: {
+    rest: 'Server downloads the URL and transcribes the complete file.',
+    websocket: 'Server pipes the URL through ffmpeg live. Works for HLS, icecast, RTSP, m3u8.',
+  },
+  mic: {
+    rest: 'Record locally, upload as a file when you stop.',
+    websocket: 'Live transcription. Partials appear as you speak.',
+  },
+}
+
 /** Wire-level `?strategy=` param the backend expects, derived from the
- * two-axis (engine, strategyOverride) UI vocabulary. */
-function restStrategyParam(engine: Engine, override: StrategyOverride): Strategy {
-  if (engine === 'streaming') return 'streaming'
-  // engine === 'offline'
+ * (engine, strategyOverride) pair. */
+function restStrategyParam(override: StrategyOverride): Strategy {
   return override === 'auto' ? 'offline' : (override as Strategy)
 }
 
-export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBusyChange, onSessionStart, onAudioReady, onClearSource, onPeaks, onPartialSegment }: Props) {
+const TABS: { id: Modality; label: string }[] = [
+  { id: 'file', label: 'Upload' },
+  { id: 'url', label: 'URL' },
+  { id: 'mic', label: 'Record' },
+]
+
+export function Sidebar({
+  mode,
+  onModeChange,
+  onResult,
+  onPartial,
+  onError,
+  onBusyChange,
+  onSessionStart,
+  onAudioReady,
+  onClearSource,
+  onPeaks,
+  onPartialSegment,
+}: Props) {
   const s = useSettings()
-  const [tab, setTab] = useState<SidebarTab>('source')
+  const m = s[mode] as CommonModality | MicModality
   const [busy, setBusy] = useState(false)
   const [progress, setProgress] = useState<number | null>(null)
 
@@ -90,19 +112,13 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   // File state
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [pickedFile, setPickedFile] = useState<File | null>(null)
-  // Mic *recording* staged blob — kept separate from `pickedFile` so a
-  // file chosen in upload mode never shows up as a staged recording in
-  // the mic pane (and vice versa).
+  // Mic-record staged blob — kept separate from `pickedFile`.
   const [micBlob, setMicBlob] = useState<File | null>(null)
   const [dragOver, setDragOver] = useState(false)
   const onFiles = (files: FileList | null) => {
     if (!files || files.length === 0) return
     const file = files[0]
     setPickedFile(file)
-    // Wire the audio source + kick off peaks decode immediately. We
-    // already have the entire audio locally — no reason to wait for the
-    // user to click Transcribe. The waveform fades in as soon as
-    // decodeAudioData resolves.
     onAudioReady?.({
       kind: 'file',
       title: file.name.replace(/\.[^.]+$/, ''),
@@ -114,10 +130,8 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   // URL state
   const [urlInput, setUrlInput] = useState('https://')
 
-  // Mic state — live capture
+  // Mic / streaming state
   const wsRef = useRef<LiveWSHandle | null>(null)
-  // AbortController for the in-flight REST upload (file/url, non-progressive).
-  // Held in a ref because we need to reach in from the Stop button click.
   const restAbortRef = useRef<AbortController | null>(null)
   const segmentsRef = useRef<WhisperSegment[]>([])
   const wordsRef = useRef<Word[]>([])
@@ -125,48 +139,27 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   const recordStartRef = useRef<number>(0)
   const [recordElapsed, setRecordElapsed] = useState(0)
 
-  // ── Keep Engine valid for the current source ──
-  // Backend reality:
-  //  - mic + live           → only the WS streaming engine can emit live
-  //                           partials, so lock Engine=Streaming.
-  //  - url / mic + record   → REST upload only (URL is server-fetched, a
-  //                           finished recording is a plain blob), so lock
-  //                           Engine=Offline.
-  //  - file                 → both selectable (Streaming uses WS file
-  //                           streaming for live partials).
-  useEffect(() => {
-    if (mode === 'mic' && s.micCaptureMode === 'live') {
-      if (s.engine !== 'streaming') s.set('engine', 'streaming')
-    } else if (mode === 'url' || (mode === 'mic' && s.micCaptureMode === 'record')) {
-      if (s.engine !== 'offline') s.set('engine', 'offline')
+  // Shared VAD config — only honored on mic+ws. File / URL paths stream
+  // faster than realtime so VAD adds CPU without latency benefit there.
+  const vadConfig = () => {
+    if (mode !== 'mic') {
+      return {
+        vad_enabled: false,
+      }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, s.micCaptureMode])
+    const mic = s.mic
+    return {
+      vad_enabled: mic.vadEnabled,
+      vad_threshold: mic.vadThreshold,
+      vad_consecutive: mic.vadConsecutive,
+      vad_hangover_ms: mic.vadHangoverMs,
+      vad_pad_min_gap_ms: mic.vadPadMinGapMs,
+      vad_pad_duration_ms: mic.vadPadDurationMs,
+      hpf_hz: mic.hpfHz,
+    }
+  }
 
-  /** Shared VAD + HPF config block for any WS config first frame.
-   *
-   * VAD is only honored in mic mode: it exists to keep the engine queue
-   * drained when the producer is bandwidth-bound. File and URL paths
-   * stream data faster than realtime, so VAD adds per-frame CPU cost
-   * without any latency benefit there. Auto-disable it for non-mic
-   * modes regardless of the persisted toggle. */
-  const vadConfig = () => ({
-    vad_enabled: mode === 'mic' ? s.vadEnabled : false,
-    vad_threshold: s.vadThreshold,
-    vad_consecutive: s.vadConsecutive,
-    vad_hangover_ms: s.vadHangoverMs,
-    vad_pad_min_gap_ms: s.vadPadMinGapMs,
-    vad_pad_duration_ms: s.vadPadDurationMs,
-    hpf_hz: s.hpfHz,
-  })
-
-  // ── Throttle for onPartial during streaming ──────────────────────
-  // Server emits segments_batch up to ~10/s during fast file processing.
-  // Dispatching every one causes O(N) React re-renders of the transcript
-  // view per partial (text.join over a growing array, full DOM diff).
-  // Coalesce to ~4 Hz with leading + trailing edges; build the payload
-  // off the refs at dispatch time so the trailing call always carries
-  // the latest accumulated state.
+  // Partial-message throttle — see the original Sidebar's notes; same logic.
   const PARTIAL_THROTTLE_MS = 250
   const lastPartialAtRef = useRef(0)
   const partialTimerRef = useRef<number | null>(null)
@@ -212,18 +205,17 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
     lastPartialAtRef.current = 0
   }, [])
 
-  // ── WS message → result/partial dispatch ─────────────────────────
+  // WS message dispatch — same as before. `final_transcription` aliases a
+  // "live recording" loaded source for mic; for file/url streaming the
+  // caller has already set the audio source via onAudioReady.
   const handleMessage = useCallback(
-    (msg: WSMessage) => {
+    (msg: WSMessage, options?: { staged?: LoadedAudio }) => {
       switch (msg.type) {
         case 'segments_batch': {
           segmentsRef.current = [...segmentsRef.current, ...msg.segments]
           if (msg.words && msg.words.length > 0) {
             wordsRef.current = [...wordsRef.current, ...msg.words]
           }
-          // The committed segments include whatever was previously in
-          // the partial buffer — clear the in-flight partial so the
-          // text doesn't appear twice (once as partial, once as real).
           onPartialSegment?.(null, [])
           schedulePartial()
           break
@@ -234,68 +226,57 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         case 'final_transcription': {
           cancelPendingPartial()
           onPartialSegment?.(null, [])
-          const blob = new Blob(chunksRef.current, { type: MIC_MIME_TYPE })
-          const file = new File([blob], `mic-${Date.now()}.webm`, { type: MIC_MIME_TYPE })
-          onResult(
-            {
+          let loaded: LoadedAudio
+          if (options?.staged) {
+            loaded = options.staged
+          } else {
+            // Mic-streaming default — build a Blob from the recorded chunks.
+            const blob = new Blob(chunksRef.current, { type: MIC_MIME_TYPE })
+            const file = new File([blob], `mic-${Date.now()}.webm`, { type: MIC_MIME_TYPE })
+            loaded = {
               kind: 'file',
               title: `live recording — ${new Date().toLocaleTimeString()}`,
               source: 'live mic',
               file,
+            }
+          }
+          onResult(loaded, {
+            format: 'verbose_json',
+            body: {
+              task: 'transcribe',
+              language: msg.language,
+              duration: msg.duration,
+              text: msg.text,
+              segments: msg.segments,
+              words: msg.words,
+              strategy: msg.strategy,
+              transcription_time_seconds: msg.transcription_time,
+              csv_content: msg.csv_content,
+              srt_content: msg.srt_content,
             },
-            {
-              format: 'verbose_json',
-              body: {
-                task: 'transcribe',
-                language: msg.language,
-                duration: msg.duration,
-                text: msg.text,
-                segments: msg.segments,
-                words: msg.words,
-                strategy: msg.strategy,
-                transcription_time_seconds: msg.transcription_time,
-                csv_content: msg.csv_content,
-                srt_content: msg.srt_content,
-              },
-            },
-          )
-          // Final result is in — tear the socket down promptly rather
-          // than waiting for the server's close frame. abort() closes
-          // with code 1000 so the own-checked onClose won't error-toast.
+          })
           wsRef.current?.abort()
           wsRef.current = null
           break
         }
-        // 'peaks' messages from the server are ignored here. Mic-mode
-        // peaks are driven from the local AnalyserNode via
-        // useMic({ onPeakSample }) — smoother + no round-trip. File mode
-        // gets peaks from a client-side decode of the Blob in App.tsx.
         case 'error':
           onError(msg.error)
           break
       }
     },
-    [onPartial, onResult, onError, schedulePartial, cancelPendingPartial, onPartialSegment],
+    [onResult, onError, schedulePartial, cancelPendingPartial, onPartialSegment],
   )
 
   const mic = useMic({
     onChunk: (blob) => {
       chunksRef.current.push(blob)
-      // Live mode forwards each chunk to the server while recording.
-      // Record mode just accumulates locally — wsRef is null, so this
-      // is a no-op.
       wsRef.current?.sendBinary(blob)
     },
     onStop: () => {
       if (wsRef.current) {
-        // Live mode: tell the server we're done. Final segments/words
-        // arrive via the WS message handler.
         wsRef.current.finish()
         return
       }
-      // Record mode: build a File from the accumulated chunks and
-      // stage it as `micBlob`. The user clicks Transcribe to send it
-      // through the REST upload path.
       if (chunksRef.current.length === 0) return
       const blob = new Blob(chunksRef.current, { type: MIC_MIME_TYPE })
       const file = new File([blob], `recording-${Date.now()}.webm`, { type: MIC_MIME_TYPE })
@@ -306,7 +287,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       wsRef.current?.abort()
       wsRef.current = null
     },
-    noiseSuppression: s.noiseSuppression,
+    noiseSuppression: mode === 'mic' ? s.mic.noiseSuppression : true,
     onPeakSample: (peak) => onPeaks?.([peak], false),
   })
 
@@ -323,108 +304,78 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
     return () => clearInterval(i)
   }, [recording])
 
-  // Live-preview listening: in mic + Live mode the meter should reflect
-  // real speech BEFORE the user hits Record (the design's "Listening"
-  // state). Open a preview-only mic stream while idle in that mode;
-  // tear it down whenever we leave it. start() reuses the preview
-  // stream when the user commits to recording.
-  //
-  // Only attempt where getUserMedia is actually available (secure
-  // context). On a plain-HTTP LAN deployment the API is undefined, so
-  // we skip the preview entirely rather than surface a mic error on
-  // mode switch — the meter just stays flat there.
+  // Pre-listen the mic in mic+WebSocket mode so the meter reflects real
+  // speech before the user clicks Transcribe. Skips on plain-HTTP origins
+  // where getUserMedia is undefined (LAN deployment).
+  const micEngine = s.mic.engine
   useEffect(() => {
     const micAvailable =
       typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getUserMedia
     if (!micAvailable) return
-    const wantListen = mode === 'mic' && s.micCaptureMode === 'live'
+    const wantListen = mode === 'mic' && micEngine === 'websocket'
     if (wantListen && mic.state === 'idle') {
       void mic.listen()
     } else if (!wantListen && mic.state === 'listening') {
       mic.stopListening()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, s.micCaptureMode, mic.state])
+  }, [mode, micEngine, mic.state])
 
-  // Stop the preview when the component unmounts.
   useEffect(() => {
     return () => mic.stopListening()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const startMic = useCallback(
-    async (captureMode: 'live' | 'record' = s.micCaptureMode) => {
-      onSessionStart?.({ resetHero: true })
-      cancelPendingPartial()
-      segmentsRef.current = []
-      wordsRef.current = []
-      chunksRef.current = []
-      recordStartRef.current = Date.now()
-      setRecordElapsed(0)
-      // Record mode skips the WS entirely — useMic still records to
-      // chunksRef, and the onStop handler stages the resulting blob
-      // as `micBlob` + routes through the REST file path on
-      // Transcribe click.
-      if (captureMode === 'record') {
-        // Make sure any prior recording / WS is cleared so the new
-        // blob can be staged cleanly.
-        wsRef.current = null
-        setMicBlob(null)
-        await mic.start()
-        return
-      }
-      // Live mode: open the WS, then start the mic. Engine is locked
-      // to Streaming for mic+live (see source-gating useEffect above);
-      // the Strategy override is irrelevant on the streaming engine.
-      let liveWs: LiveWSHandle
-      liveWs = connectLiveWS(
-        {
-          sample_rate: MIC_SAMPLE_RATE,
-          channels: 1,
-          bytes_per_sample: 2,
-          format: MIC_FORMAT_HINT,
-          strategy: 'streaming',
-          live_latency: s.liveLatency,
-          chunk_length: s.chunkLength ?? undefined,
-          chunk_overlap: s.chunkOverlap ?? undefined,
-          batch_size: s.batchSize ?? undefined,
-          long_audio_threshold: s.longAudioThreshold ?? undefined,
-          ...vadConfig(),
-        },
-        {
-          onMessage: handleMessage,
-          onError: () => onError('WebSocket error — connection failed.'),
-          onClose: (code, reason) => {
-            if (code !== 1000 && code !== 1005) {
-              onError(`WebSocket closed: code=${code} reason=${reason || 'no reason'}`)
-            }
-            // Only clear the ref if it still points at THIS socket — a
-            // newer recording may have already replaced it. Without this
-            // guard a late close from a previous session nulls the live
-            // socket and chunks stop being forwarded.
-            if (wsRef.current === liveWs) wsRef.current = null
-          },
-        },
-      )
-      wsRef.current = liveWs
+  const startMic = useCallback(async () => {
+    onSessionStart?.({ resetHero: true })
+    cancelPendingPartial()
+    segmentsRef.current = []
+    wordsRef.current = []
+    chunksRef.current = []
+    recordStartRef.current = Date.now()
+    setRecordElapsed(0)
+    if (s.mic.engine === 'rest') {
+      // Record-locally path — useMic accumulates chunks; the staged blob
+      // routes through REST upload when the user clicks Transcribe.
+      wsRef.current = null
+      setMicBlob(null)
       await mic.start()
-    },
+      return
+    }
+    // WebSocket path — open the live socket then start the mic.
+    const liveWs: LiveWSHandle = connectLiveWS(
+      {
+        sample_rate: MIC_SAMPLE_RATE,
+        channels: 1,
+        bytes_per_sample: 2,
+        format: MIC_FORMAT_HINT,
+        strategy: 'streaming',
+        live_latency: s.mic.liveLatency,
+        long_audio_threshold: s.mic.longAudioThreshold ?? undefined,
+        ...vadConfig(),
+      },
+      {
+        onMessage: (msg) => handleMessage(msg),
+        onError: () => onError('WebSocket error — connection failed.'),
+        onClose: (code, reason) => {
+          if (code !== 1000 && code !== 1005) {
+            onError(`WebSocket closed: code=${code} reason=${reason || 'no reason'}`)
+          }
+          if (wsRef.current === liveWs) wsRef.current = null
+        },
+      },
+    )
+    wsRef.current = liveWs
+    await mic.start()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [s, handleMessage, mic, onError, onSessionStart],
-  )
+  }, [s, handleMessage, mic, onError, onSessionStart, cancelPendingPartial])
 
-  // Drive the bottom Transcribe button. In mic mode it doubles as
-  // record/stop. In file mode + progressive, stream the bytes over the WS
-  // for real-time partials. Otherwise REST.
   const transcribe = useCallback(async () => {
     if (mode === 'file') {
       if (!pickedFile) return
       onSessionStart?.()
-
-      // File + Engine=Streaming → stream over WebSocket for live partials.
-      // The audio player gets the file immediately so the user can scrub
-      // / play while transcription streams in.
-      if (s.engine === 'streaming') {
+      const fileModality = s.file
+      if (fileModality.engine === 'websocket') {
         cancelPendingPartial()
         segmentsRef.current = []
         wordsRef.current = []
@@ -436,16 +387,11 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           source: `${formatBytes(pickedFile.size)} · ${pickedFile.type || 'audio'}`,
           file: pickedFile,
         }
-        // Wire the audio source NOW so the user can scrub / play while
-        // transcription streams. The transcript will fill in via partials,
-        // and onResult fires when final_transcription arrives.
         onAudioReady?.(loaded)
-
         setBusyAll(true)
         try {
           const fileExt = pickedFile.name.split('.').pop()?.toLowerCase() || 'wav'
-          let fileWs: LiveWSHandle
-          fileWs = streamFileViaWS(
+          const fileWs: LiveWSHandle = streamFileViaWS(
             pickedFile,
             {
               sample_rate: 16000,
@@ -453,51 +399,15 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
               bytes_per_sample: 2,
               format: fileExt,
               strategy: 'streaming',
-              // Force the offline 10s-chunk preset for file mode. The
-              // user's `liveLatency` toggle exists for mic responsiveness
-              // (2s chunks → 4s emission lag) but actively slows file
-              // throughput ~4x because the engine runs more steps per
-              // second of audio. Bench: 75x RTFx offline vs 18x live on
-              // the same 25-min file.
+              // Always use the offline-like preset for file streaming —
+              // live_latency=true slows file throughput ~4× for no benefit
+              // (no human is talking in realtime).
               live_latency: false,
-              chunk_length: s.chunkLength ?? undefined,
-              chunk_overlap: s.chunkOverlap ?? undefined,
-              batch_size: s.batchSize ?? undefined,
-              long_audio_threshold: s.longAudioThreshold ?? undefined,
+              long_audio_threshold: fileModality.longAudioThreshold ?? undefined,
               ...vadConfig(),
             },
             {
-              onMessage: (msg) => {
-                // Same as mic — accumulate segments + words, surface partials.
-                if (msg.type === 'segments_batch') {
-                  segmentsRef.current = [...segmentsRef.current, ...msg.segments]
-                  if (msg.words && msg.words.length > 0)
-                    wordsRef.current = [...wordsRef.current, ...msg.words]
-                  schedulePartial()
-                } else if (msg.type === 'final_transcription') {
-                  cancelPendingPartial()
-                  onResult(loaded, {
-                    format: 'verbose_json',
-                    body: {
-                      task: 'transcribe',
-                      language: msg.language,
-                      duration: msg.duration,
-                      text: msg.text,
-                      segments: msg.segments,
-                      words: msg.words,
-                      strategy: msg.strategy,
-                      transcription_time_seconds: msg.transcription_time,
-                      csv_content: msg.csv_content,
-                      srt_content: msg.srt_content,
-                    },
-                  })
-                } else if (msg.type === 'error') {
-                  onError(msg.error)
-                }
-                // 'peaks' messages from the server are ignored — for
-                // file+progressive the Blob is already local and
-                // computePeaksFor decodes it client-side in App.tsx.
-              },
+              onMessage: (msg) => handleMessage(msg, { staged: loaded }),
               onError: () => onError('WebSocket error during file streaming.'),
               onClose: (code, reason) => {
                 if (code !== 1000 && code !== 1005) {
@@ -515,8 +425,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         }
         return
       }
-
-      // File + chunked/full/auto → standard REST upload.
+      // REST upload
       setBusyAll(true)
       setProgress(0)
       const ac = new AbortController()
@@ -525,13 +434,10 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         const r = await postTranscription(
           pickedFile,
           {
-            response_format: s.responseFormat,
-            timestamp_granularities: s.timestampGranularities,
-            strategy: restStrategyParam(s.engine, s.strategyOverride),
-            chunk_length: s.chunkLength ?? undefined,
-            chunk_overlap: s.chunkOverlap ?? undefined,
-            batch_size: s.batchSize ?? undefined,
-            long_audio_threshold: s.longAudioThreshold ?? undefined,
+            response_format: fileModality.responseFormat,
+            timestamp_granularities: fileModality.timestampGranularities,
+            strategy: restStrategyParam(fileModality.strategyOverride),
+            long_audio_threshold: fileModality.longAudioThreshold ?? undefined,
           },
           { onProgress: (loaded, total) => setProgress(loaded / total), signal: ac.signal },
         )
@@ -545,7 +451,6 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           r,
         )
       } catch (e) {
-        // User-initiated cancel — silent return, partials (if any) stay.
         if (e instanceof DOMException && e.name === 'AbortError') return
         onError(e instanceof Error ? e.message : String(e))
       } finally {
@@ -556,6 +461,56 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
     } else if (mode === 'url') {
       if (!urlInput.trim() || urlInput === 'https://') return
       onSessionStart?.({ resetHero: true })
+      const urlModality = s.url
+      if (urlModality.engine === 'websocket') {
+        // URL-over-WS: server opens ffmpeg `-i <url>` and streams partials.
+        // The client has no local audio bytes (live stream), so the hero
+        // waveform / playback stays blank.
+        cancelPendingPartial()
+        segmentsRef.current = []
+        wordsRef.current = []
+        chunksRef.current = []
+        recordStartRef.current = Date.now()
+        let staged: LoadedAudio
+        try {
+          const u = new URL(urlInput.trim())
+          staged = { kind: 'url', title: u.pathname.split('/').filter(Boolean).pop() || u.host, source: 'live stream', url: urlInput.trim() }
+        } catch {
+          staged = { kind: 'url', title: urlInput.trim(), source: 'live stream', url: urlInput.trim() }
+        }
+        setBusyAll(true)
+        try {
+          const urlWs: LiveWSHandle = connectLiveWS(
+            {
+              sample_rate: 16000,
+              channels: 1,
+              bytes_per_sample: 2,
+              format: 'url',
+              url: urlInput.trim(),
+              strategy: 'streaming',
+              live_latency: false,
+              long_audio_threshold: urlModality.longAudioThreshold ?? undefined,
+            },
+            {
+              onMessage: (msg) => handleMessage(msg, { staged }),
+              onError: () => onError('WebSocket error during URL stream.'),
+              onClose: (code, reason) => {
+                if (code !== 1000 && code !== 1005) {
+                  onError(`WebSocket closed: code=${code} reason=${reason || 'no reason'}`)
+                }
+                if (wsRef.current === urlWs) wsRef.current = null
+                setBusyAll(false)
+              },
+            },
+          )
+          wsRef.current = urlWs
+        } catch (e) {
+          onError(e instanceof Error ? e.message : String(e))
+          setBusyAll(false)
+        }
+        return
+      }
+      // REST URL
       setBusyAll(true)
       const ac = new AbortController()
       restAbortRef.current = ac
@@ -563,13 +518,10 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         const r = await postTranscriptionUrl(
           urlInput.trim(),
           {
-            response_format: s.responseFormat,
-            timestamp_granularities: s.timestampGranularities,
-            strategy: restStrategyParam(s.engine, s.strategyOverride),
-            chunk_length: s.chunkLength ?? undefined,
-            chunk_overlap: s.chunkOverlap ?? undefined,
-            batch_size: s.batchSize ?? undefined,
-            long_audio_threshold: s.longAudioThreshold ?? undefined,
+            response_format: urlModality.responseFormat,
+            timestamp_granularities: urlModality.timestampGranularities,
+            strategy: restStrategyParam(urlModality.strategyOverride),
+            long_audio_threshold: urlModality.longAudioThreshold ?? undefined,
           },
           { signal: ac.signal },
         )
@@ -593,9 +545,8 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         mic.stop()
         return
       }
-      // Record sub-mode with a staged blob: upload via REST so the
-      // user gets the full pipeline (auto strategy, refinement, etc).
-      if (s.micCaptureMode === 'record' && micBlob) {
+      // Record-then-upload (mic + REST), with a staged blob to send.
+      if (s.mic.engine === 'rest' && micBlob) {
         onSessionStart?.({ resetHero: true })
         setBusyAll(true)
         setProgress(0)
@@ -605,13 +556,10 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           const r = await postTranscription(
             micBlob,
             {
-              response_format: s.responseFormat,
-              timestamp_granularities: s.timestampGranularities,
-              strategy: restStrategyParam(s.engine, s.strategyOverride),
-              chunk_length: s.chunkLength ?? undefined,
-              chunk_overlap: s.chunkOverlap ?? undefined,
-              batch_size: s.batchSize ?? undefined,
-              long_audio_threshold: s.longAudioThreshold ?? undefined,
+              response_format: s.mic.responseFormat,
+              timestamp_granularities: s.mic.timestampGranularities,
+              strategy: restStrategyParam(s.mic.strategyOverride),
+              long_audio_threshold: s.mic.longAudioThreshold ?? undefined,
             },
             { onProgress: (loaded, total) => setProgress(loaded / total), signal: ac.signal },
           )
@@ -634,17 +582,28 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         }
         return
       }
-      startMic(s.micCaptureMode).catch((e) => onError(e instanceof Error ? e.message : String(e)))
+      startMic().catch((e) => onError(e instanceof Error ? e.message : String(e)))
     }
-  }, [mode, pickedFile, micBlob, urlInput, s, recording, mic, startMic, onResult, onPartial, onError, setBusyAll, onSessionStart, onAudioReady])
+  }, [
+    mode,
+    pickedFile,
+    micBlob,
+    urlInput,
+    s,
+    recording,
+    mic,
+    startMic,
+    onResult,
+    onError,
+    setBusyAll,
+    onSessionStart,
+    onAudioReady,
+    cancelPendingPartial,
+    handleMessage,
+  ])
 
-  // Tear down whatever's in flight for file/url. Mic uses its own
-  // record/stop path via mic.stop() — handled inside transcribe().
   const cancelInFlight = useCallback(() => {
     if (wsRef.current && mode !== 'mic') {
-      // file + progressive. Close the WS with code 1000; even if onClose
-      // doesn't fire in time (server taking a beat to ack), we force the
-      // UI back to idle below.
       try {
         wsRef.current.abort()
       } catch (e) {
@@ -653,9 +612,6 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       wsRef.current = null
     }
     if (restAbortRef.current) {
-      // file/url REST — XHR.abort() rejects with AbortError; the
-      // promise's `finally` would normally clear busy, but explicitly
-      // doing it here keeps the button responsive.
       try {
         restAbortRef.current.abort()
       } catch (e) {
@@ -663,25 +619,16 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       }
       restAbortRef.current = null
     }
-    // Force the UI back to idle. The onClose handler also runs setBusyAll(false)
-    // but we don't want to wait for the server to ack the close frame —
-    // the user clicked Stop, the UI should respond now.
     cancelPendingPartial()
     setBusyAll(false)
     setProgress(null)
   }, [mode, setBusyAll, cancelPendingPartial])
 
-  // Plain-text labels — the pill's accent fill conveys active state,
-  // we don't need unicode glyphs to decorate them. The "Transcribe"
-  // label gets a small document icon at render time.
   const transcribeLabel = (() => {
     if (busy) return mode === 'mic' ? 'Working' : 'Stop'
     if (mode === 'mic') {
       if (recording) return 'Stop'
-      // Live mode transcribes as it streams — the button starts the
-      // live session, so it reads "Transcribe", not "Record".
-      if (s.micCaptureMode === 'live') return 'Transcribe'
-      // Record mode: "Transcribe" once a clip is staged, else "Record".
+      if (s.mic.engine === 'websocket') return 'Transcribe'
       if (micBlob) return 'Transcribe'
       return 'Record'
     }
@@ -690,13 +637,10 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   const transcribeIsAccent = busy || recording
   const transcribeShowsIcon = transcribeLabel === 'Transcribe'
   const onCommitClick = () => {
-    // Anything in flight (REST upload for file / url / mic-record, or a
-    // file+progressive WS stream) → the button acts as a hard cancel.
     if (busy) {
       cancelInFlight()
       return
     }
-    // A live mic recording → Stop means "finish & transcribe the rest".
     if (mode === 'mic' && recording) {
       mic.stop()
       return
@@ -704,7 +648,6 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
     void transcribe()
   }
   const transcribeDisabled = (() => {
-    // While busy on file/url, keep the button enabled so it can act as Stop.
     if (busy) return mode === 'mic'
     if (mode === 'file') return !pickedFile
     if (mode === 'url') return !urlInput.trim() || urlInput === 'https://'
@@ -712,108 +655,82 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
     return false
   })()
 
-  const granDisabled = s.responseFormat !== 'verbose_json'
+  // ── Output-tab callbacks (per-modality) ──────────────────────────
+  const granDisabled = m.responseFormat !== 'verbose_json'
   const toggleGran = (g: TimestampGranularity) => {
     if (granDisabled) return
-    const set = new Set(s.timestampGranularities)
+    const set = new Set(m.timestampGranularities)
     if (set.has(g)) set.delete(g)
     else set.add(g)
     if (set.size === 0) set.add('segment')
-    s.set('timestampGranularities', Array.from(set))
+    s.update(mode, { timestampGranularities: Array.from(set) })
   }
 
   return (
     <div className="sb">
-      {/* Section tabs */}
+      {/* Modality tabs */}
       <div className="sb__tabs-row">
         <div className="ma-tabs">
-          {(['source', 'output', 'engine'] as SidebarTab[]).map((id) => (
+          {TABS.map(({ id, label }) => (
             <button
               key={id}
               type="button"
-              className={tab === id ? 'ma-tab ma-tab--active' : 'ma-tab'}
-              onClick={() => setTab(id)}
+              className={mode === id ? 'ma-tab ma-tab--active' : 'ma-tab'}
+              onClick={() => onModeChange(id)}
             >
-              {id}
+              {label}
             </button>
           ))}
         </div>
       </div>
 
-      {/* Tab content */}
       <div className="sb__content">
-        {tab === 'source' && (
-          <SourcePane
-            mode={mode}
-            onModeChange={onModeChange}
+        {mode === 'file' && (
+          <UploadPane
+            modality={s.file}
+            update={(patch) => s.update('file', patch)}
             pickedFile={pickedFile}
             setPickedFile={setPickedFile}
             onClearSource={onClearSource}
-            micBlob={micBlob}
-            setMicBlob={setMicBlob}
             dragOver={dragOver}
             setDragOver={setDragOver}
             fileInputRef={fileInputRef}
             onFiles={onFiles}
-            urlInput={urlInput}
-            setUrlInput={setUrlInput}
-            mic={mic}
-            recording={recording}
-            recordElapsed={recordElapsed}
-            micCaptureMode={s.micCaptureMode}
-            setMicCaptureMode={(v) => s.set('micCaptureMode', v)}
-          />
-        )}
-        {tab === 'output' && (
-          <OutputPane
-            format={s.responseFormat}
-            setFormat={(v) => s.set('responseFormat', v)}
-            granularities={s.timestampGranularities}
             granDisabled={granDisabled}
             toggleGran={toggleGran}
           />
         )}
-        {tab === 'engine' && (
-          <EnginePane
-            engine={s.engine}
-            setEngine={(v) => s.set('engine', v)}
-            strategyOverride={s.strategyOverride}
-            setStrategyOverride={(v) => s.set('strategyOverride', v)}
-            mode={mode}
-            micCaptureMode={s.micCaptureMode}
-            longAudioThreshold={s.longAudioThreshold}
-            liveLatency={s.liveLatency}
-            vadEnabled={s.vadEnabled}
-            vadThreshold={s.vadThreshold}
-            vadConsecutive={s.vadConsecutive}
-            vadHangoverMs={s.vadHangoverMs}
-            vadPadMinGapMs={s.vadPadMinGapMs}
-            vadPadDurationMs={s.vadPadDurationMs}
-            hpfHz={s.hpfHz}
-            noiseSuppression={s.noiseSuppression}
-            setLong={(v) => s.set('longAudioThreshold', v)}
-            setLiveLatency={(v) => s.set('liveLatency', v)}
-            setVadEnabled={(v) => s.set('vadEnabled', v)}
-            setVadThreshold={(v) => s.set('vadThreshold', v ?? 0.5)}
-            setVadConsecutive={(v) => s.set('vadConsecutive', v ?? 3)}
-            setVadHangoverMs={(v) => s.set('vadHangoverMs', v ?? 500)}
-            setVadPadMinGap={(v) => s.set('vadPadMinGapMs', v ?? 400)}
-            setVadPadDuration={(v) => s.set('vadPadDurationMs', v ?? 0)}
-            setHpfHz={(v) => s.set('hpfHz', v ?? 100)}
-            setNoiseSuppression={(v) => s.set('noiseSuppression', v)}
+        {mode === 'url' && (
+          <URLPane
+            modality={s.url}
+            update={(patch) => s.update('url', patch)}
+            urlInput={urlInput}
+            setUrlInput={setUrlInput}
+            granDisabled={granDisabled}
+            toggleGran={toggleGran}
+          />
+        )}
+        {mode === 'mic' && (
+          <RecordPane
+            modality={s.mic}
+            update={(patch) => s.update('mic', patch)}
+            mic={mic}
+            recording={recording}
+            recordElapsed={recordElapsed}
+            micBlob={micBlob}
+            setMicBlob={setMicBlob}
+            granDisabled={granDisabled}
+            toggleGran={toggleGran}
           />
         )}
       </div>
 
       {progress !== null && (
-        <>
-          <div className="sb__progress">
-            <div className="sb__progress-bar" style={{ width: `${Math.round(progress * 100)}%` }} />
-          </div>
-        </>
+        <div className="sb__progress">
+          <div className="sb__progress-bar" style={{ width: `${Math.round(progress * 100)}%` }} />
+        </div>
       )}
 
-      {/* Commit button — pinned to bottom of the sidebar */}
       <div className="sb__commit">
         <button
           type="button"
@@ -847,7 +764,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   )
 }
 
-// ── Section label ─────────────────────────────────────────────────
+// ── Shared section label ──────────────────────────────────────────
 function SBLabel({ children, top }: { children: React.ReactNode; top?: number }) {
   return (
     <div className="label-eyebrow-row" style={{ marginTop: top ?? 0 }}>
@@ -857,389 +774,30 @@ function SBLabel({ children, top }: { children: React.ReactNode; top?: number })
   )
 }
 
-// ── Source pane ───────────────────────────────────────────────────
-type MicReturn = ReturnType<typeof useMic>
-function SourcePane({
-  mode,
-  onModeChange,
-  pickedFile,
-  setPickedFile,
-  onClearSource,
-  micBlob,
-  setMicBlob,
-  dragOver,
-  setDragOver,
-  fileInputRef,
-  onFiles,
-  urlInput,
-  setUrlInput,
-  mic,
-  recording,
-  recordElapsed,
-  micCaptureMode,
-  setMicCaptureMode,
+// ── Shared engine picker ──────────────────────────────────────────
+function EnginePicker({
+  modality,
+  engine,
+  setEngine,
 }: {
-  mode: InputMode
-  onModeChange: (m: InputMode) => void
-  pickedFile: File | null
-  setPickedFile: (f: File | null) => void
-  onClearSource?: () => void
-  micBlob: File | null
-  setMicBlob: (f: File | null) => void
-  dragOver: boolean
-  setDragOver: (b: boolean) => void
-  fileInputRef: React.RefObject<HTMLInputElement | null>
-  onFiles: (files: FileList | null) => void
-  urlInput: string
-  setUrlInput: (v: string) => void
-  mic: MicReturn
-  recording: boolean
-  recordElapsed: number
-  micCaptureMode: 'live' | 'record'
-  setMicCaptureMode: (v: 'live' | 'record') => void
+  modality: Modality
+  engine: Engine
+  setEngine: (e: Engine) => void
 }) {
-  const urlValid = /^https?:\/\/\S+/i.test(urlInput.trim()) && urlInput.trim() !== 'https://'
   return (
-    <div>
-      <SBLabel>Input</SBLabel>
-      <OptionList<InputMode>
-        value={mode}
-        options={[
-          { id: 'file', label: 'File upload' },
-          { id: 'mic', label: 'Microphone' },
-          { id: 'url', label: 'URL' },
-        ]}
-        onChange={onModeChange}
-      />
-
-      {mode === 'file' && (
-        <div style={{ marginTop: 16 }}>
-          <div
-            className={dragOver ? 'sb__file-card sb__file-card--drag' : 'sb__file-card'}
-            onClick={() => fileInputRef.current?.click()}
-            onDragEnter={(e) => {
-              e.preventDefault()
-              setDragOver(true)
-            }}
-            onDragLeave={(e) => {
-              e.preventDefault()
-              setDragOver(false)
-            }}
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={(e) => {
-              e.preventDefault()
-              setDragOver(false)
-              onFiles(e.dataTransfer.files)
-            }}
-            role="button"
-            tabIndex={0}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') fileInputRef.current?.click()
-            }}
-          >
-            <div className="sb__file-card__icon">
-              <svg
-                viewBox="0 0 24 24"
-                width="16"
-                height="16"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden
-              >
-                <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
-                <path d="M14 3v5h5" />
-              </svg>
-            </div>
-            <div className="sb__file-card__body">
-              {pickedFile ? (
-                <>
-                  <div className="sb__file-card__name">{pickedFile.name}</div>
-                  <div className="sb__file-card__meta">
-                    {formatBytes(pickedFile.size)} · {pickedFile.type || 'audio'}
-                  </div>
-                </>
-              ) : (
-                <>
-                  <div className="sb__file-card__name sb__file-card__name--empty">
-                    Drop a file or browse
-                  </div>
-                  <div className="sb__file-card__meta">No file selected</div>
-                </>
-              )}
-            </div>
-          </div>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="audio/*,video/*"
-            hidden
-            onChange={(e) => onFiles(e.target.files)}
-          />
-          <div className="sb__file-actions">
-            <button
-              type="button"
-              className="ma-pill ma-pill--grow"
-              onClick={() => fileInputRef.current?.click()}
-            >
-              Browse…
-            </button>
-            {pickedFile && (
-              <button
-                type="button"
-                className="ma-pill"
-                aria-label="Remove file"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  setPickedFile(null)
-                  if (fileInputRef.current) fileInputRef.current.value = ''
-                  onClearSource?.()
-                }}
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  width="11"
-                  height="11"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.7"
-                  strokeLinecap="round"
-                  aria-hidden
-                >
-                  <path d="M19 6L6 19M6 6l13 13" />
-                </svg>
-              </button>
-            )}
-          </div>
-          <div className="sb__file-formats">
-            wav · mp3 · flac · m4a · ogg · webm
-          </div>
-        </div>
-      )}
-
-      {mode === 'mic' && (
-        <div style={{ marginTop: 16 }}>
-          <SBLabel>Capture</SBLabel>
-          <OptionList<'live' | 'record'>
-            value={micCaptureMode}
-            options={[
-              { id: 'live', label: 'Live transcription' },
-              { id: 'record', label: 'Recording' },
-            ]}
-            onChange={setMicCaptureMode}
-          />
-
-          <div className="mic-card" style={{ marginTop: 16 }}>
-            <MicCardBars
-              getAnalyser={mic.getAnalyser}
-              active={recording || micCaptureMode === 'live'}
-            />
-            <div className="mic-card__row">
-              <span className="mic-card__status">
-                {recording
-                  ? 'Recording'
-                  : micCaptureMode === 'live'
-                    ? 'Listening'
-                    : 'Standby'}
-              </span>
-              <span
-                className={
-                  recording || (micCaptureMode === 'live' && !recording)
-                    ? 'mic-card__timer mic-card__timer--rec'
-                    : 'mic-card__timer'
-                }
-              >
-                {micCaptureMode === 'live' && !recording
-                  ? '——'
-                  : formatMicTimer(recordElapsed)}
-              </span>
-            </div>
-          </div>
-
-          {!recording && micBlob && micCaptureMode === 'record' && (
-            <div className="sb__file-card" style={{ marginTop: 10 }}>
-              <div className="sb__file-card__icon">
-                <svg
-                  viewBox="0 0 24 24"
-                  width="16"
-                  height="16"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.5"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden
-                >
-                  <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
-                  <path d="M14 3v5h5" />
-                </svg>
-              </div>
-              <div className="sb__file-card__body">
-                <div className="sb__file-card__name">{micBlob.name}</div>
-                <div className="sb__file-card__meta">
-                  {formatBytes(micBlob.size)} · WebM Opus
-                </div>
-              </div>
-              <button
-                type="button"
-                className="ma-pill ma-pill--sm"
-                aria-label="Discard recording"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  setMicBlob(null)
-                }}
-              >
-                ✕
-              </button>
-            </div>
-          )}
-
-          <div className="mic-card__hint">16 kHz · Mono · WebM Opus</div>
-        </div>
-      )}
-
-      {mode === 'url' && (
-        <div style={{ marginTop: 16 }}>
-          <div className="sb__url-field">
-            <svg
-              viewBox="0 0 24 24"
-              width="14"
-              height="14"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.6"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden
-            >
-              <path d="M10 13a5 5 0 0 0 7.07 0l3.18-3.18a5 5 0 0 0-7.07-7.07L11.34 5" />
-              <path d="M14 11a5 5 0 0 0-7.07 0L3.75 14.18a5 5 0 0 0 7.07 7.07L12.66 19" />
-            </svg>
-            <input
-              type="url"
-              value={urlInput}
-              onChange={(e) => setUrlInput(e.target.value)}
-              className="sb__url-input"
-              spellCheck={false}
-              autoComplete="off"
-              placeholder="https://…"
-            />
-          </div>
-          <div className="sb__url-status">
-            <span className={urlValid ? 'sb__url-dot sb__url-dot--on' : 'sb__url-dot'} />
-            <span className="sb__url-status-label">
-              {urlValid ? 'Ready to fetch' : 'Enter direct link to media'}
-            </span>
-          </div>
-        </div>
-      )}
-    </div>
+    <OptionList<Engine>
+      value={engine}
+      options={[
+        { id: 'rest', label: 'REST', disabledReason: ENGINE_TOOLTIPS[modality].rest },
+        { id: 'websocket', label: 'WebSocket', disabledReason: ENGINE_TOOLTIPS[modality].websocket },
+      ]}
+      onChange={setEngine}
+    />
   )
 }
 
-const MIC_BARS = 28
-
-/** Bar meter inside the mic card — a real frequency spectrum read live
- * from the AnalyserNode (getByteFrequencyData), folded into 28
- * log-spaced bands so each bar tracks a different part of the voice.
- *
- * "Active" both while recording AND while previewing (live mode opens
- * the mic before the user hits Record), so it reflects actual speech in
- * both cases; record-mode idle sits flat (mic closed).
- *
- * Smoothing keeps it from looking jittery/sharp: the analyser already
- * smooths between frames, then each band rises quickly but falls
- * gently (attack/release lerp) and is lightly averaged with its
- * neighbours. */
-function MicCardBars({
-  getAnalyser,
-  active,
-}: {
-  getAnalyser: () => AnalyserNode | null
-  active: boolean
-}) {
-  const [bands, setBands] = useState<number[]>(() => new Array(MIC_BARS).fill(0))
-  const dispRef = useRef<Float32Array>(new Float32Array(MIC_BARS))
-
-  useEffect(() => {
-    if (!active) {
-      dispRef.current.fill(0)
-      setBands(new Array(MIC_BARS).fill(0))
-      return
-    }
-    let raf = 0
-    let freq: Uint8Array | null = null
-    const loop = () => {
-      const analyser = getAnalyser()
-      if (analyser) {
-        if (!freq || freq.length !== analyser.frequencyBinCount) {
-          freq = new Uint8Array(analyser.frequencyBinCount)
-        }
-        analyser.getByteFrequencyData(freq as unknown as Uint8Array<ArrayBuffer>)
-        // Log-spaced band edges across the voice-relevant range (skip
-        // the DC bins; cap well below Nyquist where there's no energy).
-        const minBin = 2
-        const maxBin = Math.min(freq.length - 1, 300)
-        const ratio = maxBin / minBin
-        const disp = dispRef.current
-        const raw = new Float32Array(MIC_BARS)
-        for (let b = 0; b < MIC_BARS; b++) {
-          const lo = Math.floor(minBin * Math.pow(ratio, b / MIC_BARS))
-          const hi = Math.max(lo + 1, Math.floor(minBin * Math.pow(ratio, (b + 1) / MIC_BARS)))
-          let sum = 0
-          let n = 0
-          for (let k = lo; k < hi && k < freq.length; k++) {
-            sum += freq[k]
-            n++
-          }
-          const avg = n > 0 ? sum / n / 255 : 0
-          raw[b] = Math.pow(avg, 0.7) // gentle curve so quiet detail shows
-        }
-        for (let b = 0; b < MIC_BARS; b++) {
-          // Light spatial smoothing with neighbours.
-          const prev = raw[b - 1] ?? raw[b]
-          const next = raw[b + 1] ?? raw[b]
-          const target = (prev + 2 * raw[b] + next) / 4
-          // Fast attack, gentle release — natural meter feel, not sharp.
-          const k = target > disp[b] ? 0.35 : 0.12
-          disp[b] += (target - disp[b]) * k
-        }
-        setBands(Array.from(disp))
-      }
-      raf = requestAnimationFrame(loop)
-    }
-    raf = requestAnimationFrame(loop)
-    return () => cancelAnimationFrame(raf)
-  }, [active, getAnalyser])
-
-  return (
-    <div className="mic-card__bars">
-      {bands.map((v, i) => {
-        const h = active ? Math.max(4, Math.min(96, v * 92 + 4)) : 4
-        return (
-          <span
-            key={i}
-            className={active ? 'mic-card__bar mic-card__bar--on' : 'mic-card__bar'}
-            style={{ height: `${h}%`, opacity: active ? 0.55 + 0.45 * v : 1 }}
-          />
-        )
-      })}
-    </div>
-  )
-}
-
-/** Tabular MM:SS.t format for the mic card timer. */
-function formatMicTimer(seconds: number): string {
-  const m = Math.floor(seconds / 60)
-  const s = Math.floor(seconds % 60)
-  const t = Math.floor((seconds * 10) % 10)
-  return `${m}:${String(s).padStart(2, '0')}.${t}`
-}
-
-// ── Output pane ───────────────────────────────────────────────────
-function OutputPane({
+// ── Shared output controls ───────────────────────────────────────
+function OutputControls({
   format,
   setFormat,
   granularities,
@@ -1253,14 +811,13 @@ function OutputPane({
   toggleGran: (g: TimestampGranularity) => void
 }) {
   return (
-    <div>
-      <SBLabel>Format</SBLabel>
+    <>
+      <SBLabel top={22}>Format</SBLabel>
       <OptionList<ResponseFormat>
         value={format}
         options={FORMATS.map((f) => ({ id: f.id, label: f.label }))}
         onChange={setFormat}
       />
-
       <SBLabel top={22}>
         Timestamps
         {granDisabled && (
@@ -1312,238 +869,540 @@ function OutputPane({
           )
         })}
       </div>
-    </div>
+    </>
   )
 }
 
-// ── Engine pane ───────────────────────────────────────────────────
-function EnginePane({
-  engine,
-  setEngine,
-  strategyOverride,
-  setStrategyOverride,
-  mode,
-  micCaptureMode,
-  longAudioThreshold,
-  liveLatency,
-  vadEnabled,
-  vadThreshold,
-  vadConsecutive,
-  vadHangoverMs,
-  vadPadMinGapMs,
-  vadPadDurationMs,
-  hpfHz,
-  noiseSuppression,
-  setLong,
-  setLiveLatency,
-  setVadEnabled,
-  setVadThreshold,
-  setVadConsecutive,
-  setVadHangoverMs,
-  setVadPadMinGap,
-  setVadPadDuration,
-  setHpfHz,
-  setNoiseSuppression,
+// ── Shared engine + strategy + output block ──────────────────────
+function EngineStrategyOutput({
+  modality,
+  m,
+  update,
+  granDisabled,
+  toggleGran,
 }: {
-  engine: Engine
-  setEngine: (v: Engine) => void
-  strategyOverride: StrategyOverride
-  setStrategyOverride: (v: StrategyOverride) => void
-  mode: InputMode
-  micCaptureMode: 'live' | 'record'
-  longAudioThreshold: number | null
-  liveLatency: boolean
-  vadEnabled: boolean
-  vadThreshold: number | null
-  vadConsecutive: number | null
-  vadHangoverMs: number | null
-  vadPadMinGapMs: number | null
-  vadPadDurationMs: number | null
-  hpfHz: number | null
-  noiseSuppression: boolean
-  setLong: (v: number | null) => void
-  setLiveLatency: (v: boolean) => void
-  setVadEnabled: (v: boolean) => void
-  setVadThreshold: (v: number | null) => void
-  setVadConsecutive: (v: number | null) => void
-  setVadHangoverMs: (v: number | null) => void
-  setVadPadMinGap: (v: number | null) => void
-  setVadPadDuration: (v: number | null) => void
-  setHpfHz: (v: number | null) => void
-  setNoiseSuppression: (v: boolean) => void
+  modality: Modality
+  m: CommonModality
+  update: (patch: Partial<CommonModality>) => void
+  granDisabled: boolean
+  toggleGran: (g: TimestampGranularity) => void
 }) {
-  // Two-axis transcription picker:
-  //  1. Engine (transport): Offline (REST) vs Streaming (WS live partials).
-  //     Source dictates which are selectable — see source-gating useEffect.
-  //  2. Strategy override (offline-engine implementation only): Auto picks
-  //     Full ≤ MAX_FULL_WAVEFORM_S vs Split-full above. Power users can force
-  //     Full / Split-full / Chunked explicitly. Hidden when Engine=Streaming
-  //     since the streaming engine has only one implementation.
-  const isMicLive = mode === 'mic' && micCaptureMode === 'live'
-  const isMicAny = mode === 'mic'
-  const isStreaming = engine === 'streaming'
-  const isRestUpload = !isStreaming
+  const isRest = m.engine === 'rest'
+  return (
+    <>
+      <SBLabel top={22}>Engine</SBLabel>
+      <EnginePicker
+        modality={modality}
+        engine={m.engine}
+        setEngine={(e) => update({ engine: e })}
+      />
+      {isRest && (
+        <>
+          <SBLabel top={22}>Strategy</SBLabel>
+          <OptionList<StrategyOverride>
+            value={m.strategyOverride}
+            options={STRATEGY_OVERRIDES.map((o) => ({
+              id: o.id,
+              label: o.label,
+              disabledReason: o.hint,
+            }))}
+            onChange={(v) => update({ strategyOverride: v })}
+          />
+        </>
+      )}
+      <OutputControls
+        format={m.responseFormat}
+        setFormat={(v) => update({ responseFormat: v })}
+        granularities={m.timestampGranularities}
+        granDisabled={granDisabled}
+        toggleGran={toggleGran}
+      />
+    </>
+  )
+}
 
-  // Gating rules per source:
-  //  - mic + live      → Streaming locked (only WS can emit live partials).
-  //  - url / mic+record → Offline locked (REST upload only).
-  //  - file            → both selectable.
-  const streamingDisabledReason: string | undefined =
-    mode === 'url'
-      ? 'streaming isn’t available for URL ingest'
-      : mode === 'mic' && micCaptureMode === 'record'
-        ? 'streaming needs a live stream — record uploads the finished clip'
-        : undefined
-  const offlineDisabledReason: string | undefined = isMicLive
-    ? 'live transcription always uses the streaming engine'
-    : undefined
-
+// ── Upload pane ──────────────────────────────────────────────────
+function UploadPane({
+  modality,
+  update,
+  pickedFile,
+  setPickedFile,
+  onClearSource,
+  dragOver,
+  setDragOver,
+  fileInputRef,
+  onFiles,
+  granDisabled,
+  toggleGran,
+}: {
+  modality: CommonModality
+  update: (patch: Partial<CommonModality>) => void
+  pickedFile: File | null
+  setPickedFile: (f: File | null) => void
+  onClearSource?: () => void
+  dragOver: boolean
+  setDragOver: (b: boolean) => void
+  fileInputRef: React.RefObject<HTMLInputElement | null>
+  onFiles: (files: FileList | null) => void
+  granDisabled: boolean
+  toggleGran: (g: TimestampGranularity) => void
+}) {
   return (
     <div>
-      <SBLabel>Engine</SBLabel>
-      <OptionList<Engine>
-        value={engine}
-        options={ENGINES.map((e) => {
-          const disabled =
-            (e.id === 'streaming' && !!streamingDisabledReason) ||
-            (e.id === 'offline' && !!offlineDisabledReason)
-          const disabledReason =
-            e.id === 'streaming' ? streamingDisabledReason : offlineDisabledReason
-          return { id: e.id, label: e.label, disabled, disabledReason }
-        })}
-        onChange={setEngine}
+      <div
+        className={dragOver ? 'sb__file-card sb__file-card--drag' : 'sb__file-card'}
+        onClick={() => fileInputRef.current?.click()}
+        onDragEnter={(e) => {
+          e.preventDefault()
+          setDragOver(true)
+        }}
+        onDragLeave={(e) => {
+          e.preventDefault()
+          setDragOver(false)
+        }}
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={(e) => {
+          e.preventDefault()
+          setDragOver(false)
+          onFiles(e.dataTransfer.files)
+        }}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') fileInputRef.current?.click()
+        }}
+      >
+        <div className="sb__file-card__icon">
+          <svg
+            viewBox="0 0 24 24"
+            width="16"
+            height="16"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden
+          >
+            <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+            <path d="M14 3v5h5" />
+          </svg>
+        </div>
+        <div className="sb__file-card__body">
+          {pickedFile ? (
+            <>
+              <div className="sb__file-card__name">{pickedFile.name}</div>
+              <div className="sb__file-card__meta">
+                {formatBytes(pickedFile.size)} · {pickedFile.type || 'audio'}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="sb__file-card__name sb__file-card__name--empty">
+                Drop a file or browse
+              </div>
+              <div className="sb__file-card__meta">No file selected</div>
+            </>
+          )}
+        </div>
+      </div>
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="audio/*,video/*"
+        hidden
+        onChange={(e) => onFiles(e.target.files)}
+      />
+      <div className="sb__file-actions">
+        <button
+          type="button"
+          className="ma-pill ma-pill--grow"
+          onClick={() => fileInputRef.current?.click()}
+        >
+          Browse…
+        </button>
+        {pickedFile && (
+          <button
+            type="button"
+            className="ma-pill"
+            aria-label="Remove file"
+            onClick={(e) => {
+              e.stopPropagation()
+              setPickedFile(null)
+              if (fileInputRef.current) fileInputRef.current.value = ''
+              onClearSource?.()
+            }}
+          >
+            <svg
+              viewBox="0 0 24 24"
+              width="11"
+              height="11"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.7"
+              strokeLinecap="round"
+              aria-hidden
+            >
+              <path d="M19 6L6 19M6 6l13 13" />
+            </svg>
+          </button>
+        )}
+      </div>
+      <div className="sb__file-formats">wav · mp3 · flac · m4a · ogg · webm</div>
+
+      <EngineStrategyOutput
+        modality="file"
+        m={modality}
+        update={update}
+        granDisabled={granDisabled}
+        toggleGran={toggleGran}
       />
 
       <SBLabel top={22}>Advanced</SBLabel>
       <div className="sb__adv-list">
-        {/* Strategy override is meaningful only on the offline engine. */}
-        {!isStreaming && (
-          <div style={{ marginBottom: 12 }}>
-            <div
-              className="ma-kv__k"
-              style={{ marginBottom: 6 }}
-              title="Force a specific offline implementation. Auto lets the server pick Full ≤ cap, else Split-full."
-            >
-              Strategy override
-            </div>
-            <OptionList<StrategyOverride>
-              value={strategyOverride}
-              options={STRATEGY_OVERRIDES.map((o) => ({
-                id: o.id,
-                label: o.label,
-                disabledReason: o.hint,
-              }))}
-              onChange={setStrategyOverride}
-            />
-          </div>
+        {modality.engine === 'rest' && (
+          <NumKv
+            k="Long-audio threshold"
+            hint="long_audio_threshold — switches to long-audio model settings above this duration"
+            v={modality.longAudioThreshold}
+            placeholder={480}
+            suffix="s"
+            onSet={(v) => update({ longAudioThreshold: v })}
+          />
         )}
+      </div>
+    </div>
+  )
+}
 
-        {isRestUpload && (
-          <>
-            {/* long_audio_threshold is the only offline knob the engine
-                actually honors (picks long-audio model settings). The
-                chunked engine processes sequentially at a fixed internal
-                chunk size, so client batch_size / chunk_length had no
-                effect — removed rather than ship dead controls. */}
-            <NumKv
-              k="Long-audio threshold"
-              hint="long_audio_threshold — switches to long-audio model settings above this duration"
-              v={longAudioThreshold}
-              placeholder={480}
-              suffix="s"
-              onSet={setLong}
-            />
-          </>
+// ── URL pane ─────────────────────────────────────────────────────
+function URLPane({
+  modality,
+  update,
+  urlInput,
+  setUrlInput,
+  granDisabled,
+  toggleGran,
+}: {
+  modality: CommonModality
+  update: (patch: Partial<CommonModality>) => void
+  urlInput: string
+  setUrlInput: (v: string) => void
+  granDisabled: boolean
+  toggleGran: (g: TimestampGranularity) => void
+}) {
+  const urlValid = /^https?:\/\/\S+/i.test(urlInput.trim()) && urlInput.trim() !== 'https://'
+  return (
+    <div>
+      <div className="sb__url-field">
+        <svg
+          viewBox="0 0 24 24"
+          width="14"
+          height="14"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.6"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden
+        >
+          <path d="M10 13a5 5 0 0 0 7.07 0l3.18-3.18a5 5 0 0 0-7.07-7.07L11.34 5" />
+          <path d="M14 11a5 5 0 0 0-7.07 0L3.75 14.18a5 5 0 0 0 7.07 7.07L12.66 19" />
+        </svg>
+        <input
+          type="url"
+          value={urlInput}
+          onChange={(e) => setUrlInput(e.target.value)}
+          className="sb__url-input"
+          spellCheck={false}
+          autoComplete="off"
+          placeholder="https://…"
+        />
+      </div>
+      <div className="sb__url-status">
+        <span className={urlValid ? 'sb__url-dot sb__url-dot--on' : 'sb__url-dot'} />
+        <span className="sb__url-status-label">
+          {urlValid ? 'Ready to fetch' : 'Enter direct link to media'}
+        </span>
+      </div>
+
+      <EngineStrategyOutput
+        modality="url"
+        m={modality}
+        update={update}
+        granDisabled={granDisabled}
+        toggleGran={toggleGran}
+      />
+
+      <SBLabel top={22}>Advanced</SBLabel>
+      <div className="sb__adv-list">
+        {modality.engine === 'rest' && (
+          <NumKv
+            k="Long-audio threshold"
+            hint="long_audio_threshold — switches to long-audio model settings above this duration"
+            v={modality.longAudioThreshold}
+            placeholder={480}
+            suffix="s"
+            onSet={(v) => update({ longAudioThreshold: v })}
+          />
         )}
-        {isMicLive && (
+      </div>
+    </div>
+  )
+}
+
+// ── Record pane ──────────────────────────────────────────────────
+type MicReturn = ReturnType<typeof useMic>
+function RecordPane({
+  modality,
+  update,
+  mic,
+  recording,
+  recordElapsed,
+  micBlob,
+  setMicBlob,
+  granDisabled,
+  toggleGran,
+}: {
+  modality: MicModality
+  update: (patch: Partial<MicModality>) => void
+  mic: MicReturn
+  recording: boolean
+  recordElapsed: number
+  micBlob: File | null
+  setMicBlob: (f: File | null) => void
+  granDisabled: boolean
+  toggleGran: (g: TimestampGranularity) => void
+}) {
+  const isWs = modality.engine === 'websocket'
+  return (
+    <div>
+      <div className="mic-card">
+        <MicCardBars
+          getAnalyser={mic.getAnalyser}
+          active={recording || isWs}
+        />
+        <div className="mic-card__row">
+          <span className="mic-card__status">
+            {recording ? 'Recording' : isWs ? 'Listening' : 'Standby'}
+          </span>
+          <span
+            className={
+              recording || (isWs && !recording)
+                ? 'mic-card__timer mic-card__timer--rec'
+                : 'mic-card__timer'
+            }
+          >
+            {isWs && !recording ? '——' : formatMicTimer(recordElapsed)}
+          </span>
+        </div>
+      </div>
+
+      {!recording && micBlob && !isWs && (
+        <div className="sb__file-card" style={{ marginTop: 10 }}>
+          <div className="sb__file-card__icon">
+            <svg
+              viewBox="0 0 24 24"
+              width="16"
+              height="16"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden
+            >
+              <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+              <path d="M14 3v5h5" />
+            </svg>
+          </div>
+          <div className="sb__file-card__body">
+            <div className="sb__file-card__name">{micBlob.name}</div>
+            <div className="sb__file-card__meta">{formatBytes(micBlob.size)} · WebM Opus</div>
+          </div>
+          <button
+            type="button"
+            className="ma-pill ma-pill--sm"
+            aria-label="Discard recording"
+            onClick={(e) => {
+              e.stopPropagation()
+              setMicBlob(null)
+            }}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      <div className="mic-card__hint">16 kHz · Mono · WebM Opus</div>
+
+      <EngineStrategyOutput
+        modality="mic"
+        m={modality}
+        update={update}
+        granDisabled={granDisabled}
+        toggleGran={toggleGran}
+      />
+
+      <SBLabel top={22}>Advanced</SBLabel>
+      <div className="sb__adv-list">
+        {isWs && (
           <ToggleKv
             k="Low-latency mode"
             hint="live_latency — smaller streaming chunks; faster partials, lower throughput"
-            v={liveLatency}
-            onSet={setLiveLatency}
+            v={modality.liveLatency}
+            onSet={(v) => update({ liveLatency: v })}
           />
         )}
-
-        {isMicAny && (
+        <NumKv
+          k="High-pass filter"
+          hint="hpf_hz — ffmpeg highpass cutoff in Hz; 0 disables"
+          v={modality.hpfHz}
+          placeholder={100}
+          suffix="Hz"
+          onSet={(v) => update({ hpfHz: v ?? 100 })}
+        />
+        <ToggleKv
+          k="Noise suppression"
+          hint="noise_suppression — browser getUserMedia noise suppression"
+          v={modality.noiseSuppression}
+          onSet={(v) => update({ noiseSuppression: v })}
+        />
+        {isWs && (
           <>
             <div className="sb__adv-divider" />
-
-            {/* Mic input quality (browser-side getUserMedia constraints +
-                ffmpeg highpass). Applies to both Live and Record. */}
-            <NumKv
-              k="High-pass filter"
-              hint="hpf_hz — ffmpeg highpass cutoff in Hz; 0 disables"
-              v={hpfHz}
-              placeholder={100}
-              suffix="Hz"
-              onSet={setHpfHz}
-            />
-            <ToggleKv
-              k="Noise suppression"
-              hint="noise_suppression — browser getUserMedia noise suppression"
-              v={noiseSuppression}
-              onSet={setNoiseSuppression}
-            />
-          </>
-        )}
-
-        {isMicLive && (
-          <>
-            <div className="sb__adv-divider" />
-
-            {/* VAD settings only apply to the live WS streaming path —
-                Record mode uploads the raw blob via REST and ffmpeg
-                doesn't touch VAD on the server. */}
             <ToggleKv
               k="Voice detection"
               hint="vad_enabled — gates silence so the engine queue stays drained"
-              v={vadEnabled}
-              onSet={setVadEnabled}
+              v={modality.vadEnabled}
+              onSet={(v) => update({ vadEnabled: v })}
             />
             <NumKv
               k="Speech threshold"
               hint="vad_threshold — Silero probability cutoff 0..1; higher = pickier"
-              v={vadThreshold}
+              v={modality.vadThreshold}
               placeholder={0.5}
               step={0.05}
-              onSet={setVadThreshold}
+              onSet={(v) => update({ vadThreshold: v ?? 0.5 })}
             />
             <NumKv
               k="Onset frames"
               hint="vad_consecutive — sustained speech frames to flip silent→speech"
-              v={vadConsecutive}
+              v={modality.vadConsecutive}
               placeholder={3}
-              onSet={setVadConsecutive}
+              onSet={(v) => update({ vadConsecutive: v ?? 3 })}
             />
             <NumKv
               k="Hangover"
               hint="vad_hangover_ms — keep forwarding this long after the last loud frame"
-              v={vadHangoverMs}
+              v={modality.vadHangoverMs}
               placeholder={500}
               suffix="ms"
-              onSet={setVadHangoverMs}
+              onSet={(v) => update({ vadHangoverMs: v ?? 500 })}
             />
             <NumKv
               k="Padding min gap"
               hint="vad_pad_min_gap_ms — onset padding fires only when prior silence exceeded this"
-              v={vadPadMinGapMs}
+              v={modality.vadPadMinGapMs}
               placeholder={400}
               suffix="ms"
-              onSet={setVadPadMinGap}
+              onSet={(v) => update({ vadPadMinGapMs: v ?? 400 })}
             />
             <NumKv
               k="Onset padding"
               hint="vad_pad_duration_ms — low-noise padding injected at speech onset"
-              v={vadPadDurationMs}
+              v={modality.vadPadDurationMs}
               placeholder={0}
               suffix="ms"
-              onSet={setVadPadDuration}
+              onSet={(v) => update({ vadPadDurationMs: v ?? 0 })}
             />
           </>
         )}
       </div>
     </div>
   )
+}
+
+const MIC_BARS = 28
+
+function MicCardBars({
+  getAnalyser,
+  active,
+}: {
+  getAnalyser: () => AnalyserNode | null
+  active: boolean
+}) {
+  const [bands, setBands] = useState<number[]>(() => new Array(MIC_BARS).fill(0))
+  const dispRef = useRef<Float32Array>(new Float32Array(MIC_BARS))
+
+  useEffect(() => {
+    if (!active) {
+      dispRef.current.fill(0)
+      setBands(new Array(MIC_BARS).fill(0))
+      return
+    }
+    let raf = 0
+    let freq: Uint8Array | null = null
+    const loop = () => {
+      const analyser = getAnalyser()
+      if (analyser) {
+        if (!freq || freq.length !== analyser.frequencyBinCount) {
+          freq = new Uint8Array(analyser.frequencyBinCount)
+        }
+        analyser.getByteFrequencyData(freq as unknown as Uint8Array<ArrayBuffer>)
+        const minBin = 2
+        const maxBin = Math.min(freq.length - 1, 300)
+        const ratio = maxBin / minBin
+        const disp = dispRef.current
+        const raw = new Float32Array(MIC_BARS)
+        for (let b = 0; b < MIC_BARS; b++) {
+          const lo = Math.floor(minBin * Math.pow(ratio, b / MIC_BARS))
+          const hi = Math.max(lo + 1, Math.floor(minBin * Math.pow(ratio, (b + 1) / MIC_BARS)))
+          let sum = 0
+          let n = 0
+          for (let k = lo; k < hi && k < freq.length; k++) {
+            sum += freq[k]
+            n++
+          }
+          const avg = n > 0 ? sum / n / 255 : 0
+          raw[b] = Math.pow(avg, 0.7)
+        }
+        for (let b = 0; b < MIC_BARS; b++) {
+          const prev = raw[b - 1] ?? raw[b]
+          const next = raw[b + 1] ?? raw[b]
+          const target = (prev + 2 * raw[b] + next) / 4
+          const k = target > disp[b] ? 0.35 : 0.12
+          disp[b] += (target - disp[b]) * k
+        }
+        setBands(Array.from(disp))
+      }
+      raf = requestAnimationFrame(loop)
+    }
+    raf = requestAnimationFrame(loop)
+    return () => cancelAnimationFrame(raf)
+  }, [active, getAnalyser])
+
+  return (
+    <div className="mic-card__bars">
+      {bands.map((v, i) => {
+        const h = active ? Math.max(4, Math.min(96, v * 92 + 4)) : 4
+        return (
+          <span
+            key={i}
+            className={active ? 'mic-card__bar mic-card__bar--on' : 'mic-card__bar'}
+            style={{ height: `${h}%`, opacity: active ? 0.55 + 0.45 * v : 1 }}
+          />
+        )
+      })}
+    </div>
+  )
+}
+
+function formatMicTimer(seconds: number): string {
+  const m = Math.floor(seconds / 60)
+  const s = Math.floor(seconds % 60)
+  const t = Math.floor((seconds * 10) % 10)
+  return `${m}:${String(s).padStart(2, '0')}.${t}`
 }
 
 function NumKv({
@@ -1556,7 +1415,6 @@ function NumKv({
   onSet,
 }: {
   k: string
-  /** Hover tooltip — carries the raw server key + a short description. */
   hint?: string
   v: number | null
   placeholder: number

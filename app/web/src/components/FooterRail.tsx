@@ -17,14 +17,10 @@ interface Props {
 const STRATEGY_LABEL: Record<string, string> = {
   full: 'Full pass',
   split_full: 'Split-full',
-  chunked: 'Chunked',
   streaming: 'Streaming',
-  // `auto` / `offline` shouldn't appear in a result (they always resolve
-  // to one of the concrete values), but show them as-is if they do.
-  auto: 'auto',
+  // `offline` shouldn't appear in a result (it always resolves to FULL or
+  // SPLIT_FULL), but show it as-is if it does.
   offline: 'offline',
-  // Legacy alias — still labelled cleanly until callers drop it.
-  progressive: 'Streaming',
 }
 
 /**

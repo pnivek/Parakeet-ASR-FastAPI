@@ -16,7 +16,7 @@ Run:
     PARAKEET_URL=http://192.168.0.172:8777 pytest tests/test_strategies.py -v
 
     # Tighter scope while iterating
-    pytest tests/test_strategies.py -v -k "chunked_v2 and short"
+    pytest tests/test_strategies.py -v -k "full and short"
 """
 from __future__ import annotations
 
@@ -41,22 +41,18 @@ SHORT_LIMIT = int(os.environ.get("PARAKEET_TEST_SHORT_LIMIT", "5"))
 
 # Per (strategy, fixture-kind) WER ceilings.
 #
-# Parakeet on LibriSpeech-clean is ~1.7%. We keep `full` / `_v2` strict (≤10%)
-# on short to catch real engine regressions; the streaming `_v2` engine gets
-# slightly looser short-clip headroom because its first-chunk right context
-# is silence padding, which can flip one phoneme on a 3-5s utterance (=
-# 10-15% WER from a single word). Legacy chunked/progressive get a wide
-# short-clip gate because their middle-token-merge boundary artifacts are
-# documented pre-existing behavior — the whole reason `_v2` exists.
+# Parakeet on LibriSpeech-clean is ~1.7%. We keep REST strategies strict
+# (≤10%) on short to catch real engine regressions; `streaming` gets slightly
+# looser short-clip headroom because its first-chunk right context is silence
+# padding, which can flip one phoneme on a 3-5s utterance (= 10-15% WER from
+# a single word).
 #
 # Long-form thresholds reflect what's reasonable on TED-LIUM 3 (harder than
 # LibriSpeech — natural speech, varied speakers, no read text).
 WER_THRESHOLDS = {
-    "full":           {"short": 0.10, "longform": 0.15},
-    "chunked_v2":     {"short": 0.10, "longform": 0.15},
-    "progressive_v2": {"short": 0.20, "longform": 0.15},
-    "chunked":        {"short": 0.75, "longform": 0.20},
-    "progressive":    {"short": 0.75, "longform": 0.20},
+    "full":       {"short": 0.10, "longform": 0.15},
+    "split_full": {"short": 0.10, "longform": 0.15},
+    "streaming":  {"short": 0.20, "longform": 0.15},
 }
 
 

@@ -8,7 +8,7 @@ http://localhost:8777) through every strategy against two datasets:
     comparable to NVIDIA's published 1.69% on the same split.
 
   - **longform**: TED-LIUM 3 long-form (11 real TED talks, 5-25 min each).
-    Per-talk WER; lets us see how `full` / `chunked_v2` / `progressive_v2`
+    Per-talk WER; lets us see how `full` / `split_full` / `streaming`
     behave on natural long-form audio (no synthetic concat).
 
 WER is computed via `EnglishTextNormalizer` (Whisper) + `jiwer.wer` — the
@@ -19,9 +19,9 @@ Usage:
     python -m tests.download_fixtures
     PARAKEET_URL=http://192.168.0.172:8777 python -m tests.eval_harness
 
-WS strategies (`progressive`, `progressive_v2`) have a ~30s per-request
-teardown overhead, so the harness caps them at `--ws-limit` short fixtures
-(default 50). REST strategies run on all of them.
+The WS `streaming` strategy has ~30s per-request teardown overhead, so the
+harness caps it at `--ws-limit` short fixtures (default 50). REST strategies
+run on all of them.
 """
 from __future__ import annotations
 
@@ -41,8 +41,8 @@ from typing import Iterable
 FIXTURES = Path(__file__).parent / "fixtures"
 RESULTS = Path(__file__).parent / "results"
 
-REST_STRATEGIES = ("full", "chunked", "chunked_v2")
-WS_STRATEGIES = ("progressive", "progressive_v2")
+REST_STRATEGIES = ("full", "split_full")
+WS_STRATEGIES = ("streaming",)
 ALL_STRATEGIES = REST_STRATEGIES + WS_STRATEGIES
 
 
@@ -225,13 +225,9 @@ async def _run_ws(
                     if first_partial_at is None:
                         first_partial_at = time.monotonic() - t0
                     partials += 1
-                elif mtype == "refined_transcription":
+                elif mtype == "final_transcription":
                     final_text = msg.get("text") or _segments_to_text(msg.get("segments") or [])
                     final_segments = msg.get("segments") or []
-                elif mtype == "final_transcription" or mtype == "final":
-                    if not final_text:
-                        final_text = msg.get("text") or _segments_to_text(msg.get("segments") or [])
-                        final_segments = msg.get("segments") or []
                     break
                 elif mtype == "error":
                     raise RuntimeError(f"Server error: {msg.get('error')}")

@@ -1,9 +1,9 @@
-"""Backend-only progressive-stream throughput probe.
+"""Backend-only streaming throughput probe.
 
 Drives the deployed Parakeet WS endpoint with a single audio file as fast
 as the network allows, with explicit control over `vad_enabled`. Reports
 total wall time, audio duration, RTFx, time-to-first-partial, and the
-count of segments / peaks / refined messages received.
+count of segments_batch messages received.
 
 Removes every UI variable (no MediaRecorder, no decodeAudioData, no
 React state) so we can attribute the perceived slowness to the server
@@ -11,7 +11,7 @@ vs the client.
 
 Usage:
     PARAKEET_URL=http://192.168.0.172:8777 \
-      venv/bin/python -m tests.bench_progressive \
+      venv/bin/python -m tests.bench_streaming \
       --fixture GaryFlake --vad off
 """
 from __future__ import annotations
@@ -55,7 +55,7 @@ async def run(server_url: str, audio_path: Path, vad_enabled: bool, chunk_kb: in
 
     t0 = time.monotonic()
     first_partial_at: float | None = None
-    counts = {"segments_batch": 0, "peaks": 0, "refined_transcription": 0}
+    counts = {"segments_batch": 0}
     final_text: str | None = None
 
     async with websockets.connect(endpoint, max_size=2**26, ping_timeout=60) as ws:
@@ -100,8 +100,6 @@ async def run(server_url: str, audio_path: Path, vad_enabled: bool, chunk_kb: in
         "first_partial_s": first_partial_at,
         "send_done_s": send_done_at,
         "segments_batches": counts["segments_batch"],
-        "peaks_messages": counts["peaks"],
-        "refined_messages": counts["refined_transcription"],
         "final_chars": len(final_text or ""),
         "vad_enabled": vad_enabled,
     }
@@ -164,8 +162,6 @@ def main() -> None:
             f"  first partial  : {result['first_partial_s']:.2f}s (after stream open)\n"
             f"  send finished  : {result['send_done_s']:.2f}s\n"
             f"  segments_batch : {result['segments_batches']}\n"
-            f"  peaks msgs     : {result['peaks_messages']}\n"
-            f"  refined msgs   : {result['refined_messages']}\n"
             f"  text chars     : {result['final_chars']}",
             flush=True,
         )

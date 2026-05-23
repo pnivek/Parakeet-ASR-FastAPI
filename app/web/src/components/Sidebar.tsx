@@ -1111,32 +1111,65 @@ function URLPane({
   setUrlInput: (v: string) => void
 }) {
   const urlValid = /^https?:\/\/\S+/i.test(urlInput.trim()) && urlInput.trim() !== 'https://'
+  // Parsed pieces shown in the meta row when the user has typed a
+  // valid URL — gives the section visual mass while doubling as
+  // confirmation that we've parsed the link they typed.
+  let urlScheme = ''
+  let urlHost = ''
+  if (urlValid) {
+    try {
+      const u = new URL(urlInput.trim())
+      urlScheme = u.protocol.replace(':', '')
+      urlHost = u.host
+    } catch {
+      /* keep empty */
+    }
+  }
   return (
     <div>
-      <div className="sb__url-field">
-        <svg
-          viewBox="0 0 24 24"
-          width="14"
-          height="14"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.6"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden
-        >
-          <path d="M10 13a5 5 0 0 0 7.07 0l3.18-3.18a5 5 0 0 0-7.07-7.07L11.34 5" />
-          <path d="M14 11a5 5 0 0 0-7.07 0L3.75 14.18a5 5 0 0 0 7.07 7.07L12.66 19" />
-        </svg>
-        <input
-          type="url"
-          value={urlInput}
-          onChange={(e) => setUrlInput(e.target.value)}
-          className="sb__url-input"
-          spellCheck={false}
-          autoComplete="off"
-          placeholder="https://…"
-        />
+      {/* URL field rendered as a card (icon block + body) so its visual
+          mass matches the Upload file-card and Record mic-card — keeps
+          the sidebar from shifting height when the user tabs between
+          modalities. */}
+      <div className="sb__url-card">
+        <div className="sb__url-card__icon">
+          <svg
+            viewBox="0 0 24 24"
+            width="16"
+            height="16"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.6"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden
+          >
+            <path d="M10 13a5 5 0 0 0 7.07 0l3.18-3.18a5 5 0 0 0-7.07-7.07L11.34 5" />
+            <path d="M14 11a5 5 0 0 0-7.07 0L3.75 14.18a5 5 0 0 0 7.07 7.07L12.66 19" />
+          </svg>
+        </div>
+        <div className="sb__url-card__body">
+          <input
+            type="url"
+            value={urlInput}
+            onChange={(e) => setUrlInput(e.target.value)}
+            className="sb__url-input"
+            spellCheck={false}
+            autoComplete="off"
+            placeholder="https://…"
+          />
+          <div className="sb__url-card__meta">
+            {urlValid ? (
+              <>
+                <span className="mono">{urlScheme}</span>
+                <span className="sb__url-card__meta-dot" />
+                <span className="mono sb__url-card__meta-host">{urlHost}</span>
+              </>
+            ) : (
+              <span>No URL entered</span>
+            )}
+          </div>
+        </div>
       </div>
       <div className="sb__url-status">
         <span className={urlValid ? 'sb__url-dot sb__url-dot--on' : 'sb__url-dot'} />
@@ -1144,6 +1177,7 @@ function URLPane({
           {urlValid ? 'Ready to fetch' : 'Enter direct link to media'}
         </span>
       </div>
+      <div className="sb__url-formats">hls · icecast · mp3 · mp4 · m3u8 · wav</div>
 
       <EngineStrategy modality="url" m={modality} update={update} alwaysShowStrategy />
 

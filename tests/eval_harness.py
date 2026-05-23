@@ -203,9 +203,6 @@ async def _run_ws(
         "bytes_per_sample": 2,
         "format": "wav",
         "strategy": strategy,
-        # Disable refinement so we test the streaming output, not a post-hoc
-        # full pass that overrides it.
-        "progressive_refinement": False,
     }
 
     t0 = time.monotonic()

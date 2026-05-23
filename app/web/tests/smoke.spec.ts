@@ -2,10 +2,10 @@ import { test, expect } from '@playwright/test'
 
 /**
  * Smoke test: load the deployed Maison v6 UI, walk the three sidebar
- * tabs + the three input modes, verify the strategy gate, and capture
+ * tabs + the three input modes, verify the Engine gate, and capture
  * screenshots.
  */
-test('Maison v6 UI — boots, tabs switch, modes switch, strategy gate enforced', async ({ page }) => {
+test('Maison v6 UI — boots, tabs switch, modes switch, engine gate enforced', async ({ page }) => {
   const consoleErrors: string[] = []
   page.on('console', (msg) => {
     if (msg.type() === 'error') consoleErrors.push(msg.text())
@@ -54,21 +54,28 @@ test('Maison v6 UI — boots, tabs switch, modes switch, strategy gate enforced'
   await expect(page.getByRole('button', { name: /^Segment$/i })).toBeVisible()
   await expect(page.getByRole('button', { name: /^Word$/i })).toBeVisible()
 
-  // Engine tab — Strategy option list visible.
+  // Engine tab — Engine picker (Offline / Streaming) + Strategy override.
   await engineTab.click()
-  await expect(page.getByRole('radio', { name: 'auto' })).toBeVisible()
-  await expect(page.getByRole('radio', { name: 'chunked' })).toBeVisible()
+  await expect(page.getByRole('radio', { name: 'Offline' })).toBeVisible()
+  await expect(page.getByRole('radio', { name: 'Streaming' })).toBeVisible()
+  // The override is visible (Engine defaults to Offline → it's shown).
+  await expect(page.getByRole('radio', { name: 'Auto' })).toBeVisible()
+  await expect(page.getByRole('radio', { name: 'Full pass' })).toBeVisible()
+  await expect(page.getByRole('radio', { name: 'Split-full' })).toBeVisible()
+  await expect(page.getByRole('radio', { name: 'Chunked' })).toBeVisible()
 
-  // Strategy gate: progressive enabled in file mode, disabled in URL.
+  // Engine gate: file allows both engines.
   await sourceTab.click()
   await page.getByRole('radio', { name: 'File upload' }).click()
   await engineTab.click()
-  await expect(page.getByRole('radio', { name: 'progressive' })).toBeEnabled()
+  await expect(page.getByRole('radio', { name: 'Offline' })).toBeEnabled()
+  await expect(page.getByRole('radio', { name: 'Streaming' })).toBeEnabled()
 
+  // Engine gate: URL locks Streaming out (REST upload only).
   await sourceTab.click()
   await page.getByRole('radio', { name: 'URL' }).click()
   await engineTab.click()
-  await expect(page.getByRole('radio', { name: 'progressive' })).toBeDisabled()
+  await expect(page.getByRole('radio', { name: 'Streaming' })).toBeDisabled()
 
   // Footer rail metric labels present.
   for (const label of ['STRATEGY', 'ASR', 'RTFx', 'TTFS', 'SEGMENTS', 'WORDS']) {

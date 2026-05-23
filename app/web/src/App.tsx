@@ -271,13 +271,21 @@ export default function App() {
     result?.format === 'verbose_json' ? result.body.language || 'en' : 'en'
 
   // Active strategy for the footer — there's always one. mic+live is
-  // locked to progressive; otherwise the chosen engine setting (already
-  // kept valid per mode by the sidebar). The footer prefers the result's
-  // resolved strategy when present, falling back to this.
-  const strategy = useSettings((st) => st.strategy)
+  // locked to Engine=Streaming. Otherwise show the chosen engine; if
+  // it's offline + an explicit strategy override, surface the override
+  // instead (more informative). The footer prefers the resolved value
+  // from the server result when present and falls back to this.
+  const engine = useSettings((st) => st.engine)
+  const strategyOverride = useSettings((st) => st.strategyOverride)
   const micCaptureMode = useSettings((st) => st.micCaptureMode)
   const activeStrategy =
-    mode === 'mic' && micCaptureMode === 'live' ? 'progressive' : strategy
+    mode === 'mic' && micCaptureMode === 'live'
+      ? 'streaming'
+      : engine === 'streaming'
+        ? 'streaming'
+        : strategyOverride === 'auto'
+          ? 'offline'
+          : strategyOverride
 
   return (
     <div className="app">

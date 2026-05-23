@@ -1,21 +1,34 @@
 # Transcription strategies
 
-A Parakeet Playground guide to picking the right strategy, what the model can and can't do, and where our server's defaults come from. This page eventually renders inside the SPA at `/docs/strategies`.
+A Parakeet Playground guide to picking the right Engine + Strategy, what the model can and can't do, and where our server's defaults come from. This page eventually renders inside the SPA at `/docs/strategies`.
 
-> **Source vs. server.** Every fact about the model itself is sourced from NVIDIA's [`nvidia/parakeet-tdt-0.6b-v2` model card](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) and the upstream [NeMo](https://github.com/NVIDIA/NeMo) library. Everything about *strategies* (`auto` / `full` / `chunked` / `progressive`) and our defaults is our server's wrapper layer.
+> **Source vs. server.** Every fact about the model itself is sourced from NVIDIA's [`nvidia/parakeet-tdt-0.6b-v2` model card](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) and the upstream [NeMo](https://github.com/NVIDIA/NeMo) library. Everything about *strategies* (`auto` / `offline` / `full` / `split_full` / `chunked` / `streaming`) and our defaults is our server's wrapper layer.
+
+---
+
+## Vocabulary — Engine × Strategy
+
+Two orthogonal axes:
+
+1. **Engine (transport)** — `offline` (REST, results all at once) or `streaming` (WebSocket, live partials). Mutually exclusive; you always know which one you want.
+2. **Strategy override (offline engine only)** — `auto` (default), `full`, `split_full`, or `chunked`. Most users never touch it; benchmarkers can force one.
+
+The streaming engine has only one implementation, so there's no Strategy choice under it.
 
 ---
 
 ## TL;DR — pick a strategy
 
-| Your situation | Use | Why |
-|---|---|---|
-| Offline file, ≤ 24 min, you want it done as fast as possible | `full` | Single-pass through the encoder; up to ~170× RTFx on a single stream. |
-| Offline file, any length | `chunked` (REST default via `auto`) | Same engine as `full` driven over a sliding window, never OOMs, identical quality within noise. |
-| Live mic / WebSocket streaming | `progressive` (WS default via `auto`) | Same engine again but emits partial segments as they commit. ~6 s emission lag. |
-| Don't want to think about it | `auto` | REST → `chunked`. WS → `progressive`. Always works. |
+| Your situation | Engine | Override | Resolves to |
+|---|---|---|---|
+| Offline file, any length, just transcribe it | Offline | Auto (default) | `full` if ≤ `MAX_FULL_WAVEFORM_S`, else `split_full` |
+| Offline file, you know it fits — want max throughput, fail-fast if it doesn't | Offline | Full | `full` (errors if too long) |
+| Offline file longer than the GPU's single-shot ceiling, want FULL throughput anyway | Offline | Split-full | `split_full` (sequential FULL passes, stitched) |
+| Benchmarking the chunked engine against `full` / `split_full` | Offline | Chunked | `chunked` |
+| Live mic / WebSocket captions | Streaming | n/a | `streaming` |
+| Don't want to think about it | (Auto) | n/a | WS → `streaming`; else `offline` cascade above |
 
-If `progressive` is selected on a REST upload the server returns `400`; the client maps stale values to `chunked` defensively. (Why: see [Why we don't allow `progressive` on REST](#why-progressive-only-makes-sense-over-a-websocket).)
+Sending `?strategy=streaming` to the REST endpoint returns `400` — see [Why streaming only makes sense over a WebSocket](#why-streaming-only-makes-sense-over-a-websocket).
 
 ---
 
@@ -54,7 +67,18 @@ All four strategies share the **same primitives**: the FastConformer encoder and
 
 **Quality**: 1.37 % WER on LibriSpeech test-clean (our measurement; better than NVIDIA's 1.69 % via `transcribe()` because we sidestep the wrapper bug).
 **Throughput**: ~170× RTFx single-stream on a DGX Spark.
-**Hard limit**: ≤ 24 min, or ≤ `MAX_FULL_WAVEFORM_S` (env, default 1440 s).
+**Hard limit**: ≤ `MAX_FULL_WAVEFORM_S` (env). When `engine=offline` + `override=auto`, the dispatcher auto-routes longer files to `split_full` instead.
+
+### `split_full` — sequential FULL passes, stitched
+
+- Audio is sliced into `MAX_FULL_WAVEFORM_S * SLICE_SAFETY`-second windows with `SPLIT_FULL_OVERLAP_S` of overlap.
+- Each slice runs back-to-back through `_transcribe_full` (same primitive as `full`).
+- Slice-relative timestamps are translated to wall-clock; segments inside the prior slice's tail (the overlap) are dropped to avoid duplicates at the seam.
+
+**Why it works**: on this hardware FULL is ~3-5× the throughput of `chunked`. Even paying the cost of an overlap per seam, sequential FULL passes finish a long file much faster than the chunked engine would. The cold-start at every slice boundary is mitigated by the `SPLIT_FULL_OVERLAP_S` of audio context the second slice's encoder sees before its first emitted segment.
+
+**Throughput**: comparable to `full` minus the overlap tax (typically ≤ 5 %).
+**Limits**: any length; no hard ceiling.
 
 ### `chunked` — sliding window, offline
 
@@ -65,9 +89,9 @@ All four strategies share the **same primitives**: the FastConformer encoder and
 
 **Quality**: 1.33 % WER on LibriSpeech test-clean. Within noise of `full`.
 **Throughput**: ~65× RTFx single-stream.
-**Limits**: handles anything from 1 s to multi-hour files. No upper bound.
+**Why it's still on the menu**: power-user benchmarking against `full` / `split_full`, and as the natural shape for the future multi-tenant scheduler that batches across concurrent users.
 
-### `progressive` — same engine, live I/O
+### `streaming` — same engine, live I/O
 
 Algorithmically identical to `chunked`. The differences are entirely about *when audio arrives and when results go back*:
 
@@ -79,55 +103,36 @@ Algorithmically identical to `chunked`. The differences are entirely about *when
 
 ### `auto` — server picks
 
-- REST request → `chunked`.
-- WebSocket request → `progressive`.
+- WebSocket request → `streaming`.
+- REST request → `offline` cascade → `full` if `duration ≤ MAX_FULL_WAVEFORM_S`, else `split_full`.
 
 That's it. If you set the env `DEFAULT_STRATEGY` to something other than `auto`, that becomes the picked strategy.
 
 ---
 
-## Why `progressive` only makes sense over a WebSocket
+## Why `streaming` only makes sense over a WebSocket
 
 Two reasons, both about the HTTP request lifecycle:
 
 1. **Input is one-shot on REST.** `multipart/form-data` delivers the entire body before the handler runs. There's nothing "streaming in" to feed a live producer. `await file.read()` returns the complete buffer at once.
 2. **Output is one-shot on REST.** A single HTTP response, one body. There's no way to push `segments_batch` messages as they commit. Even with chunked transfer encoding you'd be streaming the *response*, but the *input* is still already complete.
 
-Asking for `progressive` over REST would silently degrade to "wait until done, then return all segments at once" — which is exactly what `chunked` already does. The server returns `400` instead of doing the silent demotion because if a developer asks for `progressive`, they want live partials and need to know they're not getting them.
+Asking for `streaming` over REST would silently degrade to "wait until done, then return all segments at once" — which is exactly what `chunked` already does. The server returns `400` instead of doing the silent demotion because if a developer asks for `streaming`, they want live partials and need to know they're not getting them.
 
-The Maison sidebar disables the `progressive` option outside Live mic mode. If a stale localStorage value picks it on REST anyway, the client transparently maps `progressive → chunked` at submit time.
-
----
-
-## `progressive_refinement` — the EOF FULL pass
-
-When `progressive_refinement=true` (default) and the total accumulated audio is ≤ `MAX_FULL_WAVEFORM_S` (24 min), the server:
-
-1. Streams partials live as usual during recording.
-2. On EOF, runs **one single FULL pass** over the entire accumulated PCM.
-3. Replaces the streamed segments with the FULL output as a `refined_transcription` message.
-4. Sends `final_transcription` to close.
-
-**It is not a continuous refinement.** It's one shot at the end. The streamed partials are the "preview"; the FULL pass is the "final cut."
-
-If the recording exceeds 24 min, refinement is silently skipped (logged) — FULL can't handle it. The streamed partials remain the final output.
+The Maison sidebar gates the Engine picker per source: mic+live locks Engine=Streaming, URL and mic+record lock Engine=Offline.
 
 ---
 
-## Why we can't just split a long file into FULL passes
+## Why `split_full` instead of forcing everyone onto `chunked` for long files
 
-The naive approach: chop a 1-hour file into three 20-min slices, run FULL on each, concat. **It would be fast — but quality at the joins is bad.** Two reasons:
+The naive offline path used to be: file too long for one FULL pass? Fall back to `chunked`. That works but is ~3-5× slower than necessary on this hardware. The right answer for offline files that exceed the FULL ceiling is to **run FULL on slices** — which is what `split_full` does.
 
-1. **Where to cut**: splitting at second 1200 might chop mid-word. Silence detection is its own problem.
-2. **Decoder cold-start at every split**: the TDT decoder is stateful. Three independent FULL passes mean three cold starts. The first 1–2 words after every join are statistically worse, and sentence boundaries get jagged.
+Two reasons the seam isn't a problem in practice:
 
-`StreamingPrevBatchedEngine` (chunked / progressive) solves both:
-- **Overlapping windows** mean no word ever falls inside a "missed" segment.
-- **`prev_batched_state` threading** means the decoder believes it's doing one long decode that just happens to come in pieces.
+1. **Overlapping slices** give the second slice's encoder enough left-context to land its first few segments cleanly. We dedup segments whose start landed inside the prior slice's tail.
+2. **Cold-start cost** is small relative to the slice itself: a single FULL pass on `MAX_FULL_WAVEFORM_S × SLICE_SAFETY` seconds amortizes the cold-start across many minutes of audio. Compare to chunked, where every chunk has the same kind of decoder boundary cost — just constantly, every 10 s, instead of every ~24 min.
 
-Measured impact: chunked is 1.33 % WER vs. full's 1.37 % on LibriSpeech test-clean — essentially identical accuracy. Naive 20-min FULL splits would measurably regress at the joins.
-
-The cost of doing it right is throughput: ~65× RTFx for chunked vs. ~170× RTFx for full. Worth it for long files; not worth it when full fits.
+`chunked` stays on the menu as an explicit override for benchmarking and as the natural shape for the future multi-tenant scheduler.
 
 ---
 
@@ -159,7 +164,7 @@ if duration_sec > 480 : # 8 minutes
 **Caveats**:
 - The model card doesn't mention local attention at all — the model was *trained* with full attention only. Local attention is a NeMo runtime feature inherited from FastConformer.
 - Expect a small but real quality regression on the local-attention portion of the audio vs. true full attention.
-- `chunked` and `progressive` also call this switch when the *original* file duration exceeds the threshold — their per-chunk encoder calls inherit the long-audio attention mode for the whole session.
+- `chunked` and `streaming` also call this switch when the *original* file duration exceeds the threshold — their per-chunk encoder calls inherit the long-audio attention mode for the whole session.
 
 ---
 
@@ -198,7 +203,8 @@ All optional. Defaults shown.
 | Var | Default | Effect |
 |---|---:|---|
 | `DEFAULT_STRATEGY` | `auto` | What `?strategy=auto` resolves to. |
-| `MAX_FULL_WAVEFORM_S` | `1440` (24 min) | Hard cap for `full`. Above this, `full` errors or auto-falls-back to `chunked`. |
+| `MAX_FULL_WAVEFORM_S` | `1440` (24 min) | Hard cap for `full`. When `engine=offline` + `override=auto`, longer files route to `split_full`. |
+| `SPLIT_FULL_OVERLAP_S` | `15` | Overlap (s) between adjacent `split_full` slices. Gives the second slice's encoder enough left-context to land clean segments; seam-dedup drops segments inside the prior slice's tail. |
 | `LONG_AUDIO_THRESHOLD` | `480` (8 min) | Above this duration, the encoder is switched to `rel_pos_local_attn` for the session. **GPU-dependent**: NVIDIA's value chosen to be safe across hardware; raise on big-memory GPUs, lower on small ones. See [Local attention above 8 minutes](#local-attention-above-8-minutes--where-this-comes-from). |
 | `STREAMING_LEFT_CONTEXT_S` | `10` | Left context for the offline-like preset. |
 | `STREAMING_CHUNK_S` | `10` | Chunk length for the offline-like preset. |
@@ -273,11 +279,11 @@ You can, but accuracy degrades and the encoder may OOM. The cap exists to preven
 **Why is `chunked`'s WER lower than `full`'s in our table?**
 Statistical noise. We're at the model's accuracy floor on a small test set; the 0.04 % gap is within run-to-run variance. The point is that they're functionally equivalent.
 
-**Why is `progressive` not the default for REST too?**
-`progressive` provides nothing on REST that `chunked` doesn't — the partials can't be delivered. Routing REST to `chunked` is the honest default; the server explicitly errors on `?strategy=progressive` over REST so a misconfiguration doesn't silently degrade.
+**Why is `streaming` not the default for REST too?**
+`streaming` provides nothing on REST that `offline` doesn't — the partials can't be delivered. Routing REST to `offline` is the honest default; the server explicitly errors on `?strategy=streaming` over REST so a misconfiguration doesn't silently degrade.
 
 **My audio is 30 minutes. What happens?**
-`auto` → `chunked` handles it. `full` would error (above the 24-min cap). The server logs the dispatch decision with the resolved strategy.
+`auto` → `offline` cascade → `split_full` (assuming `MAX_FULL_WAVEFORM_S=1440 s`). `full` would error (above the cap). The server logs the dispatch decision with the resolved strategy.
 
 **Why does the long-audio switch fire at 8 minutes? Is that a model requirement?**
 No — it's NVIDIA's chosen safety margin in their reference demo. We copied the threshold and the `[256, 256]` context window from their HuggingFace Space verbatim. The exact value isn't sacred; it's "low enough to keep most GPUs from OOMing in the FULL pass." On a beefy GPU (A100/H100 80 GB) you can comfortably raise it; on a smaller GPU you may need to lower it. Tune via the `LONG_AUDIO_THRESHOLD` env var.

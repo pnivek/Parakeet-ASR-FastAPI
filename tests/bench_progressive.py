@@ -49,8 +49,7 @@ async def run(server_url: str, audio_path: Path, vad_enabled: bool, chunk_kb: in
         "channels": 1,
         "bytes_per_sample": 2,
         "format": "wav",
-        "strategy": "progressive",
-        "progressive_refinement": False,
+        "strategy": "streaming",
         "vad_enabled": vad_enabled,
     }
 

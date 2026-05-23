@@ -10,7 +10,7 @@ import {
 import { useSettings } from '../lib/settings'
 import { MIC_FORMAT_HINT, MIC_SAMPLE_RATE, MIC_MIME_TYPE, useMic } from '../lib/mic'
 import { formatBytes } from '../lib/format'
-import type { ResponseFormat, Strategy, TimestampGranularity, WhisperSegment, Word, WSMessage } from '../lib/types'
+import type { Engine, ResponseFormat, Strategy, StrategyOverride, TimestampGranularity, WhisperSegment, Word, WSMessage } from '../lib/types'
 import type { LoadedAudio } from '../lib/download'
 import { OptionList } from './OptionList'
 
@@ -53,7 +53,25 @@ const FORMATS: { id: ResponseFormat; label: string }[] = [
   { id: 'srt', label: 'srt' },
   { id: 'vtt', label: 'vtt' },
 ]
-const STRATEGIES: Strategy[] = ['auto', 'full', 'chunked', 'progressive']
+const ENGINES: { id: Engine; label: string; hint: string }[] = [
+  { id: 'offline', label: 'Offline', hint: 'REST upload, no live partials. Best for files, URLs, recordings.' },
+  { id: 'streaming', label: 'Streaming', hint: 'WebSocket with live segments as they’re transcribed. Required for mic + live.' },
+]
+
+const STRATEGY_OVERRIDES: { id: StrategyOverride; label: string; hint: string }[] = [
+  { id: 'auto', label: 'Auto', hint: 'Server picks Full / Split-full based on file size.' },
+  { id: 'full', label: 'Full pass', hint: 'Force a single pass. Errors if it would OOM.' },
+  { id: 'split_full', label: 'Split-full', hint: 'Force sequential full passes over slices, stitched at seams.' },
+  { id: 'chunked', label: 'Chunked', hint: 'Force the chunked engine (offline, no partials). For benchmarking against streaming; slower than Full on this GPU.' },
+]
+
+/** Wire-level `?strategy=` param the backend expects, derived from the
+ * two-axis (engine, strategyOverride) UI vocabulary. */
+function restStrategyParam(engine: Engine, override: StrategyOverride): Strategy {
+  if (engine === 'streaming') return 'streaming'
+  // engine === 'offline'
+  return override === 'auto' ? 'offline' : (override as Strategy)
+}
 
 export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBusyChange, onSessionStart, onAudioReady, onClearSource, onPeaks, onPartialSegment }: Props) {
   const s = useSettings()
@@ -107,29 +125,23 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
   const recordStartRef = useRef<number>(0)
   const [recordElapsed, setRecordElapsed] = useState(0)
 
-  // ── Keep the engine (strategy) valid for the current source ──
+  // ── Keep Engine valid for the current source ──
   // Backend reality:
-  //  - mic + live  → live partials come ONLY from the progressive
-  //    streaming path, so live transcription IS progressive. Lock it.
-  //  - url / mic+record → REST upload; progressive isn't available
-  //    (URL is server-fetched; a finished recording is a plain blob).
-  // file keeps the full choice (progressive streams over WS).
+  //  - mic + live           → only the WS streaming engine can emit live
+  //                           partials, so lock Engine=Streaming.
+  //  - url / mic + record   → REST upload only (URL is server-fetched, a
+  //                           finished recording is a plain blob), so lock
+  //                           Engine=Offline.
+  //  - file                 → both selectable (Streaming uses WS file
+  //                           streaming for live partials).
   useEffect(() => {
     if (mode === 'mic' && s.micCaptureMode === 'live') {
-      if (s.strategy !== 'progressive') s.set('strategy', 'progressive')
-    } else if (
-      (mode === 'url' || (mode === 'mic' && s.micCaptureMode === 'record')) &&
-      s.strategy === 'progressive'
-    ) {
-      s.set('strategy', 'auto')
+      if (s.engine !== 'streaming') s.set('engine', 'streaming')
+    } else if (mode === 'url' || (mode === 'mic' && s.micCaptureMode === 'record')) {
+      if (s.engine !== 'offline') s.set('engine', 'offline')
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, s.micCaptureMode])
-  // Strategy actually sent over REST (file-non-progressive / URL). If the
-  // user has progressive selected but we're falling back to REST (URL
-  // mode), map to chunked so the backend doesn't 400.
-  const restStrategy = (): Strategy =>
-    s.strategy === 'progressive' ? 'chunked' : s.strategy
 
   /** Shared VAD + HPF config block for any WS config first frame.
    *
@@ -171,7 +183,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         text: segs.map((x) => x.text).join(' ').trim(),
         segments: segs,
         words: words.length > 0 ? words : undefined,
-        strategy: 'progressive',
+        strategy: 'streaming',
         transcription_time_seconds: wall,
       },
     }
@@ -218,25 +230,6 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         }
         case 'partial_segment':
           onPartialSegment?.(msg.segment, msg.words ?? [])
-          break
-        case 'refined_transcription':
-          cancelPendingPartial()
-          onPartialSegment?.(null, [])
-          segmentsRef.current = msg.segments
-          if (msg.words) wordsRef.current = msg.words
-          onPartial({
-            format: 'verbose_json',
-            body: {
-              task: 'transcribe',
-              language: 'en',
-              duration: msg.audio_duration_seconds,
-              text: msg.text,
-              segments: msg.segments,
-              words: msg.words,
-              strategy: 'progressive',
-              transcription_time_seconds: msg.transcription_time,
-            },
-          })
           break
         case 'final_transcription': {
           cancelPendingPartial()
@@ -380,9 +373,9 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         await mic.start()
         return
       }
-      // Live mode: open the WS, then start the mic.
-      const wsStrategy: Strategy =
-        s.strategy === 'auto' || s.strategy === 'progressive' ? 'progressive' : s.strategy
+      // Live mode: open the WS, then start the mic. Engine is locked
+      // to Streaming for mic+live (see source-gating useEffect above);
+      // the Strategy override is irrelevant on the streaming engine.
       let liveWs: LiveWSHandle
       liveWs = connectLiveWS(
         {
@@ -390,9 +383,8 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           channels: 1,
           bytes_per_sample: 2,
           format: MIC_FORMAT_HINT,
-          strategy: wsStrategy,
+          strategy: 'streaming',
           live_latency: s.liveLatency,
-          progressive_refinement: s.progressiveRefinement,
           chunk_length: s.chunkLength ?? undefined,
           chunk_overlap: s.chunkOverlap ?? undefined,
           batch_size: s.batchSize ?? undefined,
@@ -429,10 +421,10 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
       if (!pickedFile) return
       onSessionStart?.()
 
-      // File + progressive → stream over WebSocket for live partials.
+      // File + Engine=Streaming → stream over WebSocket for live partials.
       // The audio player gets the file immediately so the user can scrub
       // / play while transcription streams in.
-      if (s.strategy === 'progressive') {
+      if (s.engine === 'streaming') {
         cancelPendingPartial()
         segmentsRef.current = []
         wordsRef.current = []
@@ -460,7 +452,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
               channels: 1,
               bytes_per_sample: 2,
               format: fileExt,
-              strategy: 'progressive',
+              strategy: 'streaming',
               // Force the offline 10s-chunk preset for file mode. The
               // user's `liveLatency` toggle exists for mic responsiveness
               // (2s chunks → 4s emission lag) but actively slows file
@@ -468,7 +460,6 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
               // second of audio. Bench: 75x RTFx offline vs 18x live on
               // the same 25-min file.
               live_latency: false,
-              progressive_refinement: s.progressiveRefinement,
               chunk_length: s.chunkLength ?? undefined,
               chunk_overlap: s.chunkOverlap ?? undefined,
               batch_size: s.batchSize ?? undefined,
@@ -483,23 +474,6 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
                   if (msg.words && msg.words.length > 0)
                     wordsRef.current = [...wordsRef.current, ...msg.words]
                   schedulePartial()
-                } else if (msg.type === 'refined_transcription') {
-                  cancelPendingPartial()
-                  segmentsRef.current = msg.segments
-                  if (msg.words) wordsRef.current = msg.words
-                  onPartial({
-                    format: 'verbose_json',
-                    body: {
-                      task: 'transcribe',
-                      language: 'en',
-                      duration: msg.audio_duration_seconds,
-                      text: msg.text,
-                      segments: msg.segments,
-                      words: msg.words,
-                      strategy: 'progressive',
-                      transcription_time_seconds: msg.transcription_time,
-                    },
-                  })
                 } else if (msg.type === 'final_transcription') {
                   cancelPendingPartial()
                   onResult(loaded, {
@@ -553,7 +527,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           {
             response_format: s.responseFormat,
             timestamp_granularities: s.timestampGranularities,
-            strategy: restStrategy(),
+            strategy: restStrategyParam(s.engine, s.strategyOverride),
             chunk_length: s.chunkLength ?? undefined,
             chunk_overlap: s.chunkOverlap ?? undefined,
             batch_size: s.batchSize ?? undefined,
@@ -591,7 +565,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
           {
             response_format: s.responseFormat,
             timestamp_granularities: s.timestampGranularities,
-            strategy: restStrategy(),
+            strategy: restStrategyParam(s.engine, s.strategyOverride),
             chunk_length: s.chunkLength ?? undefined,
             chunk_overlap: s.chunkOverlap ?? undefined,
             batch_size: s.batchSize ?? undefined,
@@ -633,7 +607,7 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             {
               response_format: s.responseFormat,
               timestamp_granularities: s.timestampGranularities,
-              strategy: restStrategy(),
+              strategy: restStrategyParam(s.engine, s.strategyOverride),
               chunk_length: s.chunkLength ?? undefined,
               chunk_overlap: s.chunkOverlap ?? undefined,
               batch_size: s.batchSize ?? undefined,
@@ -801,13 +775,14 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
         )}
         {tab === 'engine' && (
           <EnginePane
-            strategy={s.strategy}
-            setStrategy={(v) => s.set('strategy', v)}
+            engine={s.engine}
+            setEngine={(v) => s.set('engine', v)}
+            strategyOverride={s.strategyOverride}
+            setStrategyOverride={(v) => s.set('strategyOverride', v)}
             mode={mode}
             micCaptureMode={s.micCaptureMode}
             longAudioThreshold={s.longAudioThreshold}
             liveLatency={s.liveLatency}
-            progressiveRefinement={s.progressiveRefinement}
             vadEnabled={s.vadEnabled}
             vadThreshold={s.vadThreshold}
             vadConsecutive={s.vadConsecutive}
@@ -818,7 +793,6 @@ export function Sidebar({ mode, onModeChange, onResult, onPartial, onError, onBu
             noiseSuppression={s.noiseSuppression}
             setLong={(v) => s.set('longAudioThreshold', v)}
             setLiveLatency={(v) => s.set('liveLatency', v)}
-            setProgRefine={(v) => s.set('progressiveRefinement', v)}
             setVadEnabled={(v) => s.set('vadEnabled', v)}
             setVadThreshold={(v) => s.set('vadThreshold', v ?? 0.5)}
             setVadConsecutive={(v) => s.set('vadConsecutive', v ?? 3)}
@@ -1344,13 +1318,14 @@ function OutputPane({
 
 // ── Engine pane ───────────────────────────────────────────────────
 function EnginePane({
-  strategy,
-  setStrategy,
+  engine,
+  setEngine,
+  strategyOverride,
+  setStrategyOverride,
   mode,
   micCaptureMode,
   longAudioThreshold,
   liveLatency,
-  progressiveRefinement,
   vadEnabled,
   vadThreshold,
   vadConsecutive,
@@ -1361,7 +1336,6 @@ function EnginePane({
   noiseSuppression,
   setLong,
   setLiveLatency,
-  setProgRefine,
   setVadEnabled,
   setVadThreshold,
   setVadConsecutive,
@@ -1371,13 +1345,14 @@ function EnginePane({
   setHpfHz,
   setNoiseSuppression,
 }: {
-  strategy: Strategy
-  setStrategy: (v: Strategy) => void
+  engine: Engine
+  setEngine: (v: Engine) => void
+  strategyOverride: StrategyOverride
+  setStrategyOverride: (v: StrategyOverride) => void
   mode: InputMode
   micCaptureMode: 'live' | 'record'
   longAudioThreshold: number | null
   liveLatency: boolean
-  progressiveRefinement: boolean
   vadEnabled: boolean
   vadThreshold: number | null
   vadConsecutive: number | null
@@ -1388,7 +1363,6 @@ function EnginePane({
   noiseSuppression: boolean
   setLong: (v: number | null) => void
   setLiveLatency: (v: boolean) => void
-  setProgRefine: (v: boolean) => void
   setVadEnabled: (v: boolean) => void
   setVadThreshold: (v: number | null) => void
   setVadConsecutive: (v: number | null) => void
@@ -1398,55 +1372,72 @@ function EnginePane({
   setHpfHz: (v: number | null) => void
   setNoiseSuppression: (v: boolean) => void
 }) {
-  // Each setting only shows on the path that actually uses it, so we
-  // never present a knob that silently does nothing.
-  //
-  // Two server paths:
-  //  - STREAMING (WebSocket): mic+live, and file+progressive. Processes
-  //    audio chunk-by-chunk as it arrives. Uses progressive_refinement
-  //    (+ live_latency / VAD for mic). Does NOT use batch_size /
-  //    chunk_length / long_audio_threshold — those are batch knobs.
-  //  - REST UPLOAD: file (chunked/full/auto), url, mic+record. The
-  //    whole file is decoded server-side, so batch_size / chunk_length
-  //    / long_audio_threshold apply here.
+  // Two-axis transcription picker:
+  //  1. Engine (transport): Offline (REST) vs Streaming (WS live partials).
+  //     Source dictates which are selectable — see source-gating useEffect.
+  //  2. Strategy override (offline-engine implementation only): Auto picks
+  //     Full ≤ MAX_FULL_WAVEFORM_S vs Split-full above. Power users can force
+  //     Full / Split-full / Chunked explicitly. Hidden when Engine=Streaming
+  //     since the streaming engine has only one implementation.
   const isMicLive = mode === 'mic' && micCaptureMode === 'live'
   const isMicAny = mode === 'mic'
-  const isStreaming = isMicLive || (mode === 'file' && strategy === 'progressive')
+  const isStreaming = engine === 'streaming'
   const isRestUpload = !isStreaming
+
+  // Gating rules per source:
+  //  - mic + live      → Streaming locked (only WS can emit live partials).
+  //  - url / mic+record → Offline locked (REST upload only).
+  //  - file            → both selectable.
+  const streamingDisabledReason: string | undefined =
+    mode === 'url'
+      ? 'streaming isn’t available for URL ingest'
+      : mode === 'mic' && micCaptureMode === 'record'
+        ? 'streaming needs a live stream — record uploads the finished clip'
+        : undefined
+  const offlineDisabledReason: string | undefined = isMicLive
+    ? 'live transcription always uses the streaming engine'
+    : undefined
+
   return (
     <div>
-      <SBLabel>Strategy</SBLabel>
-      <OptionList<Strategy>
-        value={strategy}
-        options={STRATEGIES.map((id) => {
-          // mic + live IS progressive streaming — lock the others out.
-          if (isMicLive) {
-            return {
-              id,
-              label: id,
-              disabled: id !== 'progressive',
-              disabledReason: 'live transcription always streams progressively',
-            }
-          }
-          // progressive needs a stream we can push: file (WS) or mic+live.
-          // URL is server-fetched and mic+record is a finished blob → REST.
-          const progDisabled =
-            id === 'progressive' && (mode === 'url' || (mode === 'mic' && micCaptureMode === 'record'))
-          return {
-            id,
-            label: id,
-            disabled: progDisabled,
-            disabledReason:
-              mode === 'url'
-                ? 'progressive isn’t available for URL ingest'
-                : 'progressive needs a live stream — record uploads the finished clip',
-          }
+      <SBLabel>Engine</SBLabel>
+      <OptionList<Engine>
+        value={engine}
+        options={ENGINES.map((e) => {
+          const disabled =
+            (e.id === 'streaming' && !!streamingDisabledReason) ||
+            (e.id === 'offline' && !!offlineDisabledReason)
+          const disabledReason =
+            e.id === 'streaming' ? streamingDisabledReason : offlineDisabledReason
+          return { id: e.id, label: e.label, disabled, disabledReason }
         })}
-        onChange={setStrategy}
+        onChange={setEngine}
       />
 
       <SBLabel top={22}>Advanced</SBLabel>
       <div className="sb__adv-list">
+        {/* Strategy override is meaningful only on the offline engine. */}
+        {!isStreaming && (
+          <div style={{ marginBottom: 12 }}>
+            <div
+              className="ma-kv__k"
+              style={{ marginBottom: 6 }}
+              title="Force a specific offline implementation. Auto lets the server pick Full ≤ cap, else Split-full."
+            >
+              Strategy override
+            </div>
+            <OptionList<StrategyOverride>
+              value={strategyOverride}
+              options={STRATEGY_OVERRIDES.map((o) => ({
+                id: o.id,
+                label: o.label,
+                disabledReason: o.hint,
+              }))}
+              onChange={setStrategyOverride}
+            />
+          </div>
+        )}
+
         {isRestUpload && (
           <>
             {/* long_audio_threshold is the only offline knob the engine
@@ -1470,14 +1461,6 @@ function EnginePane({
             hint="live_latency — smaller streaming chunks; faster partials, lower throughput"
             v={liveLatency}
             onSet={setLiveLatency}
-          />
-        )}
-        {isStreaming && (
-          <ToggleKv
-            k="Refinement"
-            hint="progressive_refinement — re-runs finalized regions for higher accuracy as the stream advances"
-            v={progressiveRefinement}
-            onSet={setProgRefine}
           />
         )}
 

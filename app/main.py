@@ -89,22 +89,36 @@ FFMPEG_PCM_CHUNK_SIZE_BYTES = int(os.getenv("FFMPEG_PCM_CHUNK_SIZE_BYTES", 16384
 
 
 class ProcessingStrategy(str, Enum):
-    """Transcription dispatch modes. See README and resolve_strategy() for selection rules.
+    """Transcription dispatch modes. Two-axis vocabulary: Engine × Strategy.
 
-    All three strategies share one decoding pipeline
-    (encoder + `decoding_computer` with optional `prev_batched_state` threading):
+    Engine (transport) — picked by the client. Mutually exclusive:
+      - OFFLINE     REST upload (or WS accumulate-then-process), no live partials.
+      - STREAMING   WebSocket transport, chunked engine, live partials.
 
-      - FULL          single-pass encode → decode of the whole waveform
-      - CHUNKED       same engine driven chunk-by-chunk over an offline waveform
-      - PROGRESSIVE   same engine driven chunk-by-chunk over an ffmpeg PCM stream
+    Strategy override (offline-engine implementation only). Default AUTO lets
+    the server pick between FULL and SPLIT_FULL based on duration vs.
+    MAX_FULL_WAVEFORM_S. Power users / benchmarkers can force one explicitly:
 
-    The legacy `BatchedFrameASRTDT`-based chunked + progressive engines were
-    retired once v2 parity was verified end-to-end on the LibriSpeech
-    test-clean + TED-LIUM 3 harness.
+      - FULL          single-pass encode → decode of the whole waveform.
+      - SPLIT_FULL    sequential FULL passes over overlapping slices, stitched.
+      - CHUNKED       chunked streaming engine driven offline (REST, no partials).
+
+    AUTO at the top level cascades: STREAMING for a WS connection, OFFLINE
+    otherwise; then OFFLINE → FULL or SPLIT_FULL by duration. See
+    resolve_strategy() for the full table.
+
+    `PROGRESSIVE` is a back-compat alias of STREAMING accepted by the
+    validator for one release; drop later.
     """
     AUTO = "auto"
+    OFFLINE = "offline"
     FULL = "full"
+    SPLIT_FULL = "split_full"
     CHUNKED = "chunked"
+    STREAMING = "streaming"
+    # Legacy alias — `progressive` accepted as a synonym of `streaming`.
+    # Coerced to STREAMING inside parse_request_config() so callers never see
+    # PROGRESSIVE leak into the dispatch table.
     PROGRESSIVE = "progressive"
 
 
@@ -117,14 +131,14 @@ MAX_FULL_WAVEFORM_S = float(os.getenv("MAX_FULL_WAVEFORM_S", 1440.0))
 
 # Streaming context windows. NeMo's reference recommends 10-10-5 for offline-like
 # quality, 10-2-2 for live latency. These drive `StreamingPrevBatchedEngine`
-# in both the CHUNKED (offline) and PROGRESSIVE (live) strategies.
+# in both the CHUNKED (offline) and STREAMING (live) strategies.
 STREAMING_LEFT_CONTEXT_S = float(os.getenv("STREAMING_LEFT_CONTEXT_S", 10.0))
 STREAMING_CHUNK_S = float(os.getenv("STREAMING_CHUNK_S", 10.0))
 STREAMING_RIGHT_CONTEXT_S = float(os.getenv("STREAMING_RIGHT_CONTEXT_S", 5.0))
 STREAMING_LIVE_CHUNK_S = float(os.getenv("STREAMING_LIVE_CHUNK_S", 2.0))
 STREAMING_LIVE_RIGHT_CONTEXT_S = float(os.getenv("STREAMING_LIVE_RIGHT_CONTEXT_S", 2.0))
 
-# Progressive mode: PCM buffered before emitting the first partial.
+# Streaming mode: PCM buffered before emitting the first partial.
 EARLY_BUFFER_TARGET_S = float(os.getenv("EARLY_BUFFER_TARGET_S", 15.0))
 
 # CUDA graph decoder for RNNT/TDT. NeMo 2.7.x defaults to ON (FULL_GRAPH mode).
@@ -595,7 +609,6 @@ def parse_request_config(
     strategy: Optional[str] = None,
     early_buffer_target_s: Optional[float] = None,
     live_latency: Optional[bool] = None,
-    progressive_refinement: Optional[bool] = None,
 ) -> dict:
     """
     Parses and validates common ASR request configuration parameters.
@@ -610,13 +623,12 @@ def parse_request_config(
         l_thresh: Long audio threshold in seconds to determine model settings
                   (e.g., attention mechanism).
         strategy: Processing strategy override. One of ProcessingStrategy values.
-                  None falls back to DEFAULT_STRATEGY.
-        early_buffer_target_s: Progressive mode — PCM seconds buffered before
+                  None falls back to DEFAULT_STRATEGY. `progressive` is accepted
+                  as a back-compat alias of `streaming`.
+        early_buffer_target_s: Streaming mode — PCM seconds buffered before
                   the first partial transcript is emitted.
-        live_latency: When True, progressive mode uses the 10-2-2 streaming preset
-                  for ~4s latency; when False/None, uses 10-10-5 for offline-like quality.
-        progressive_refinement: When True (default), progressive mode runs an
-                  extra full-pass at EOF if duration <= MAX_FULL_WAVEFORM_S.
+        live_latency: When True, streaming mode uses the 10-2-2 preset for ~4s
+                  latency; when False/None, uses 10-10-5 for offline-like quality.
 
     Returns:
         A dictionary containing the validated configuration parameters.
@@ -628,8 +640,11 @@ def parse_request_config(
     try:
         strategy_enum = ProcessingStrategy(requested_strategy)
     except ValueError:
-        valid = [s.value for s in ProcessingStrategy]
+        valid = [s.value for s in ProcessingStrategy if s != ProcessingStrategy.PROGRESSIVE]
         raise ValueError(f"Invalid strategy '{requested_strategy}'. Must be one of: {valid}.")
+    # Collapse the back-compat alias so dispatch never sees PROGRESSIVE.
+    if strategy_enum == ProcessingStrategy.PROGRESSIVE:
+        strategy_enum = ProcessingStrategy.STREAMING
 
     config = {
         "chunk_length": c_len if c_len is not None else TRANSCRIBE_CHUNK_LEN,
@@ -641,9 +656,6 @@ def parse_request_config(
             early_buffer_target_s if early_buffer_target_s is not None else EARLY_BUFFER_TARGET_S
         ),
         "live_latency": bool(live_latency) if live_latency is not None else False,
-        "progressive_refinement": (
-            bool(progressive_refinement) if progressive_refinement is not None else True
-        ),
     }
 
     if not (0 < config["chunk_length"] <= 300): # Max 5 minutes chunk
@@ -660,44 +672,69 @@ def parse_request_config(
     return config
 
 
+# Slice-safety margin for SPLIT_FULL. The per-slice duration is
+# MAX_FULL_WAVEFORM_S * SLICE_SAFETY so we stay under the FULL-mode ceiling
+# even after accounting for the overlap tail.
+SLICE_SAFETY = float(os.getenv("SPLIT_FULL_SLICE_SAFETY", 0.95))
+SPLIT_FULL_OVERLAP_S = float(os.getenv("SPLIT_FULL_OVERLAP_S", 15.0))
+
+
 def resolve_strategy(
     audio_duration_s: Optional[float],
     client_config: dict,
     is_streaming: bool,
 ) -> ProcessingStrategy:
     """
-    Resolve the processing strategy for a request.
+    Resolve the processing strategy for a request to a concrete dispatch mode.
 
-    Explicit non-AUTO strategies from client_config win. Otherwise AUTO routes:
+    The vocabulary has two axes:
+      - Engine: OFFLINE vs STREAMING (transport — picked by the client).
+      - Strategy override (offline only): FULL / SPLIT_FULL / CHUNKED, default AUTO.
 
-    - Streaming                            -> PROGRESSIVE
-    - Non-streaming, duration ≤ cap        -> FULL     (one batched pass, ~3-5×
-                                              faster than CHUNKED when it fits)
-    - Non-streaming, duration > cap or None -> CHUNKED  (bounded memory)
+    Cascade:
+      - AUTO         → STREAMING for a WS connection, else OFFLINE (then recurses).
+      - OFFLINE      → STREAMING if the connection is actually a WS (auto-correct);
+                       else CHUNKED if duration is unknown (WS-accumulate path
+                       without duration yet); else FULL if duration ≤
+                       MAX_FULL_WAVEFORM_S, else SPLIT_FULL.
+      - FULL / SPLIT_FULL / CHUNKED / STREAMING → returned as-is.
 
-    The duration cap is `MAX_FULL_WAVEFORM_S` (env, default 1440s = 24min) and
-    should be tuned per deployment to whatever the GPU's verified FULL ceiling
-    is. The probe on a 128 GB DGX Spark put the real OOM at ~9.6h; an 8h
-    setting gives ~20% safety margin. All three strategies share one encoder
-    + `decoding_computer` pipeline.
+    The duration cap `MAX_FULL_WAVEFORM_S` (env, default 1440s = 24min) is the
+    deployment's verified FULL ceiling. SPLIT_FULL routes long offline files
+    to back-to-back FULL passes at FULL throughput (~3-5× faster than CHUNKED
+    on this hardware). CHUNKED stays on the menu as an explicit override for
+    benchmarking the chunked engine against FULL, and as the natural shape
+    for the future multi-tenant batched-across-requests scheduler.
     """
     requested = client_config.get("strategy", ProcessingStrategy.AUTO)
     if isinstance(requested, str):
         requested = ProcessingStrategy(requested)
+    if requested == ProcessingStrategy.PROGRESSIVE:
+        requested = ProcessingStrategy.STREAMING
 
-    if requested != ProcessingStrategy.AUTO:
-        return requested
+    if requested == ProcessingStrategy.AUTO:
+        # Cascade: AUTO picks the engine, then falls through to OFFLINE's
+        # duration-based fan-out below.
+        if is_streaming:
+            return ProcessingStrategy.STREAMING
+        requested = ProcessingStrategy.OFFLINE
 
-    if is_streaming:
-        return ProcessingStrategy.PROGRESSIVE
+    if requested == ProcessingStrategy.OFFLINE:
+        if is_streaming:
+            # Client asked for offline on a WS — fall through to streaming
+            # rather than error; the engine on this socket is the streaming
+            # one regardless.
+            return ProcessingStrategy.STREAMING
+        if audio_duration_s is None:
+            # WS-accumulate path before we know the duration: keep the
+            # legacy chunked dispatch so the lock-acquire path stays bounded.
+            return ProcessingStrategy.CHUNKED
+        if audio_duration_s <= MAX_FULL_WAVEFORM_S:
+            return ProcessingStrategy.FULL
+        return ProcessingStrategy.SPLIT_FULL
 
-    # Non-streaming AUTO prefers FULL when the audio fits under the
-    # deployment's safety cap. Above the cap we fall back to CHUNKED so a
-    # too-long file can't OOM the encoder.
-    if audio_duration_s is not None and audio_duration_s <= MAX_FULL_WAVEFORM_S:
-        return ProcessingStrategy.FULL
-
-    return ProcessingStrategy.CHUNKED
+    # Explicit FULL / SPLIT_FULL / CHUNKED / STREAMING → return as-is.
+    return requested
 
 
 def parse_websocket_config(client_cfg: dict) -> dict:
@@ -739,7 +776,6 @@ def parse_websocket_config(client_cfg: dict) -> dict:
         strategy=client_cfg.get("strategy"),
         early_buffer_target_s=client_cfg.get("early_buffer_target_s"),
         live_latency=client_cfg.get("live_latency"),
-        progressive_refinement=client_cfg.get("progressive_refinement"),
     )
 
     # Combine with WebSocket-specific audio stream parameters
@@ -1059,7 +1095,7 @@ async def handle_streaming_pcm(
     client_config: dict
 ):
     """
-    Handles the live PROGRESSIVE pipeline for a WebSocket connection.
+    Handles the live STREAMING pipeline for a WebSocket connection.
 
     Producer/consumer pattern:
     - Producer: receives audio from the WS, pipes through ffmpeg → 16 kHz mono
@@ -1069,9 +1105,7 @@ async def handle_streaming_pcm(
       StreamingPrevBatchedEngine. Newly committed sentence-bounded segments
       are emitted as `segments_batch` messages.
 
-    On EOF: optional `progressive_refinement` runs a single FULL pass over the
-    accumulated PCM (offline-quality replacement). Finally emits
-    `final_transcription`.
+    On EOF: emits `final_transcription` aggregated from the streamed segments.
 
     Args:
         websocket: The active WebSocket connection.
@@ -1114,13 +1148,6 @@ async def handle_streaming_pcm(
         f"buffer={engine_total_buffer_s:g}s ({preset_label})."
     )
 
-    # `progressive_refinement` (defaults True): after EOF, if the full audio
-    # fits the FULL-mode ceiling, run a single transcribe pass over the entire
-    # buffered PCM and emit a `refined_transcription` message — better quality
-    # than the streamed partials, since FULL gets the whole context at once.
-    progressive_refinement = bool(client_config.get("progressive_refinement", True))
-    refinement_pcm_accumulator: Optional[bytearray] = bytearray() if progressive_refinement else None
-    
     # Target PCM characteristics (output from ffmpeg, input to ASR chunker)
     target_pcm_sample_rate = MODEL_SAMPLE_RATE # 16000 Hz
     target_pcm_bytes_per_sample = 2 # For s16le (16-bit signed little-endian PCM)
@@ -1290,12 +1317,6 @@ async def handle_streaming_pcm(
                         logger.info(f"({session_id}) Read ffmpeg: EOF received from ffmpeg stdout. Stream finished.")
                         break # ffmpeg closed its stdout, indicating end of conversion
                     
-                    # refinement_pcm_accumulator keeps the ORIGINAL ffmpeg
-                    # output (with silence) so the final FULL pass at EOF can
-                    # produce authoritative wall-clock timestamps.
-                    if refinement_pcm_accumulator is not None:
-                        refinement_pcm_accumulator.extend(pcm_data_from_ffmpeg)
-
                     # Run VAD layer (no-op when disabled). Returns only
                     # speech-confirmed bytes; silent windows are dropped so
                     # the engine queue stays drained.
@@ -1521,61 +1542,9 @@ async def handle_streaming_pcm(
         # For now, assume they are appended in rough chronological order.
         final_transcribed_text_pcm = " ".join(s["text"] for s in sent_segments_pcm).strip()
 
-        # progressive_refinement: re-transcribe the accumulated PCM as a single
-        # FULL pass before emitting final_transcription. Cheaper than re-running
-        # the whole pipeline and yields offline-quality segments instead of the
-        # independent-chunk approximations that were streamed live.
-        refined_segments: Optional[List[dict]] = None
-        refined_text: Optional[str] = None
-        refinement_asr_t: float = 0.0
-        if refinement_pcm_accumulator is not None and len(refinement_pcm_accumulator) > 0:
-            full_audio_duration_s = (len(refinement_pcm_accumulator) // (target_pcm_bytes_per_sample)) / target_pcm_sample_rate
-            if full_audio_duration_s > MAX_FULL_WAVEFORM_S:
-                logger.info(
-                    f"({session_id}) Stream: progressive_refinement skipped — accumulated audio "
-                    f"{full_audio_duration_s:.1f}s > MAX_FULL_WAVEFORM_S ({MAX_FULL_WAVEFORM_S:.0f}s)."
-                )
-            elif asr_model is not None:
-                try:
-                    full_pcm_bytes = bytes(refinement_pcm_accumulator)
-                    full_tensor = await asyncio.to_thread(_create_asr_tensor_from_bytes, full_pcm_bytes)
-                    refined_segments, refinement_asr_t = await _transcribe_full(
-                        waveform=full_tensor,
-                        audio_duration_s=full_audio_duration_s,
-                        request_id=f"WS-Stream-{session_id}-refine",
-                    )
-                    refined_text = " ".join(s["text"] for s in refined_segments).strip()
-                    logger.info(
-                        f"({session_id}) Stream: progressive_refinement complete — "
-                        f"{len(refined_segments)} refined segs in {refinement_asr_t:.2f}s "
-                        f"over {full_audio_duration_s:.1f}s audio."
-                    )
-                    if websocket.application_state == WebSocketState.CONNECTED:
-                        await websocket.send_json({
-                            "type": "refined_transcription",
-                            "segments": refined_segments,
-                            "words": _segments_to_words(refined_segments) if refined_segments else [],
-                            "text": refined_text,
-                            "transcription_time": round(refinement_asr_t, 3),
-                            "audio_duration_seconds": round(full_audio_duration_s, 3),
-                        })
-                except Exception as e_refine:
-                    logger.warning(
-                        f"({session_id}) Stream: progressive_refinement failed ({e_refine!r}); "
-                        f"final_transcription will use the live-streamed segments.",
-                        exc_info=True,
-                    )
-                    refined_segments = None
-                    refined_text = None
-
         if websocket.application_state == WebSocketState.CONNECTED:
             logger.info(f"({session_id}) Streaming: Sending final_transcription message to client. "
                         f"Total ASR input duration (from ffmpeg PCM): {total_duration_processed_seconds_for_asr:.2f}s")
-
-            use_refined = refined_segments is not None and refined_text is not None
-            final_segments_for_payload = refined_segments if use_refined else sent_segments_pcm
-            final_text_for_payload = refined_text if use_refined else final_transcribed_text_pcm
-            final_total_asr_t = accumulated_asr_processing_time_s + refinement_asr_t
 
             final_message_payload = {
                 "type": "final_transcription",
@@ -1583,23 +1552,19 @@ async def handle_streaming_pcm(
                 "task": "transcribe",
                 "language": "english",
                 "duration": round(total_duration_processed_seconds_for_asr, 3),
-                "text": final_text_for_payload,
-                "segments": final_segments_for_payload,
-                "words": _segments_to_words(final_segments_for_payload),
+                "text": final_transcribed_text_pcm,
+                "segments": sent_segments_pcm,
+                "words": _segments_to_words(sent_segments_pcm),
                 # Extensions:
-                "transcription_time": round(final_total_asr_t, 3),
-                "total_segments": len(final_segments_for_payload),
+                "transcription_time": round(accumulated_asr_processing_time_s, 3),
+                "total_segments": len(sent_segments_pcm),
                 "final_duration_processed_seconds": round(total_duration_processed_seconds_for_asr, 3),
-                "csv_content": generate_csv_content(final_segments_for_payload),
-                "srt_content": generate_srt_content(final_segments_for_payload),
+                "csv_content": generate_csv_content(sent_segments_pcm),
+                "srt_content": generate_srt_content(sent_segments_pcm),
                 "streaming_mode": client_config.get("format", "unknown"),
-                "refinement_applied": use_refined,
             }
             await websocket.send_json(final_message_payload)
-            logger.info(
-                f"({session_id}) Streaming: Final transcription message sent "
-                f"(refinement_applied={use_refined})."
-            )
+            logger.info(f"({session_id}) Streaming: Final transcription message sent.")
         else:
             logger.info(f"({session_id}) Streaming: WebSocket disconnected before final_transcription could be sent.")
 
@@ -1697,7 +1662,7 @@ async def _transcribe_chunked(
     """
     Offline chunked transcription using `StreamingPrevBatchedEngine`.
 
-    Feeds the entire waveform through the same engine the live `progressive`
+    Feeds the entire waveform through the same engine the live `streaming`
     path uses, just back-to-back as fast as the GPU will accept. Emits
     sentence-bounded segments via the engine's pop_final_segments(). Uses
     the default greedy_batch decoder (no per-request decoder swap) so the
@@ -1857,6 +1822,101 @@ async def _transcribe_full(
     return segments, asr_time
 
 
+async def _transcribe_split_full(
+    waveform: torch.Tensor,
+    audio_duration_s: float,
+    client_config: dict,
+    request_id: str = "split_full",
+    cancel_event: Optional["threading.Event"] = None,
+) -> Tuple[List[dict], float]:
+    """Sequential FULL passes over overlapping slices, stitched at seams.
+
+    For audio longer than `MAX_FULL_WAVEFORM_S` we can't fit one encoder
+    pass on the available GPU memory, but we can run back-to-back FULL
+    passes at FULL throughput — ~3-5× faster than the CHUNKED engine on
+    this hardware. Each slice is `MAX_FULL_WAVEFORM_S * SLICE_SAFETY`
+    seconds long with `SPLIT_FULL_OVERLAP_S` of overlap; the overlap
+    gives the second slice's encoder enough left-context to land its
+    first few segments cleanly, and we drop segments at the seam whose
+    start landed inside the prior slice's tail to avoid duplicates.
+
+    Caller MUST hold `model_access_lock`.
+    """
+    if asr_model is None:
+        logger.error(f"({request_id}) split_full: asr_model is None.")
+        return [], 0.0
+
+    slice_s = MAX_FULL_WAVEFORM_S * SLICE_SAFETY
+    overlap_s = SPLIT_FULL_OVERLAP_S
+    if overlap_s >= slice_s:
+        raise ValueError(
+            f"SPLIT_FULL_OVERLAP_S ({overlap_s}) must be less than slice "
+            f"length ({slice_s:.1f}s = MAX_FULL_WAVEFORM_S * SLICE_SAFETY)."
+        )
+    step_s = slice_s - overlap_s
+    sr = MODEL_SAMPLE_RATE
+
+    waveform_1d = waveform.squeeze()
+    if waveform_1d.dim() != 1:
+        waveform_1d = waveform_1d.reshape(-1)
+
+    all_segs: List[dict] = []
+    asr_total = 0.0
+    seg_id = 0
+    start_s = 0.0
+    slice_idx = 0
+
+    while start_s < audio_duration_s:
+        if cancel_event is not None and cancel_event.is_set():
+            logger.info(
+                f"({request_id}) split_full: cancelled before slice {slice_idx + 1} "
+                f"(start={start_s:.1f}s of {audio_duration_s:.1f}s)."
+            )
+            break
+
+        end_s = min(audio_duration_s, start_s + slice_s)
+        sub = waveform_1d[int(start_s * sr) : int(end_s * sr)]
+        sub_duration_s = end_s - start_s
+        slice_idx += 1
+        logger.info(
+            f"({request_id}) split_full: slice {slice_idx} "
+            f"[{start_s:.1f}s, {end_s:.1f}s] ({sub_duration_s:.1f}s)"
+        )
+
+        segs, asr_t = await _transcribe_full(
+            waveform=sub,
+            audio_duration_s=sub_duration_s,
+            request_id=f"{request_id}-split{slice_idx}",
+        )
+        asr_total += asr_t
+
+        # Translate slice-relative timestamps back to wall-clock.
+        for s in segs:
+            s["start"] = float(s.get("start", 0.0)) + start_s
+            s["end"] = float(s.get("end", 0.0)) + start_s
+
+        # Drop segments in the overlap with the prior slice's tail to keep
+        # the seam clean. 0.30s of slop tolerates minor decoder jitter.
+        if all_segs and segs:
+            prior_end = float(all_segs[-1]["end"])
+            segs = [s for s in segs if s["start"] > prior_end - 0.30]
+
+        for s in segs:
+            s["id"] = seg_id
+            seg_id += 1
+        all_segs.extend(segs)
+
+        if end_s >= audio_duration_s:
+            break
+        start_s += step_s
+
+    logger.info(
+        f"({request_id}) split_full: dur={audio_duration_s:.2f}s "
+        f"asr_t={asr_total:.2f}s segs={len(all_segs)} slices={slice_idx}"
+    )
+    return all_segs, asr_total
+
+
 _VALID_RESPONSE_FORMATS = {"json", "text", "srt", "verbose_json", "vtt"}
 
 
@@ -1993,7 +2053,7 @@ async def transcribe_endpoint_rest(
     chunk_overlap: Optional[float] = Query(None),
     batch_size: Optional[int] = Query(None),
     long_audio_threshold: Optional[float] = Query(None),
-    strategy: Optional[str] = Query(None, description="auto (default) → chunked. Explicit: full | chunked | progressive."),
+    strategy: Optional[str] = Query(None, description="auto (default) → offline (full ≤ cap, split_full above). Explicit: offline | full | split_full | chunked | streaming."),
 ):
     """
     POST /v1/audio/transcriptions — OpenAI Whisper API drop-in.
@@ -2012,7 +2072,8 @@ async def transcribe_endpoint_rest(
 
     Server extensions (query string):
       - chunk_length, chunk_overlap, batch_size, long_audio_threshold
-      - strategy ∈ {auto, full, chunked, progressive}
+      - strategy ∈ {auto, offline, full, split_full, chunked, streaming}
+        (`progressive` accepted for one release as an alias of `streaming`.)
     """
     if not asr_model:
         logger.error("REST Request: ASR model is not available.")
@@ -2134,11 +2195,12 @@ async def transcribe_endpoint_rest(
                     )
                     logger.info(f"({request_id}) REST: Resolved strategy = '{resolved_strategy.value}' for {total_audio_duration_s:.2f}s of audio.")
 
-                    if resolved_strategy == ProcessingStrategy.PROGRESSIVE:
+                    if resolved_strategy == ProcessingStrategy.STREAMING:
                         response_status_code = 400
                         final_response_content = {
-                            "error": "Strategy 'progressive' requires a streaming connection. "
-                                     "Use a WebSocket endpoint, or pick 'full' or 'chunked' for REST."
+                            "error": "Strategy 'streaming' requires a WebSocket connection. "
+                                     "For REST, pick 'full', 'split_full', or 'chunked' "
+                                     "(or omit `strategy` for auto)."
                         }
                     else:
                         # Apply model settings (long/short audio attention) for this session.
@@ -2163,8 +2225,23 @@ async def transcribe_endpoint_rest(
                             _watch_request_disconnect(request, rest_cancel_event, request_id)
                         )
                         try:
+                            # CHUNKED stays on the menu as an explicit override
+                            # for benchmarking the chunked engine against FULL,
+                            # and as the natural shape for the future
+                            # multi-tenant batched-across-requests scheduler.
                             if resolved_strategy == ProcessingStrategy.CHUNKED:
                                 segments, asr_processing_time_s = await _transcribe_chunked(
+                                    waveform=waveform_tensor,
+                                    audio_duration_s=total_audio_duration_s,
+                                    client_config=client_config_rest,
+                                    request_id=f"REST-{request_id}",
+                                    cancel_event=rest_cancel_event,
+                                )
+                            elif resolved_strategy == ProcessingStrategy.SPLIT_FULL:
+                                # Sequential FULL passes over overlapping
+                                # slices — keeps FULL-mode throughput on files
+                                # longer than the GPU's single-shot ceiling.
+                                segments, asr_processing_time_s = await _transcribe_split_full(
                                     waveform=waveform_tensor,
                                     audio_duration_s=total_audio_duration_s,
                                     client_config=client_config_rest,
@@ -2371,7 +2448,15 @@ async def _ws_accumulate_then_process(
                 audio_duration_s=audio_duration_s,
                 request_id=f"WS-{session_id}",
             )
-        else:  # CHUNKED
+        elif resolved_strategy == ProcessingStrategy.SPLIT_FULL:
+            segments, asr_t = await _transcribe_split_full(
+                waveform=waveform,
+                audio_duration_s=audio_duration_s,
+                client_config=client_config,
+                request_id=f"WS-{session_id}",
+                cancel_event=cancel_event,
+            )
+        else:  # CHUNKED — explicit override or future multi-tenant fan-in.
             segments, asr_t = await _transcribe_chunked(
                 waveform=waveform,
                 audio_duration_s=audio_duration_s,
@@ -2465,7 +2550,7 @@ async def _ws_handle_unified(
         )
         logger.info(f"({session_id}) {log_prefix}: resolved strategy = {resolved.value}.")
 
-        if resolved == ProcessingStrategy.PROGRESSIVE:
+        if resolved == ProcessingStrategy.STREAMING:
             # Streaming pipeline: ffmpeg producer/consumer feeding the v2 engine.
             # We don't know audio duration upfront in streaming; use chunk_length
             # as the proxy for the long-audio attention decision.
@@ -2559,13 +2644,14 @@ async def websocket_transcribe_unified(websocket: WebSocket):
     resolves the processing strategy and dispatches:
 
       - strategy=full         → accumulate-then-process, single-pass via encoder + decoding_computer.
-      - strategy=chunked      → accumulate-then-process, StreamingPrevBatchedEngine.
-      - strategy=progressive  → ffmpeg streaming pipeline, same engine driven live.
-      - strategy=auto         → progressive for WS connections, chunked for REST.
+      - strategy=split_full   → accumulate-then-process, sequential FULL passes over slices.
+      - strategy=chunked      → accumulate-then-process, StreamingPrevBatchedEngine offline.
+      - strategy=streaming    → ffmpeg streaming pipeline, same engine driven live.
+      - strategy=auto         → streaming for WS connections, offline for REST.
 
     Legacy aliases /ws_upload and /ws_stream forward here with strategy
-    forced to chunked and progressive respectively. Client strings
-    chunked_v2 / progressive_v2 are accepted and map to chunked / progressive.
+    forced to chunked and streaming respectively. The legacy client string
+    `progressive` is accepted for one release as an alias of `streaming`.
     """
     await _ws_handle_unified(websocket, strategy_override=None, log_prefix="WS")
 
@@ -2573,13 +2659,13 @@ async def websocket_transcribe_unified(websocket: WebSocket):
 @app.websocket("/v1/audio/transcriptions/ws_stream")
 async def websocket_transcribe_endpoint_streaming(websocket: WebSocket):
     """
-    Legacy compatibility alias for /v1/audio/transcriptions with strategy=progressive.
+    Legacy compatibility alias for /v1/audio/transcriptions with strategy=streaming.
 
     Existing clients connecting here get the ffmpeg streaming pipeline regardless
     of the strategy they send. Logs that the legacy path was taken.
     """
-    logger.info("WS legacy alias: /ws_stream → forwarding with strategy=progressive.")
-    await _ws_handle_unified(websocket, strategy_override="progressive", log_prefix="WS Stream")
+    logger.info("WS legacy alias: /ws_stream → forwarding with strategy=streaming.")
+    await _ws_handle_unified(websocket, strategy_override="streaming", log_prefix="WS Stream")
 
 
 @app.websocket("/v1/audio/transcriptions/ws_upload")

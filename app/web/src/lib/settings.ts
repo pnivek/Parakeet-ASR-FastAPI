@@ -8,7 +8,7 @@
  */
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import type { ResponseFormat, Strategy, TimestampGranularity } from './types'
+import type { Engine, ResponseFormat, StrategyOverride, TimestampGranularity } from './types'
 
 export type ThemeMode = 'system' | 'light' | 'dark'
 
@@ -17,16 +17,20 @@ export interface Settings {
   responseFormat: ResponseFormat
   timestampGranularities: TimestampGranularity[]
 
-  // Server-extension knobs (REST query string / WS config field)
-  strategy: Strategy
+  // Two-axis transcription picker:
+  //   engine          — transport: REST upload vs WebSocket live partials.
+  //   strategyOverride — offline-engine implementation. `auto` lets the
+  //                      server pick full ≤ MAX_FULL_WAVEFORM_S, else split_full.
+  //                      Hidden in the UI when engine === 'streaming'.
+  engine: Engine
+  strategyOverride: StrategyOverride
   chunkLength: number | null
   chunkOverlap: number | null
   batchSize: number | null
   longAudioThreshold: number | null
 
-  // Progressive (WS) knobs
+  // Streaming (WS) knobs
   liveLatency: boolean
-  progressiveRefinement: boolean
 
   // Voice activity detection + noise (mic / WS path)
   vadEnabled: boolean
@@ -61,13 +65,13 @@ export interface Settings {
 const DEFAULTS: Omit<Settings, 'set' | 'reset'> = {
   responseFormat: 'verbose_json',
   timestampGranularities: ['segment', 'word'],
-  strategy: 'auto',
+  engine: 'offline',
+  strategyOverride: 'auto',
   chunkLength: null,
   chunkOverlap: null,
   batchSize: null,
   longAudioThreshold: null,
   liveLatency: true,
-  progressiveRefinement: false,
 
   vadEnabled: true,
   vadThreshold: 0.5,
@@ -83,6 +87,29 @@ const DEFAULTS: Omit<Settings, 'set' | 'reset'> = {
   theme: 'system',
 }
 
+/** Coerce a persisted snapshot from the pre-split (single-`strategy`) era into
+ * the new (engine, strategyOverride) pair. Idempotent: snapshots that already
+ * carry `engine` pass through untouched. */
+function migrateLegacyStrategy(snap: Record<string, unknown>): Record<string, unknown> {
+  if (typeof snap.engine === 'string') return snap
+  const legacy = typeof snap.strategy === 'string' ? snap.strategy.toLowerCase() : 'auto'
+  const out: Record<string, unknown> = { ...snap }
+  delete out.strategy
+  delete out.progressiveRefinement
+  if (legacy === 'progressive' || legacy === 'streaming') {
+    out.engine = 'streaming'
+    out.strategyOverride = 'auto'
+  } else if (legacy === 'full' || legacy === 'chunked' || legacy === 'split_full') {
+    out.engine = 'offline'
+    out.strategyOverride = legacy as StrategyOverride
+  } else {
+    // 'auto' (or unknown) → safest default: offline + auto.
+    out.engine = 'offline'
+    out.strategyOverride = 'auto'
+  }
+  return out
+}
+
 export const useSettings = create<Settings>()(
   persist(
     (set) => ({
@@ -95,7 +122,11 @@ export const useSettings = create<Settings>()(
       // When the persisted shape lacks newly-added fields (e.g. user
       // hasn't reset since we added vadThreshold), merge DEFAULTS in so
       // those knobs get sensible values without forcing a reset.
-      merge: (persisted, current) => ({ ...current, ...(persisted as Partial<Settings>) }),
+      // Also coerce pre-split `strategy` snapshots into the new two-axis pair.
+      merge: (persisted, current) => ({
+        ...current,
+        ...migrateLegacyStrategy((persisted ?? {}) as Record<string, unknown>),
+      }),
     },
   ),
 )

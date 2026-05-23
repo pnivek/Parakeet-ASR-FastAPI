@@ -119,7 +119,7 @@ async function dumpProbes(page: Page): Promise<Array<{ t: number; tag: string; e
   )
 }
 
-test('long-audio progressive: timing + hang diagnostics', async ({ page }) => {
+test('long-audio streaming: timing + hang diagnostics', async ({ page }) => {
   test.setTimeout(360_000) // 6 min
 
   if (!fs.existsSync(FIXTURE)) {
@@ -134,9 +134,9 @@ test('long-audio progressive: timing + hang diagnostics', async ({ page }) => {
   await page.getByRole('button', { name: /^source$/i }).click()
   await page.getByRole('radio', { name: 'File upload' }).click()
 
-  // Switch to engine tab and pick `progressive` (option-list radio).
+  // Switch to engine tab and pick Streaming (option-list radio).
   await page.getByRole('button', { name: /^engine$/i }).click()
-  await page.getByRole('radio', { name: 'progressive' }).click()
+  await page.getByRole('radio', { name: 'Streaming' }).click()
   // Back to source so the file input is in the DOM for upload.
   await page.getByRole('button', { name: /^source$/i }).click()
 

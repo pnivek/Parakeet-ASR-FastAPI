@@ -58,7 +58,7 @@ test('streaming long file does not saturate the main thread', async ({ page }) =
   await page.getByRole('button', { name: /^source$/i }).click()
   await page.getByRole('radio', { name: 'File upload' }).click()
   await page.getByRole('button', { name: /^engine$/i }).click()
-  await page.getByRole('radio', { name: 'progressive' }).click()
+  await page.getByRole('radio', { name: 'Streaming' }).click()
   await page.getByRole('button', { name: /^source$/i }).click()
   await page.locator('input[type="file"]').first().setInputFiles(FIXTURE)
   await page.getByRole('button', { name: /Transcribe/i }).click()

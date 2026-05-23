@@ -300,7 +300,7 @@ export function connectLiveWS(config: WSConfig, callbacks: WSCallbacks): LiveWSH
 
 /**
  * Stream a File over the unified WebSocket endpoint so the user gets
- * partial transcriptions in real time, the same way `progressive` works
+ * partial transcriptions in real time, the same way `streaming` works
  * for live mic. Chunks the file into ~64 KB binary frames and sends EOF
  * (empty binary) when done. Returns a handle the caller can `abort()`.
  */

@@ -12,6 +12,21 @@ interface Props {
   activeStrategy: string
 }
 
+/** Map the server's resolved-strategy enum to a short, human-readable
+ * label for the footer chip. Unknown values pass through verbatim. */
+const STRATEGY_LABEL: Record<string, string> = {
+  full: 'Full pass',
+  split_full: 'Split-full',
+  chunked: 'Chunked',
+  streaming: 'Streaming',
+  // `auto` / `offline` shouldn't appear in a result (they always resolve
+  // to one of the concrete values), but show them as-is if they do.
+  auto: 'auto',
+  offline: 'offline',
+  // Legacy alias — still labelled cleanly until callers drop it.
+  progressive: 'Streaming',
+}
+
 /**
  * 68 px sticky footer. Currently-loaded file on the left, real metrics on
  * the right (resolved strategy, ASR time, RTFx, time-to-first-segment,
@@ -28,7 +43,8 @@ export function FooterRail({ loaded, result, ttfs, activeStrategy }: Props) {
   const ttfsLabel = ttfs != null ? `${ttfs.toFixed(2)}s` : '—'
   // Resolved strategy from the result wins; otherwise show the active
   // engine so STRATEGY is always populated (live mic, pre-result, etc).
-  const strategy = verbose?.strategy || activeStrategy
+  const rawStrategy = verbose?.strategy || activeStrategy
+  const strategy = STRATEGY_LABEL[rawStrategy] ?? rawStrategy
 
   return (
     <div className="footer">

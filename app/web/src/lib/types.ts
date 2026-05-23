@@ -13,7 +13,25 @@
 
 export type ResponseFormat = 'json' | 'text' | 'srt' | 'vtt' | 'verbose_json'
 
-export type Strategy = 'auto' | 'full' | 'chunked' | 'progressive'
+/** Engine — the transport / delivery axis. Mutually exclusive. */
+export type Engine = 'offline' | 'streaming'
+
+/** Strategy override for the offline engine. Default `auto` lets the server
+ * pick `full` (≤ MAX_FULL_WAVEFORM_S) vs `split_full` (above). Explicit values
+ * force a particular implementation. */
+export type StrategyOverride = 'auto' | 'full' | 'split_full' | 'chunked'
+
+/** Wire-level strategy enum the server's `?strategy=` param accepts. The UI
+ * derives it from (engine, strategyOverride) — see Sidebar `restStrategyParam`.
+ * `progressive` is a legacy alias of `streaming` accepted for one release. */
+export type Strategy =
+  | 'auto'
+  | 'offline'
+  | 'full'
+  | 'split_full'
+  | 'chunked'
+  | 'streaming'
+  | 'progressive'
 
 export type TimestampGranularity = 'segment' | 'word'
 
@@ -88,7 +106,6 @@ export interface WSConfig {
   batch_size?: number
   long_audio_threshold?: number
   live_latency?: boolean
-  progressive_refinement?: boolean
   early_buffer_target_s?: number
 
   // VAD + noise knobs (server falls back to env defaults if absent).
@@ -111,17 +128,6 @@ export interface WSSegmentsBatch {
   words?: Word[]
 }
 
-/** Optional post-EOF full-pass replacement segments. */
-export interface WSRefinedTranscription {
-  type: 'refined_transcription'
-  segments: WhisperSegment[]
-  /** Word-level timestamps for the refined segments. */
-  words?: Word[]
-  text: string
-  transcription_time: number
-  audio_duration_seconds: number
-}
-
 /** Final summary message at end of stream — mirrors verbose_json with extras. */
 export interface WSFinalTranscription {
   type: 'final_transcription'
@@ -139,7 +145,6 @@ export interface WSFinalTranscription {
   csv_content: string
   srt_content: string
   streaming_mode: string
-  refinement_applied: boolean
 }
 
 export interface WSError {
@@ -162,7 +167,6 @@ export interface WSPartialSegment {
 
 export type WSMessage =
   | WSSegmentsBatch
-  | WSRefinedTranscription
   | WSFinalTranscription
   | WSError
   | WSPartialSegment

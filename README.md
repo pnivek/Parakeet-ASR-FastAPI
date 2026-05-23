@@ -1,22 +1,31 @@
 # Parakeet ASR
 
-A FastAPI wrapper around NVIDIA's `parakeet-tdt-0.6b-v2` covering three workloads — short-batch, long-batch, and buffered-streaming WebSocket — behind one strategy dispatcher.
+A FastAPI wrapper around NVIDIA's `parakeet-tdt-0.6b-v2` covering offline batch transcription (single-pass, sliced single-pass, and chunked) plus a WebSocket streaming engine for live captions — behind one strategy dispatcher organized on two axes.
 
 > ### A note on "streaming"
-> `parakeet-tdt-0.6b-v2` is an **offline** model. NVIDIA trained it with full attention for a 24-minute single-pass ceiling — it is not a cache-aware streaming model. Riva does not offer this model as a streaming endpoint ([NVIDIA forum](https://forums.developer.nvidia.com/t/support-parakeet-tdt-0-6b-v2-en/337223)). What this project calls `progressive` is **buffered streaming with a ~4–15 s emission lag** (the model needs right context before committing tokens). If you need true low-latency live ASR, switch checkpoints to a cache-aware streaming variant such as [`parakeet_realtime_eou_120m-v1`](https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1) or [`nemotron-speech-streaming-en-0.6b`](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b). For everything else — batch transcription, near-real-time captioning, multi-hour archives — this server covers it.
+> `parakeet-tdt-0.6b-v2` is an **offline** model. NVIDIA trained it with full attention for a 24-minute single-pass ceiling — it is not a cache-aware streaming model. Riva does not offer this model as a streaming endpoint ([NVIDIA forum](https://forums.developer.nvidia.com/t/support-parakeet-tdt-0-6b-v2-en/337223)). What this project's `streaming` engine delivers is **buffered streaming with a ~4–15 s emission lag** (the model needs right context before committing tokens). If you need true low-latency live ASR, switch checkpoints to a cache-aware streaming variant such as [`parakeet_realtime_eou_120m-v1`](https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1) or [`nemotron-speech-streaming-en-0.6b`](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b). For everything else — batch transcription, near-real-time captioning, multi-hour archives — this server covers it.
+
+## Vocabulary — Engine × Strategy
+
+The dispatcher has two orthogonal axes:
+
+1. **Engine (transport)** — `offline` (REST, all results at once) or `streaming` (WebSocket, live partials). Mutually exclusive; pick based on whether the client needs live segments.
+2. **Strategy override (offline only)** — `auto` (default; server picks `full` if audio fits, else `split_full`), `full`, `split_full`, or `chunked`. Hidden in the UI when the engine is `streaming` — that engine has only one implementation.
+
+The REST/WS `?strategy=` enum carries both axes via the same parameter — see [Strategy dispatch](#strategy-dispatch) below.
 
 ## Features
 
 - **State-of-the-art offline ASR** — `nvidia/parakeet-tdt-0.6b-v2` (Token-and-Duration Transducer).
-- **Three processing strategies**, one decoding pipeline (encoder + `decoding_computer` with optional `prev_batched_state` threading):
-  - `chunked` *(REST default via `auto`)* — offline waveform fed chunk-by-chunk through NVIDIA's `StreamingBatchedAudioBuffer + decoding_computer + prev_batched_state` engine. Sentence-bounded segments, works across the full duration range.
-  - `progressive` *(WS default via `auto`)* — same engine driven over an ffmpeg PCM stream, emitting sentence-bounded partials as new tokens commit.
-  - `full` — single-pass encode + decode of the whole waveform. Fastest on long offline audio (~170× RTFx vs `chunked`'s ~65×), matches NVIDIA's published 1.69 % WER on LibriSpeech test-clean. Bypasses NeMo's `transcribe()` wrapper to dodge a FULL_GRAPH-mode CUDA-graph short-audio bug.
+- **Four dispatch modes**, one decoding pipeline (encoder + `decoding_computer` with optional `prev_batched_state` threading):
+  - `full` — single-pass encode + decode of the whole waveform. Fastest on long offline audio that fits the GPU (~170× RTFx vs `chunked`'s ~65×), matches NVIDIA's published 1.69 % WER on LibriSpeech test-clean. Bypasses NeMo's `transcribe()` wrapper to dodge a FULL_GRAPH-mode CUDA-graph short-audio bug.
+  - `split_full` — sequential FULL passes over overlapping slices (`SPLIT_FULL_OVERLAP_S` of context per seam), stitched with seam-dedup. Keeps FULL-mode throughput on files longer than the GPU's single-shot ceiling. Auto-selected when `engine=offline` and `duration > MAX_FULL_WAVEFORM_S`.
+  - `chunked` — offline waveform fed chunk-by-chunk through `StreamingPrevBatchedEngine`. Kept on the menu for benchmarking against `full` and as the natural shape for the future multi-tenant batched-across-requests scheduler.
+  - `streaming` — same chunked engine driven over an ffmpeg PCM stream on a WebSocket, emitting sentence-bounded partials as new tokens commit.
 - **Whisper-compatible response shape** — segments follow OpenAI Whisper's `verbose_json` (`id`, `seek`, `start`, `end`, `text`, `tokens`, `temperature`, `avg_logprob`, `compression_ratio`, `no_speech_prob`). Top-level fields include `task`, `language`, `duration` alongside our extension fields (strategy, csv_content, srt_content, etc.).
 - **Emission lag for streaming**: `(total_buffer − chunk) / 2` seconds — ~7.5 s with the offline-like 10-10-5 preset, ~6 s with the live 10-2-2 preset.
 - **Per-token timestamps** recovered from the stateful TDT merge — segment starts/ends align with the `full` strategy within ~40 ms.
-- **Optional end-of-stream refinement** — `progressive_refinement` runs a single FULL pass over the accumulated PCM at EOF and replaces the streamed segments with offline-quality output (when audio ≤ `MAX_FULL_WAVEFORM_S`).
-- **Verified at scale** — 3 h files complete cleanly through `progressive` with 100% audio coverage (~205 s ASR time on a DGX Spark, 1121 segments).
+- **Verified at scale** — 3 h files complete cleanly through `streaming` with 100% audio coverage (~205 s ASR time on a DGX Spark, 1121 segments).
 - **Versatile output** — plain text, segment list (with start/end), CSV, SRT.
 - **Interactive Web UI** — file upload, strategy selector, segment playback, downloads.
 - **Health probes** — `/health` for liveness + introspection, `/readyz` for readiness gating.
@@ -69,20 +78,32 @@ Configure via environment variables or `app/.env`.
 
 ### Strategy dispatch
 
+The `?strategy=` enum encodes both axes (Engine and Strategy override) via the table below.
+
+| Value | Meaning | UI equivalent |
+|-------|---------|---------------|
+| `auto` | Server picks: WS → `streaming`, else `offline`. | (API-only convenience; UI never sends it.) |
+| `offline` | Engine=Offline, override=Auto. Server runs `full` if `duration ≤ MAX_FULL_WAVEFORM_S`, else `split_full`. | Engine=Offline + override=Auto (default) |
+| `full` | Force single-pass FULL. Errors / OOMs if too long. | Engine=Offline + override=Full |
+| `split_full` | Force sequential FULL passes with seam-stitching. | Engine=Offline + override=Split-full |
+| `chunked` | Force the chunked engine running offline (REST, no partials). | Engine=Offline + override=Chunked |
+| `streaming` | WebSocket transport, chunked engine, live partials. | Engine=Streaming |
+
+`progressive` is accepted as a back-compat alias of `streaming` for one release.
+
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DEFAULT_STRATEGY` | `auto` \| `full` \| `chunked` \| `progressive`. `auto` routes to `chunked` for REST and `progressive` for WS. Aliases `chunked_v2` / `progressive_v2` still accepted for backward compatibility. | auto |
-| `MAX_FULL_WAVEFORM_S` | Hard cap for `full`; longer audio routes to `chunked`. Default matches NeMo's full-attention ceiling. | 1440 |
-| `EARLY_BUFFER_TARGET_S` | Progressive mode — PCM seconds buffered before the first partial. | 15 |
+| `DEFAULT_STRATEGY` | Any value from the table above. `auto` cascades (WS → `streaming`, else `offline`). | auto |
+| `MAX_FULL_WAVEFORM_S` | Hard cap for `full`; longer audio routes to `split_full` (when offline-auto picks it). Default matches NeMo's full-attention ceiling. | 1440 |
+| `SPLIT_FULL_OVERLAP_S` | Overlap (s) between adjacent `split_full` slices. Gives the second slice's encoder enough left-context to land clean segments; seam-dedup drops segments that start inside the prior slice's tail. | 15 |
+| `EARLY_BUFFER_TARGET_S` | Streaming mode — PCM seconds buffered before the first partial. | 15 |
 
 ### Stateful streaming engine
 
-`BatchedFrameASRTDT` powers both `chunked` and `progressive`. Buffer geometry follows NVIDIA's `<left>-<chunk>-<right>` presets in seconds.
+`StreamingPrevBatchedEngine` powers both the `chunked` and `streaming` strategies. Buffer geometry follows NVIDIA's `<left>-<chunk>-<right>` presets in seconds.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `USE_STATEFUL_CHUNKED` | Enable the stateful engine for `chunked` and `progressive`. When false, both fall back to the legacy independent-chunk consumer. | true |
-| `STATEFUL_MAX_DURATION_S` | Above this duration, `chunked` falls back to the legacy path (~4× faster on long audio, slightly lower boundary quality). `0` disables the cap. | 1800 |
 | `STREAMING_LEFT_CONTEXT_S` | Left context for the offline-like 10-10-5 preset | 10 |
 | `STREAMING_CHUNK_S` | Chunk length for the offline-like preset | 10 |
 | `STREAMING_RIGHT_CONTEXT_S` | Right context for the offline-like preset | 5 |
@@ -116,7 +137,7 @@ Form upload (`file=@…`), optional query parameters:
 
 | Query param | Description |
 |-------------|-------------|
-| `strategy` | `auto` \| `full` \| `chunked` \| `progressive`. `auto` honors `DEFAULT_STRATEGY`. `chunked_v2` / `progressive_v2` accepted as aliases. |
+| `strategy` | `auto` \| `offline` \| `full` \| `split_full` \| `chunked` \| `streaming`. See [Strategy dispatch](#strategy-dispatch). `progressive` accepted as a back-compat alias of `streaming` for one release. |
 | `chunk_length`, `chunk_overlap`, `batch_size`, `long_audio_threshold` | Override server defaults. |
 
 Example:
@@ -162,8 +183,7 @@ Config frame:
   "chunk_overlap": 5.0,
   "batch_size": 1,
   "long_audio_threshold": 480.0,
-  "strategy": "progressive",
-  "progressive_refinement": true,
+  "strategy": "streaming",
   "live_latency": false
 }
 ```
@@ -173,8 +193,7 @@ Messages from the server (one or more):
 | `type` | When | Notable fields |
 |--------|------|----------------|
 | `segments_batch` | After each engine commit (sentence-bounded) | `segments[]` |
-| `refined_transcription` | After EOF if `progressive_refinement` triggered | `segments`, `text`, `transcription_time`, `audio_duration_seconds` |
-| `final_transcription` | Last message before close | `text`, `segments`, `transcription_time`, `total_segments`, `csv_content`, `srt_content`, `refinement_applied` |
+| `final_transcription` | Last message before close | `text`, `segments`, `transcription_time`, `total_segments`, `csv_content`, `srt_content` |
 | `error` | On server error | `error` |
 
 ### WebSocket — legacy aliases
@@ -183,7 +202,7 @@ These remain as thin compatibility wrappers and forward to the unified handler w
 
 ```
 WS /v1/audio/transcriptions/ws_upload   # forces strategy=chunked
-WS /v1/audio/transcriptions/ws_stream   # forces strategy=progressive
+WS /v1/audio/transcriptions/ws_stream   # forces strategy=streaming
 ```
 
 ### Health
@@ -204,12 +223,13 @@ GET /readyz
 
 | If… | Use |
 |-----|-----|
-| Anything REST, any duration — pick the default | `auto` (→ `chunked`) |
-| Anything WS, any duration — pick the default | `auto` (→ `progressive`) |
-| Offline file, want fastest single-pass throughput on long audio | `full` (~170× RTFx vs `chunked`'s ~65× on multi-min clips) |
-| Streaming audio, ~6 s emission lag, prefer fewer/cleaner emissions | `progressive` + `live_latency: true` (10-2-2 preset) |
-| Streaming audio, ~7.5 s emission lag, best chunk-boundary quality | `progressive` + `live_latency: false` (10-10-5 preset, default) |
-| Streaming audio, want offline-quality replacement at EOF | `progressive` + `progressive_refinement: true` (default) |
+| Anything REST, any duration — pick the default | `auto` (→ `offline` → `full` or `split_full` based on duration) |
+| Anything WS, any duration — pick the default | `auto` (→ `streaming`) |
+| Offline file, fits the GPU's single-shot ceiling, want max throughput | `full` |
+| Offline file, longer than the FULL ceiling | `split_full` (sequential FULL passes, ~3-5× faster than `chunked`) |
+| Benchmarking the chunked engine against `full` / `split_full` | `chunked` |
+| Streaming audio, ~6 s emission lag, prefer fewer/cleaner emissions | `streaming` + `live_latency: true` (10-2-2 preset) |
+| Streaming audio, ~7.5 s emission lag, best chunk-boundary quality | `streaming` + `live_latency: false` (10-10-5 preset, default) |
 
 ### About the latency numbers
 
@@ -231,7 +251,7 @@ Open `http://localhost:8777/` in a browser. The bundled SPA (React + Vite + Type
 - **Live mic capture** — `MediaRecorder(audio/webm;codecs=opus)` over `WS /v1/audio/transcriptions`. Captured audio stays in the player so segments are seekable after stop. **Browsers require a secure context for mic access** — see [Live mic & secure-context requirement](#live-mic--secure-context-requirement) below if you've deployed to a LAN IP.
 - **Format-driven output** — `response_format` selector (`json` / `verbose_json` / `text` / `srt` / `vtt`) swaps the result view. `verbose_json` shows the full Whisper segment table, per-segment metadata expansion (tokens, temperature, compression_ratio, avg_logprob, no_speech_prob — honest tooltips on the fields that are unavailable or non-applicable for Parakeet TDT), and a clickable word timeline when `timestamp_granularities[]=word`.
 - **Audio playback + segment seek** — one shared `<audio>` element. Clicking a segment row or a word seeks the audio. The playing segment and word get a live highlight.
-- **Persisted settings** — strategy, response format, granularities, `live_latency`, `progressive_refinement`, batch_size, etc., all kept in `localStorage` (Zustand `persist` middleware). The `progressive` strategy is auto-disabled outside Live mic and translated to `chunked` on REST submission so a stale persisted value can't return a 400.
+- **Persisted settings** — Engine (`offline` / `streaming`), Strategy override (`auto` / `full` / `split_full` / `chunked`), response format, granularities, `live_latency`, batch_size, etc., all kept in `localStorage` (Zustand `persist` middleware). Source-aware gating: mic+live locks Engine=Streaming; URL and mic+record lock Engine=Offline. A small migrator coerces pre-split persisted snapshots (single `strategy` field) into the new two-axis pair, so existing users don't have to reset.
 
 ### Live mic & secure-context requirement
 

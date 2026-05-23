@@ -118,7 +118,7 @@ export function TranscriptSection({
             text: '',
             segments: [],
             words: [],
-            strategy: 'progressive',
+            strategy: 'streaming',
             transcription_time_seconds: 0,
           }
         : null

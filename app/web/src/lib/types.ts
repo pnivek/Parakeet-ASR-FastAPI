@@ -80,6 +80,7 @@ export interface VerboseJsonResponse {
   audio_duration_seconds?: number
   csv_content?: string
   srt_content?: string
+  vtt_content?: string
 }
 
 /** Plain-text response body — `response_format=text|srt|vtt` returns a string. */
@@ -141,6 +142,7 @@ export interface WSFinalTranscription {
   final_duration_processed_seconds: number
   csv_content: string
   srt_content: string
+  vtt_content?: string
   streaming_mode: string
 }
 

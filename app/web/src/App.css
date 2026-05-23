@@ -884,6 +884,52 @@ body {
   font-weight: 500;
 }
 
+/* Download flyout — anchored to the trigger pill in the transport row. */
+.hero__download-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  min-width: 140px;
+  padding: 4px;
+  background: oklch(0.16 0.012 60);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.hero__download-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--ma-fgDim);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
+}
+.hero__download-item:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--ma-fg);
+}
+.hero__download-item:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.hero__download-divider {
+  height: 1px;
+  margin: 4px 8px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
 /* ─── Transcript section ───────────────────────────────────────── */
 .transcript {
   flex: 1;

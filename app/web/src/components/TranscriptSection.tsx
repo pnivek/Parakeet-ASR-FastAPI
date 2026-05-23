@@ -1,7 +1,7 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import type { TranscriptionResponse } from '../lib/api'
 import type { VerboseJsonResponse, WhisperSegment, Word } from '../lib/types'
-import { play, seek } from '../lib/playback'
+import { play, seek, useCurrentTime } from '../lib/playback'
 import { formatTime } from '../lib/format'
 
 interface Props {
@@ -193,6 +193,11 @@ function VerboseBody({
 }: {
   body: VerboseJsonResponse
   view: View
+  /** Word + segments views still depend on currentTime for the
+   * active-row highlight — that's a per-tick visual on a single element,
+   * which React handles cheaply. The text view is the one we detached
+   * (PlainText no longer takes currentTime; ActiveWordTracker drives
+   * the underline imperatively). */
   currentTime: number
   filename: string
   live: boolean
@@ -201,11 +206,10 @@ function VerboseBody({
   partialSegment: WhisperSegment | null
   partialWords: Word[]
 }) {
-  // Monotonic active-word lookup: the LAST word whose start time is
-  // <= currentTime. This avoids the flicker we'd get from
-  // `start <= t <= end` when adjacent words have overlapping or gappy
-  // timestamps (the engine's 80ms encoder-stride quantization makes
-  // overlaps common in the real per-token output).
+  const activeSegIdx = useMemo(
+    () => body.segments.findIndex((s) => currentTime >= s.start && currentTime <= s.end),
+    [body.segments, currentTime],
+  )
   const activeWordIdx = useMemo(() => {
     const words = body.words
     if (!words || words.length === 0) return -1
@@ -224,17 +228,11 @@ function VerboseBody({
     }
     return found
   }, [body.words, currentTime])
-  const activeSegIdx = useMemo(
-    () => body.segments.findIndex((s) => currentTime >= s.start && currentTime <= s.end),
-    [body.segments, currentTime],
-  )
 
   if (view === 'text')
     return (
       <PlainText
         body={body}
-        currentTime={currentTime}
-        activeWordIdx={activeWordIdx}
         live={live}
         wordArrivals={wordArrivals}
         partialWords={partialWords}
@@ -313,91 +311,26 @@ const Word = memo(function Word({
   )
 })
 
-function PlainText({
+/** Memoization fence: re-render the word list only when its identity
+ * actually changes — not on every 60Hz currentTime tick. The combined
+ * (committed + partial) list is keyed by length and the last partial's
+ * start time, which moves whenever new content lands. */
+const WordList = memo(function WordList({
   body,
-  currentTime,
-  activeWordIdx,
   live,
   wordArrivals,
   partialWords,
 }: {
   body: VerboseJsonResponse
-  currentTime: number
-  activeWordIdx: number
-  /** True only while transcripts are arriving mid-stream — drives the
-   * arrival-based fade-in. False for finalized results. */
   live: boolean
   wordArrivals: Map<number, number>
   partialWords: Word[]
 }) {
   const committed = body.words ?? []
-  const containerRef = useRef<HTMLDivElement | null>(null)
-  const [underline, setUnderline] = useState<{ x: number; y: number; w: number } | null>(null)
-
-  // Track the active word's bounding rect and translate to a position
-  // relative to the editorial body. The single moving underline below
-  // is a CSS-transitioned div — much smoother than per-word reactive
-  // highlight flips, and it gracefully handles overlapping word
-  // timestamps because there's only ever one underline on screen.
-  useLayoutEffect(() => {
-    const container = containerRef.current
-    if (!container || activeWordIdx < 0) {
-      setUnderline(null)
-      return
-    }
-    const wordEl = container.querySelector<HTMLSpanElement>(
-      `[data-word-idx="${activeWordIdx}"]`,
-    )
-    if (!wordEl) {
-      setUnderline(null)
-      return
-    }
-    const cRect = container.getBoundingClientRect()
-    const wRect = wordEl.getBoundingClientRect()
-    setUnderline({
-      x: wRect.left - cRect.left,
-      y: wRect.bottom - cRect.top,
-      w: wRect.width,
-    })
-  }, [activeWordIdx, body.words])
-
-  // Re-measure the underline on window resize so it follows line wraps
-  // when the user resizes their window mid-playback.
-  useEffect(() => {
-    const onResize = () => {
-      const container = containerRef.current
-      if (!container || activeWordIdx < 0) return
-      const wordEl = container.querySelector<HTMLSpanElement>(
-        `[data-word-idx="${activeWordIdx}"]`,
-      )
-      if (!wordEl) return
-      const cRect = container.getBoundingClientRect()
-      const wRect = wordEl.getBoundingClientRect()
-      setUnderline({
-        x: wRect.left - cRect.left,
-        y: wRect.bottom - cRect.top,
-        w: wRect.width,
-      })
-    }
-    window.addEventListener('resize', onResize)
-    return () => window.removeEventListener('resize', onResize)
-  }, [activeWordIdx])
-
-  if (committed.length === 0 && partialWords.length === 0) {
-    return <div className="editorial-body">{body.text}</div>
-  }
-
-  // ONE combined list. Stable keys by position so a word transitioning
-  // from partial→committed reuses its DOM <span>; only the className
-  // flips, and CSS handles the smooth styling change.
   const committedCount = committed.length
   const total = committedCount + partialWords.length
-  // Show the moving underline only when playback has actually advanced
-  // past the first word — at currentTime=0 the underline at index 0
-  // would just sit there waiting, which is noise.
-  const showUnderline = currentTime > 0 && underline !== null
   return (
-    <div className="editorial-body" ref={containerRef} style={{ position: 'relative' }}>
+    <>
       {Array.from({ length: total }).map((_unused, i) => {
         const isPartial = i >= committedCount
         const w = isPartial ? partialWords[i - committedCount] : committed[i]
@@ -414,25 +347,139 @@ function PlainText({
           />
         )
       })}
-      {showUnderline && (
-        <span
-          aria-hidden
-          className="text-playhead"
-          style={{
-            position: 'absolute',
-            left: underline.x,
-            top: underline.y + 2,
-            width: underline.w,
-            height: 2,
-            background: 'var(--accent)',
-            borderRadius: 2,
-            pointerEvents: 'none',
-            transition:
-              'left 220ms cubic-bezier(0.22,0.61,0.36,1), top 220ms cubic-bezier(0.22,0.61,0.36,1), width 220ms cubic-bezier(0.22,0.61,0.36,1), opacity 220ms ease-out',
-          }}
-        />
-      )}
+    </>
+  )
+})
+
+function PlainText({
+  body,
+  live,
+  wordArrivals,
+  partialWords,
+}: {
+  body: VerboseJsonResponse
+  /** True only while transcripts are arriving mid-stream — drives the
+   * arrival-based fade-in. False for finalized results. */
+  live: boolean
+  wordArrivals: Map<number, number>
+  partialWords: Word[]
+}) {
+  const committed = body.words ?? []
+  const containerRef = useRef<HTMLDivElement | null>(null)
+
+  if (committed.length === 0 && partialWords.length === 0) {
+    return <div className="editorial-body">{body.text}</div>
+  }
+
+  return (
+    <div className="editorial-body" ref={containerRef} style={{ position: 'relative' }}>
+      <WordList
+        body={body}
+        live={live}
+        wordArrivals={wordArrivals}
+        partialWords={partialWords}
+      />
+      <ActiveWordTracker words={body.words ?? []} containerRef={containerRef} />
     </div>
+  )
+}
+
+/** Sibling component that drives the playhead underline.
+ *
+ * Subscribes to `useCurrentTime()` ITSELF so the parent (PlainText /
+ * WordList) doesn't reconcile on every 60Hz tick. Updates the
+ * absolutely-positioned underline `<div>` via a ref-driven imperative
+ * style write rather than React state — the only DOM mutation per tick
+ * is the four style fields on a single element. */
+function ActiveWordTracker({
+  words,
+  containerRef,
+}: {
+  words: Word[]
+  containerRef: React.RefObject<HTMLDivElement | null>
+}) {
+  const t = useCurrentTime()
+  const lineRef = useRef<HTMLSpanElement | null>(null)
+  const lastIdxRef = useRef<number>(-1)
+
+  // Binary search for the last word whose start time is <= currentTime.
+  // Mirrors the previous lookup; preserves the no-flicker behavior for
+  // overlapping word timestamps (engine 80 ms encoder-stride quantization).
+  const activeIdx = useMemo(() => {
+    if (!words || words.length === 0) return -1
+    if (t < words[0].start) return -1
+    let lo = 0,
+      hi = words.length - 1,
+      found = -1
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      if (words[mid].start <= t) {
+        found = mid
+        lo = mid + 1
+      } else {
+        hi = mid - 1
+      }
+    }
+    return found
+  }, [words, t])
+
+  useEffect(() => {
+    const container = containerRef.current
+    const line = lineRef.current
+    if (!container || !line) return
+    if (activeIdx < 0 || t <= 0) {
+      line.style.opacity = '0'
+      return
+    }
+    // Skip the DOM measure when the active word hasn't actually changed
+    // — currentTime ticks ~60 Hz but the underline only moves at word
+    // boundaries (a few Hz at most).
+    if (activeIdx === lastIdxRef.current) return
+    lastIdxRef.current = activeIdx
+    const wordEl = container.querySelector<HTMLSpanElement>(
+      `[data-word-idx="${activeIdx}"]`,
+    )
+    if (!wordEl) return
+    const cRect = container.getBoundingClientRect()
+    const wRect = wordEl.getBoundingClientRect()
+    line.style.opacity = '1'
+    line.style.transform = `translate(${wRect.left - cRect.left}px, ${
+      wRect.bottom - cRect.top + 2
+    }px)`
+    line.style.width = `${wRect.width}px`
+  }, [activeIdx, t, containerRef])
+
+  // Re-measure on window resize — line wraps shift word positions, and
+  // the imperative style cache (`lastIdxRef`) would otherwise stick at
+  // the pre-resize coordinates.
+  useEffect(() => {
+    const onResize = () => {
+      lastIdxRef.current = -1 // force a re-measure on the next tick
+    }
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+
+  return (
+    <span
+      ref={lineRef}
+      aria-hidden
+      className="text-playhead"
+      style={{
+        position: 'absolute',
+        left: 0,
+        top: 0,
+        width: 0,
+        height: 2,
+        background: 'var(--accent)',
+        borderRadius: 2,
+        pointerEvents: 'none',
+        opacity: 0,
+        transform: 'translate(0,0)',
+        transition:
+          'transform 220ms cubic-bezier(0.22,0.61,0.36,1), width 220ms cubic-bezier(0.22,0.61,0.36,1), opacity 220ms ease-out',
+      }}
+    />
   )
 }
 

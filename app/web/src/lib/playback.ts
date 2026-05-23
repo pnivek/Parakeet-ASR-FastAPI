@@ -217,6 +217,14 @@ export function resetPlayback() {
   el.currentTime = 0
 }
 
+/** Direct access to the singleton <audio> for callers that need to read
+ * its seekable range or duration semantics that don't round-trip well
+ * through the hook layer (e.g. the Live button needs `audio.seekable`
+ * to land at the head of an HLS / icecast stream). */
+export function getAudioElement(): HTMLAudioElement {
+  return ensureEl()
+}
+
 function subscribe(cb: () => void) {
   listeners.add(cb)
   return () => {

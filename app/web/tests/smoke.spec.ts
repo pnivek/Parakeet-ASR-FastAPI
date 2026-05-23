@@ -43,10 +43,20 @@ test('Maison v6 UI — boots, modality tabs switch, per-tab engine picker works'
   await expect(page.getByRole('radio', { name: 'Full pass' })).toBeVisible()
   await expect(page.getByRole('radio', { name: 'Split-full' })).toBeVisible()
   await expect(page.getByRole('radio', { name: 'Chunked' })).toHaveCount(0)
-  // Output + Timestamps in the same pane.
-  await expect(page.getByRole('radio', { name: 'verbose_json' })).toBeVisible()
-  await expect(page.getByRole('button', { name: /^Segment$/i })).toBeVisible()
-  await expect(page.getByRole('button', { name: /^Word$/i })).toBeVisible()
+  // Output/Timestamps controls retired — format choice now lives in
+  // the hero download flyout (verbose_json is always requested).
+  await expect(page.getByRole('radio', { name: 'verbose_json' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /^Segment$/i })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /^Word$/i })).toHaveCount(0)
+
+  // Hero transport row — prev/next segment, play, rewind, sync. Live
+  // (URL-only) and Download (result-only) are conditional and not
+  // asserted here.
+  await expect(page.getByRole('button', { name: /Previous segment/i })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Next segment/i })).toBeVisible()
+  await expect(page.getByRole('button', { name: /^Play$/ })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Rewind/i })).toBeVisible()
+  await expect(page.getByRole('button', { name: /^Sync$/ })).toBeVisible()
 
   // URL tab — URL input + Engine picker.
   await urlTab.click()
@@ -66,8 +76,11 @@ test('Maison v6 UI — boots, modality tabs switch, per-tab engine picker works'
     await expect(page.getByText(label, { exact: true })).toBeVisible()
   }
 
-  // Commit button.
-  await expect(page.getByRole('button', { name: /Transcribe|Record/ })).toBeVisible()
+  // Commit button — scope to the sidebar's commit row so we don't collide
+  // with the "Record" modality tab in the tab strip above.
+  await expect(
+    page.locator('.sb__commit').getByRole('button', { name: /Transcribe|Record/ }),
+  ).toBeVisible()
 
   // Snapshots.
   await uploadTab.click()

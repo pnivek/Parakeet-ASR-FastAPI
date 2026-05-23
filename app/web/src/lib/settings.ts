@@ -10,7 +10,7 @@
  */
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import type { Engine, ResponseFormat, StrategyOverride, TimestampGranularity } from './types'
+import type { Engine, StrategyOverride } from './types'
 
 export type ThemeMode = 'system' | 'light' | 'dark'
 
@@ -25,8 +25,6 @@ export interface CommonModality {
   engine: Engine
   /** REST-only override; ignored when engine === 'websocket'. */
   strategyOverride: StrategyOverride
-  responseFormat: ResponseFormat
-  timestampGranularities: TimestampGranularity[]
   /** REST-only knob; hidden when engine === 'websocket'. */
   longAudioThreshold: number | null
   /** WS-only knob — flips the streaming preset between 10-10-5 (offline-like,
@@ -73,8 +71,6 @@ export interface Settings {
 const COMMON_DEFAULTS: CommonModality = {
   engine: 'rest',
   strategyOverride: 'auto',
-  responseFormat: 'verbose_json',
-  timestampGranularities: ['segment', 'word'],
   longAudioThreshold: null,
   liveLatency: false,
   hpfHz: 100,

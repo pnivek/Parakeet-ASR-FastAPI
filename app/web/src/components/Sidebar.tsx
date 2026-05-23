@@ -12,10 +12,8 @@ import { MIC_FORMAT_HINT, MIC_SAMPLE_RATE, MIC_MIME_TYPE, useMic } from '../lib/
 import { formatBytes } from '../lib/format'
 import type {
   Engine,
-  ResponseFormat,
   Strategy,
   StrategyOverride,
-  TimestampGranularity,
   WhisperSegment,
   Word,
   WSMessage,
@@ -39,14 +37,6 @@ interface Props {
   onPeaks?: (peaks: number[], cumulative: boolean) => void
   onPartialSegment?: (segment: WhisperSegment | null, words: Word[]) => void
 }
-
-const FORMATS: { id: ResponseFormat; label: string }[] = [
-  { id: 'verbose_json', label: 'verbose_json' },
-  { id: 'json', label: 'json' },
-  { id: 'text', label: 'text' },
-  { id: 'srt', label: 'srt' },
-  { id: 'vtt', label: 'vtt' },
-]
 
 const STRATEGY_OVERRIDES: { id: StrategyOverride; label: string; hint: string }[] = [
   { id: 'auto', label: 'Auto', hint: 'Server picks Full / Split-full based on file size.' },
@@ -461,8 +451,11 @@ export function Sidebar({
         const r = await postTranscription(
           pickedFile,
           {
-            response_format: fileModality.responseFormat,
-            timestamp_granularities: fileModality.timestampGranularities,
+            // verbose_json + both granularities are hardcoded — the transcript
+            // view always needs the full body, and the download flyout derives
+            // every other format from it.
+            response_format: 'verbose_json',
+            timestamp_granularities: ['segment', 'word'],
             strategy: restStrategyParam(fileModality.strategyOverride),
             long_audio_threshold: fileModality.longAudioThreshold ?? undefined,
           },
@@ -570,8 +563,8 @@ export function Sidebar({
         const r = await postTranscriptionUrl(
           urlInput.trim(),
           {
-            response_format: urlModality.responseFormat,
-            timestamp_granularities: urlModality.timestampGranularities,
+            response_format: 'verbose_json',
+            timestamp_granularities: ['segment', 'word'],
             strategy: restStrategyParam(urlModality.strategyOverride),
             long_audio_threshold: urlModality.longAudioThreshold ?? undefined,
           },
@@ -601,8 +594,8 @@ export function Sidebar({
           const r = await postTranscription(
             micBlob,
             {
-              response_format: s.mic.responseFormat,
-              timestamp_granularities: s.mic.timestampGranularities,
+              response_format: 'verbose_json',
+              timestamp_granularities: ['segment', 'word'],
               strategy: restStrategyParam(s.mic.strategyOverride),
               long_audio_threshold: s.mic.longAudioThreshold ?? undefined,
             },
@@ -700,16 +693,10 @@ export function Sidebar({
     return false
   })()
 
-  // ── Output-tab callbacks (per-modality) ──────────────────────────
-  const granDisabled = m.responseFormat !== 'verbose_json'
-  const toggleGran = (g: TimestampGranularity) => {
-    if (granDisabled) return
-    const set = new Set(m.timestampGranularities)
-    if (set.has(g)) set.delete(g)
-    else set.add(g)
-    if (set.size === 0) set.add('segment')
-    s.update(mode, { timestampGranularities: Array.from(set) })
-  }
+  // Reference `m` once so the underlying setting still hydrates the
+  // active modality's view; the rest of the Output/Timestamps logic
+  // was retired with the format consolidation.
+  void m
 
   return (
     <div className="sb">
@@ -741,8 +728,6 @@ export function Sidebar({
             setDragOver={setDragOver}
             fileInputRef={fileInputRef}
             onFiles={onFiles}
-            granDisabled={granDisabled}
-            toggleGran={toggleGran}
           />
         )}
         {mode === 'url' && (
@@ -751,8 +736,6 @@ export function Sidebar({
             update={(patch) => s.update('url', patch)}
             urlInput={urlInput}
             setUrlInput={setUrlInput}
-            granDisabled={granDisabled}
-            toggleGran={toggleGran}
           />
         )}
         {mode === 'mic' && (
@@ -764,8 +747,6 @@ export function Sidebar({
             recordElapsed={recordElapsed}
             micBlob={micBlob}
             setMicBlob={setMicBlob}
-            granDisabled={granDisabled}
-            toggleGran={toggleGran}
           />
         )}
       </div>
@@ -841,90 +822,13 @@ function EnginePicker({
   )
 }
 
-// ── Shared output controls ───────────────────────────────────────
-function OutputControls({
-  format,
-  setFormat,
-  granularities,
-  granDisabled,
-  toggleGran,
-}: {
-  format: ResponseFormat
-  setFormat: (v: ResponseFormat) => void
-  granularities: TimestampGranularity[]
-  granDisabled: boolean
-  toggleGran: (g: TimestampGranularity) => void
-}) {
-  return (
-    <>
-      <SBLabel top={22}>Format</SBLabel>
-      <OptionList<ResponseFormat>
-        value={format}
-        options={FORMATS.map((f) => ({ id: f.id, label: f.label }))}
-        onChange={setFormat}
-      />
-      <SBLabel top={22}>
-        Timestamps
-        {granDisabled && (
-          <span
-            style={{
-              marginLeft: 10,
-              fontFamily: 'Newsreader, serif',
-              fontStyle: 'italic',
-              fontSize: 11,
-              color: 'var(--muted-deep)',
-              textTransform: 'none',
-              letterSpacing: 0,
-            }}
-          >
-            verbose_json only
-          </span>
-        )}
-      </SBLabel>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-        {(['segment', 'word'] as TimestampGranularity[]).map((id) => {
-          const on = !granDisabled && granularities.includes(id)
-          return (
-            <button
-              key={id}
-              type="button"
-              disabled={granDisabled}
-              className={on ? 'ma-check ma-check--on' : 'ma-check'}
-              onClick={() => toggleGran(id)}
-            >
-              <span className="ma-check__box">
-                {on && (
-                  <svg
-                    viewBox="0 0 24 24"
-                    width="9"
-                    height="9"
-                    fill="none"
-                    stroke="oklch(0.135 0.012 60)"
-                    strokeWidth="4"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden
-                  >
-                    <path d="M5 12l5 5L20 7" />
-                  </svg>
-                )}
-              </span>
-              <span style={{ textTransform: 'capitalize' }}>{id}</span>
-            </button>
-          )
-        })}
-      </div>
-    </>
-  )
-}
-
-// ── Shared engine + strategy + output block ──────────────────────
-function EngineStrategyOutput({
+// ── Shared engine + strategy block ───────────────────────────────
+// (Output/Timestamps controls were retired — verbose_json + segment+word
+// are now hardcoded, with format choice deferred to the download flyout.)
+function EngineStrategy({
   modality,
   m,
   update,
-  granDisabled,
-  toggleGran,
   /** When true, render the Strategy section even with engine=websocket,
    * disabling each option (with a tooltip). Lets the Record tab keep the
    * Strategy slot visible across engine switches so users see the option
@@ -934,8 +838,6 @@ function EngineStrategyOutput({
   modality: Modality
   m: CommonModality
   update: (patch: Partial<CommonModality>) => void
-  granDisabled: boolean
-  toggleGran: (g: TimestampGranularity) => void
   alwaysShowStrategy?: boolean
 }) {
   const isRest = m.engine === 'rest'
@@ -965,13 +867,6 @@ function EngineStrategyOutput({
           />
         </>
       )}
-      <OutputControls
-        format={m.responseFormat}
-        setFormat={(v) => update({ responseFormat: v })}
-        granularities={m.timestampGranularities}
-        granDisabled={granDisabled}
-        toggleGran={toggleGran}
-      />
     </>
   )
 }
@@ -1067,8 +962,6 @@ function UploadPane({
   setDragOver,
   fileInputRef,
   onFiles,
-  granDisabled,
-  toggleGran,
 }: {
   modality: CommonModality
   update: (patch: Partial<CommonModality>) => void
@@ -1079,8 +972,6 @@ function UploadPane({
   setDragOver: (b: boolean) => void
   fileInputRef: React.RefObject<HTMLInputElement | null>
   onFiles: (files: FileList | null) => void
-  granDisabled: boolean
-  toggleGran: (g: TimestampGranularity) => void
 }) {
   return (
     <div>
@@ -1185,13 +1076,7 @@ function UploadPane({
       </div>
       <div className="sb__file-formats">wav · mp3 · flac · m4a · ogg · webm</div>
 
-      <EngineStrategyOutput
-        modality="file"
-        m={modality}
-        update={update}
-        granDisabled={granDisabled}
-        toggleGran={toggleGran}
-      />
+      <EngineStrategy modality="file" m={modality} update={update} />
 
       <SBLabel top={22}>Advanced</SBLabel>
       <div className="sb__adv-list">
@@ -1219,15 +1104,11 @@ function URLPane({
   update,
   urlInput,
   setUrlInput,
-  granDisabled,
-  toggleGran,
 }: {
   modality: CommonModality
   update: (patch: Partial<CommonModality>) => void
   urlInput: string
   setUrlInput: (v: string) => void
-  granDisabled: boolean
-  toggleGran: (g: TimestampGranularity) => void
 }) {
   const urlValid = /^https?:\/\/\S+/i.test(urlInput.trim()) && urlInput.trim() !== 'https://'
   return (
@@ -1264,13 +1145,7 @@ function URLPane({
         </span>
       </div>
 
-      <EngineStrategyOutput
-        modality="url"
-        m={modality}
-        update={update}
-        granDisabled={granDisabled}
-        toggleGran={toggleGran}
-      />
+      <EngineStrategy modality="url" m={modality} update={update} />
 
       <SBLabel top={22}>Advanced</SBLabel>
       <div className="sb__adv-list">
@@ -1302,8 +1177,6 @@ function RecordPane({
   recordElapsed,
   micBlob,
   setMicBlob,
-  granDisabled,
-  toggleGran,
 }: {
   modality: MicModality
   update: (patch: Partial<MicModality>) => void
@@ -1312,8 +1185,6 @@ function RecordPane({
   recordElapsed: number
   micBlob: File | null
   setMicBlob: (f: File | null) => void
-  granDisabled: boolean
-  toggleGran: (g: TimestampGranularity) => void
 }) {
   const isWs = modality.engine === 'websocket'
   return (
@@ -1377,12 +1248,10 @@ function RecordPane({
 
       <div className="mic-card__hint">16 kHz · Mono · WebM Opus</div>
 
-      <EngineStrategyOutput
+      <EngineStrategy
         modality="mic"
         m={modality}
         update={update}
-        granDisabled={granDisabled}
-        toggleGran={toggleGran}
         alwaysShowStrategy
       />
 
@@ -1438,7 +1307,17 @@ function MicCardBars({
     }
     let raf = 0
     let freq: Uint8Array | null = null
+    // Cap to ~30 Hz — sampling + setBands(Array.from(disp)) was the
+    // dominant per-frame cost in this loop, and 30 Hz is visually
+    // indistinguishable from 60 here (the bars already smooth via the
+    // exponential ema below).
+    let skip = false
     const loop = () => {
+      skip = !skip
+      if (skip) {
+        raf = requestAnimationFrame(loop)
+        return
+      }
       const analyser = getAnalyser()
       if (analyser) {
         if (!freq || freq.length !== analyser.frequencyBinCount) {

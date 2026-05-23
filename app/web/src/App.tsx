@@ -1,7 +1,11 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { TranscriptionResponse } from './lib/api'
 import {
+  getAudioElement,
   getPlaybackAnalyser,
+  pause,
+  play,
+  seek,
   setAudioFile,
   setAudioUrl,
   setDurationHint,
@@ -40,7 +44,13 @@ export default function App() {
    * one-shot capture against state-update races. */
   const [ttfs, setTtfs] = useState<number | null>(null)
   const ttfsRef = useRef<number | null>(null)
-  const sessionStartRef = useRef<number>(0)
+  /** performance.now() at the start of the active session. Mirrored
+   * into a ref so callbacks fired between renders (handlePartial /
+   * markFirstSegment) can read the live value without waiting for a
+   * re-render, while the state copy lets consumers (FooterRail) react
+   * to changes and avoids a render-time ref read. */
+  const [sessionStartMs, setSessionStartMs] = useState(0)
+  const sessionStartRef = useRef(0)
   /** True while we're receiving partials (mid-stream). False on final result
    * or no result. Drives the word-by-word reveal animation in the
    * transcript view — static results should not animate. */
@@ -59,6 +69,12 @@ export default function App() {
    * increasing ids; words are append-only by index. */
   const maxSeenSegIdRef = useRef<number>(-1)
   const wordArrivalCountRef = useRef<number>(0)
+  /** Sync (cursor-aligned playback) toggle + autoPaused tracker. Declared
+   * up here (not next to the gate effect below) so the various session
+   * handlers that need to reset autoPaused can reach `setAutoPaused`
+   * without tripping the "accessed before declared" lint rule. */
+  const [syncOn, setSyncOn] = useState(false)
+  const [autoPaused, setAutoPaused] = useState(false)
 
   // Hidden host for the singleton <audio>.
   const audioMountRef = useRef<HTMLDivElement>(null)
@@ -119,6 +135,9 @@ export default function App() {
     wordArrivalRef.current = new Map()
     maxSeenSegIdRef.current = -1
     wordArrivalCountRef.current = 0
+    // Sync gating is a live-only concern — clear the auto-pause marker
+    // so a finished result doesn't immediately re-pause on the boundary.
+    setAutoPaused(false)
     if (l.kind === 'file') {
       setAudioFile(l.file)
       // peaks decode runs in the useEffect above when loaded.file changes.
@@ -185,19 +204,21 @@ export default function App() {
   /** Clear prior session state right before a new transcribe / record fires.
    * Keeps the UI from flashing the previous transcript while the new one is
    * in flight. */
-  const handleSessionStart = (opts?: { resetHero?: boolean }) => {
+  const handleSessionStart = useCallback((opts?: { resetHero?: boolean }) => {
     setResult(null)
     setError(null)
     setLive(false)
     setPartialSegment(null)
     setPartialWords([])
     sessionStartRef.current = performance.now()
+    setSessionStartMs(sessionStartRef.current)
     ttfsRef.current = null
     setTtfs(null)
     arrivalRef.current = new Map()
     wordArrivalRef.current = new Map()
     maxSeenSegIdRef.current = -1
     wordArrivalCountRef.current = 0
+    setAutoPaused(false)
     // Only wipe the hero waveform/identity when explicitly asked (mic =
     // fresh recording, url = new source). File mode keeps the already-
     // decoded waveform: clearing it here would null `loaded`, re-trigger
@@ -207,7 +228,7 @@ export default function App() {
       setLoaded(null)
       setPeaks(null)
     }
-  }
+  }, [])
 
   const handlePartialSegment = (segment: WhisperSegment | null, words: Word[]) => {
     setPartialSegment(segment)
@@ -315,6 +336,124 @@ export default function App() {
         ? 'done'
         : 'idle'
 
+  // ── Transport helpers driven by hero buttons ────────────────────
+  const segments = useMemo(
+    () =>
+      result?.format === 'verbose_json' ? result.body.segments : [],
+    [result],
+  )
+
+  /** Seek to the start of the segment ENDING after (or AT) currentTime —
+   * stepping forward by one transcript line. */
+  const seekNextSegment = useCallback(() => {
+    if (segments.length === 0) return
+    // Find the first segment whose start is strictly after the playhead.
+    // Floor at +0.05 so a click after a long pause still advances even
+    // when currentTime is touching the previous segment's end.
+    const target = segments.find((s) => s.start > currentTime + 0.05)
+    if (target) seek(target.start)
+    else seek(segments[segments.length - 1].start)
+    play()
+  }, [segments, currentTime])
+
+  /** Seek to the start of the previous segment (or the start of the
+   * current one if we're > ~1.2 s into it — the classic "double tap to
+   * skip" affordance). */
+  const seekPrevSegment = useCallback(() => {
+    if (segments.length === 0) return
+    const cur = segments.findIndex(
+      (s) => currentTime >= s.start && currentTime <= s.end,
+    )
+    if (cur > 0) {
+      // If well into the current segment, restart it first; otherwise jump.
+      const into = currentTime - segments[cur].start
+      const target = into > 1.2 ? segments[cur] : segments[cur - 1]
+      seek(target.start)
+    } else if (cur === 0) {
+      seek(segments[0].start)
+    } else {
+      // Outside any segment — find the last that started before us.
+      const prev = [...segments].reverse().find((s) => s.start < currentTime)
+      if (prev) seek(prev.start)
+      else seek(0)
+    }
+    play()
+  }, [segments, currentTime])
+
+  const rewind = useCallback(() => {
+    pause()
+    seek(0)
+  }, [])
+
+  // ── Sync (cursor-aligned playback) gating ───────────────────────
+  // While `syncOn`, playback is gated to the latest committed segment's
+  // end — minus a small safety lead so the underline always has a word
+  // to highlight. Crossing the boundary pauses the audio; the next
+  // segments_batch (or final) extends the boundary and resumes playback
+  // iff the user had it playing before the auto-pause.
+  // syncOn / autoPaused state declared at the top of the component (see
+  // above) so the handler functions can reach the setters.
+  const SYNC_LEAD = 0.3
+
+  const latestEnd = useMemo(() => {
+    if (segments.length > 0) return segments[segments.length - 1].end
+    if (partialSegment) return partialSegment.end
+    return 0
+  }, [segments, partialSegment])
+
+  const toggleSync = () => {
+    setSyncOn((on) => {
+      if (on) setAutoPaused(false) // turning off — drop pending auto-resume
+      return !on
+    })
+  }
+
+  // Auto-pause when we'd cross the boundary. Runs whenever the play head
+  // ticks (via useCurrentTime) — cheap because it's a single comparison.
+  useEffect(() => {
+    if (!syncOn) return
+    if (!audioPlaying) return
+    if (latestEnd <= 0) return
+    const boundary = latestEnd - SYNC_LEAD
+    if (currentTime >= boundary) {
+      pause()
+      setAutoPaused(true)
+    }
+  }, [syncOn, audioPlaying, currentTime, latestEnd])
+
+  // Auto-resume when the boundary moves forward past where we paused.
+  useEffect(() => {
+    if (!syncOn) return
+    if (audioPlaying) return
+    if (!autoPaused) return
+    if (latestEnd <= 0) return
+    const boundary = latestEnd - SYNC_LEAD
+    if (currentTime < boundary - 0.05) {
+      setAutoPaused(false)
+      play()
+    }
+  }, [syncOn, audioPlaying, autoPaused, currentTime, latestEnd])
+
+  /** Jump the playback element to the live edge of an HLS / icecast
+   * source. Only meaningful for URL streams that are still being fed;
+   * file / finished recordings have a fixed end. */
+  const seekLiveEdge = useCallback(() => {
+    if (loaded?.kind !== 'url') return
+    const el = getAudioElement()
+    let edge = 0
+    if (isFinite(el.duration) && el.duration > 0) {
+      edge = el.duration
+    } else if (el.seekable && el.seekable.length > 0) {
+      edge = el.seekable.end(el.seekable.length - 1)
+    }
+    if (edge > 0) {
+      // Step back ~1 s — sitting at the absolute end often pins the
+      // browser's playback policy and stops fresh chunks from playing.
+      seek(Math.max(0, edge - 1))
+      play()
+    }
+  }, [loaded?.kind])
+
   // language from verbose_json if available
   const language =
     result?.format === 'verbose_json' ? result.body.language || 'en' : 'en'
@@ -337,7 +476,21 @@ export default function App() {
 
       <main className="shell">
         <div className="shell__main">
-          <HeroRow loaded={loaded} peaks={peaks} state={state} language={language} />
+          <HeroRow
+            loaded={loaded}
+            peaks={peaks}
+            state={state}
+            language={language}
+            result={result}
+            hasSegments={segments.length > 0}
+            onPrevSegment={seekPrevSegment}
+            onNextSegment={seekNextSegment}
+            onRewind={rewind}
+            syncOn={syncOn}
+            onToggleSync={toggleSync}
+            onLiveEdge={seekLiveEdge}
+            live={live}
+          />
           {error && <div className="error">{error}</div>}
           <TranscriptSection
             result={result}
@@ -367,7 +520,14 @@ export default function App() {
         </aside>
       </main>
 
-      <FooterRail loaded={loaded} result={result} ttfs={ttfs} activeStrategy={activeStrategy} />
+      <FooterRail
+        loaded={loaded}
+        result={result}
+        ttfs={ttfs}
+        activeStrategy={activeStrategy}
+        live={live}
+        sessionStartMs={sessionStartMs}
+      />
 
       <div
         ref={audioMountRef}

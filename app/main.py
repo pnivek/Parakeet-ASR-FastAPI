@@ -1524,6 +1524,7 @@ async def handle_streaming_pcm(
                 "final_duration_processed_seconds": round(total_duration_processed_seconds_for_asr, 3),
                 "csv_content": generate_csv_content(sent_segments_pcm),
                 "srt_content": generate_srt_content(sent_segments_pcm),
+                "vtt_content": _segments_to_vtt(sent_segments_pcm),
                 "streaming_mode": client_config.get("format", "unknown"),
             }
             await websocket.send_json(final_message_payload)
@@ -1826,6 +1827,7 @@ async def handle_streaming_url(
                 "final_duration_processed_seconds": round(total_duration_processed_seconds_for_asr, 3),
                 "csv_content": generate_csv_content(sent_segments_pcm),
                 "srt_content": generate_srt_content(sent_segments_pcm),
+                "vtt_content": _segments_to_vtt(sent_segments_pcm),
                 "streaming_mode": "url",
             }
             await websocket.send_json(final_message_payload)
@@ -2148,6 +2150,7 @@ def _build_openai_response(
             "audio_duration_seconds": round(duration_s, 3),
             "csv_content": generate_csv_content(segments),
             "srt_content": generate_srt_content(segments),
+            "vtt_content": _segments_to_vtt(segments),
         }
         if words is not None:
             body["words"] = words
@@ -2679,6 +2682,7 @@ async def _ws_accumulate_then_process(
         "final_duration_processed_seconds": round(audio_duration_s, 3),
         "csv_content": generate_csv_content(segments),
         "srt_content": generate_srt_content(segments),
+        "vtt_content": _segments_to_vtt(segments),
     }
 
 

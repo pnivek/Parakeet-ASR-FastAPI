@@ -399,10 +399,10 @@ export function Sidebar({
               bytes_per_sample: 2,
               format: fileExt,
               strategy: 'streaming',
-              // Always use the offline-like preset for file streaming —
-              // live_latency=true slows file throughput ~4× for no benefit
-              // (no human is talking in realtime).
-              live_latency: false,
+              // Default false (offline-like preset, ~4× higher throughput
+              // than 10-2-2 on a long file). User can flip on via Advanced
+              // if they want partials sooner on a slow / huge upload.
+              live_latency: fileModality.liveLatency,
               long_audio_threshold: fileModality.longAudioThreshold ?? undefined,
               ...vadConfig(),
             },
@@ -492,7 +492,9 @@ export function Sidebar({
               format: 'url',
               url: urlInput.trim(),
               strategy: 'streaming',
-              live_latency: false,
+              // Defaults true for URL — realtime source benefits from
+              // 10-2-2 preset (~6 s lag, partial_segment messages emit).
+              live_latency: urlModality.liveLatency,
               long_audio_threshold: urlModality.longAudioThreshold ?? undefined,
               // Disable VAD for URL streams — vadConfig() returns vad_enabled
               // false for non-mic modalities. Server otherwise defaults VAD on,
@@ -1096,6 +1098,14 @@ function UploadPane({
             onSet={(v) => update({ longAudioThreshold: v })}
           />
         )}
+        {modality.engine === 'websocket' && (
+          <ToggleKv
+            k="Low-latency mode"
+            hint="live_latency — 10-2-2 preset for faster partials at lower throughput"
+            v={modality.liveLatency}
+            onSet={(v) => update({ liveLatency: v })}
+          />
+        )}
       </div>
     </div>
   )
@@ -1170,6 +1180,14 @@ function URLPane({
             placeholder={480}
             suffix="s"
             onSet={(v) => update({ longAudioThreshold: v })}
+          />
+        )}
+        {modality.engine === 'websocket' && (
+          <ToggleKv
+            k="Low-latency mode"
+            hint="live_latency — 10-2-2 preset for faster partials at lower throughput"
+            v={modality.liveLatency}
+            onSet={(v) => update({ liveLatency: v })}
           />
         )}
       </div>

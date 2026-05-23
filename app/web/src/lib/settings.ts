@@ -25,11 +25,16 @@ export interface CommonModality {
   timestampGranularities: TimestampGranularity[]
   /** REST-only knob; hidden when engine === 'websocket'. */
   longAudioThreshold: number | null
+  /** WS-only knob — flips the streaming preset between 10-10-5 (offline-like,
+   * higher throughput) and 10-2-2 (~6 s emission lag, partial_segment
+   * messages). Defaults per-modality: false for `file` (throughput beats
+   * partial responsiveness on a bounded upload), true for `url` and `mic`
+   * (realtime sources benefit from faster commits + partials). */
+  liveLatency: boolean
 }
 
-/** Mic modality also carries live + capture-quality knobs. */
+/** Mic modality also carries capture-quality knobs. */
 export interface MicModality extends CommonModality {
-  liveLatency: boolean
   hpfHz: number
   noiseSuppression: boolean
   vadEnabled: boolean
@@ -63,6 +68,7 @@ const COMMON_DEFAULTS: CommonModality = {
   responseFormat: 'verbose_json',
   timestampGranularities: ['segment', 'word'],
   longAudioThreshold: null,
+  liveLatency: false,
 }
 
 const MIC_DEFAULTS: MicModality = {
@@ -82,7 +88,9 @@ const MIC_DEFAULTS: MicModality = {
 const DEFAULTS: Omit<Settings, 'set' | 'update' | 'reset'> = {
   mode: 'file',
   file: { ...COMMON_DEFAULTS },
-  url: { ...COMMON_DEFAULTS },
+  // URL streams default to live-latency so partials arrive promptly on
+  // realtime sources; user can flip off via Advanced for cleaner commits.
+  url: { ...COMMON_DEFAULTS, liveLatency: true },
   mic: { ...MIC_DEFAULTS },
   theme: 'system',
 }

@@ -128,14 +128,11 @@ export const TranscriptSection = memo(function TranscriptSection({
           }
         : null
 
-  const formatLabel = result ? result.format : 'verbose_json'
-
   return (
     <section className="transcript">
       <div className="transcript__head">
         <div className="transcript__head-l">
           <span className="label-eyebrow">TRANSCRIPT</span>
-          <span className="format-pill">{formatLabel}</span>
         </div>
         {verboseBody && (
           <div className="ma-segmented">

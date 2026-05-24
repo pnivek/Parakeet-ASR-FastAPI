@@ -216,6 +216,7 @@ export default function App() {
     maxSeenSegIdRef.current = -1
     wordArrivalCountRef.current = 0
     setAutoPaused(false)
+    setBoundary(0) // monotonic boundary resets per session
     // Only wipe the hero waveform/identity when explicitly asked (mic =
     // fresh recording, url = new source). File mode keeps the already-
     // decoded waveform: clearing it here would null `loaded`, re-trigger
@@ -318,6 +319,8 @@ export default function App() {
     setPeaks(null)
     setTtfs(null)
     ttfsRef.current = null
+    setBoundary(0)
+    setAutoPaused(false)
     setAudioFile(null)
   }
 
@@ -382,26 +385,31 @@ export default function App() {
     seek(0)
   }, [])
 
-  // ── Sync (cursor-aligned playback) gating ───────────────────────
-  // While `syncOn`, playback is gated to the latest committed segment's
-  // end — minus a small safety lead so the underline always has a word
-  // to highlight. Crossing the boundary pauses the audio; the next
-  // segments_batch (or final) extends the boundary and resumes playback
-  // iff the user had it playing before the auto-pause.
-  // syncOn / autoPaused state declared at the top of the component (see
-  // above) so the handler functions can reach the setters.
-  const SYNC_LEAD = 0.3
+  // ── Sync as a lead-buffer ──────────────────────────────────────────
+  // Sync = "keep N seconds of committed transcript in front of the
+  // cursor." Pauses audio when the lead drops below SYNC_LEAD, resumes
+  // when the boundary advances enough to restore the lead. The boundary
+  // is monotonic (only ever grows) so partial-word revisions can't
+  // shrink it and pull audio backward.
+  //
+  // syncOn / autoPaused state declared at the top of the component so
+  // the handler functions can reach the setters.
+  const SYNC_LEAD = 2.0     // seconds of committed transcript to keep ahead of cursor
+  const SYNC_SLACK = 0.5    // dormancy: when audio is more than SLACK past the boundary
+                            // (Live, scrub-forward), Sync stops gating
+  const SYNC_RESUME_EPS = 0.05
 
-  const latestEnd = useMemo(() => {
-    // Sync gates on COMMITTED segments only. The point of Sync is to
-    // keep playback strictly behind transcripts the user can read with
-    // confidence — partial words may shuffle as the engine decodes, so
-    // gating on partial.end would let playback enter unreliable
-    // territory. Fall back to partial.end only when no commits exist
-    // yet (so the boundary isn't 0 at session start).
-    if (segments.length > 0) return segments[segments.length - 1].end
-    if (partialSegment) return partialSegment.end
-    return 0
+  // Monotonic boundary: max(committed_last_end, partial_end) over the
+  // session. Partials can extend the runway in real-time, but the
+  // boundary never retreats — if a partial later shrinks or vanishes
+  // (sentence finalizes with a different word count), playback keeps
+  // its earned lead.
+  const [boundary, setBoundary] = useState(0)
+  useEffect(() => {
+    const committed = segments.length > 0 ? segments[segments.length - 1].end : 0
+    const partial = partialSegment ? partialSegment.end : 0
+    const candidate = Math.max(committed, partial)
+    if (candidate > 0) setBoundary((prev) => Math.max(prev, candidate))
   }, [segments, partialSegment])
 
   const toggleSync = () => {
@@ -411,31 +419,43 @@ export default function App() {
     })
   }
 
-  // Auto-pause when we'd cross the boundary. Runs whenever the play head
-  // ticks (via useCurrentTime) — cheap because it's a single comparison.
+  // Auto-pause when audio is at the edge of the lead zone.
+  // "Edge" = currentTime >= boundary - LEAD AND currentTime <= boundary + SLACK.
+  // If user is significantly past boundary (Live, scrub-forward) we're
+  // dormant — Sync doesn't fight them. When they scrub back inside the
+  // zone, Sync re-engages.
   useEffect(() => {
     if (!syncOn) return
     if (!audioPlaying) return
-    if (latestEnd <= 0) return
-    const boundary = latestEnd - SYNC_LEAD
-    if (currentTime >= boundary) {
+    if (boundary <= 0) return
+    const target = boundary - SYNC_LEAD
+    if (currentTime >= target && currentTime <= boundary + SYNC_SLACK) {
       pause()
       setAutoPaused(true)
     }
-  }, [syncOn, audioPlaying, currentTime, latestEnd])
+  }, [syncOn, audioPlaying, currentTime, boundary])
 
-  // Auto-resume when the boundary moves forward past where we paused.
+  // Auto-resume when the boundary moves forward enough to restore the lead.
   useEffect(() => {
     if (!syncOn) return
     if (audioPlaying) return
     if (!autoPaused) return
-    if (latestEnd <= 0) return
-    const boundary = latestEnd - SYNC_LEAD
-    if (currentTime < boundary - 0.05) {
+    if (boundary <= 0) return
+    const target = boundary - SYNC_LEAD
+    if (currentTime < target - SYNC_RESUME_EPS) {
       setAutoPaused(false)
       play()
     }
-  }, [syncOn, audioPlaying, autoPaused, currentTime, latestEnd])
+  }, [syncOn, audioPlaying, autoPaused, currentTime, boundary])
+
+  // Whether the playhead is currently at (or near) the live edge — drives
+  // the red-dot indicator on the Live button. Threshold matches the
+  // implicit "you can read along with this" window; small enough that
+  // the dot stops glowing as soon as the user falls a few seconds behind.
+  const audioReceived =
+    result?.format === 'verbose_json' ? result.body.audio_received_s ?? 0 : 0
+  const atLiveEdge =
+    loaded?.kind === 'url' && audioReceived > 0 && audioReceived - currentTime < 2.0
 
   /** Jump the playback element to the "live edge" — the latest audio
    * we have. Source of truth is the server's `audio_received_s` counter
@@ -503,6 +523,7 @@ export default function App() {
             syncOn={syncOn}
             onToggleSync={toggleSync}
             onLiveEdge={seekLiveEdge}
+            atLiveEdge={atLiveEdge}
             live={live}
           />
           {error && <div className="error">{error}</div>}

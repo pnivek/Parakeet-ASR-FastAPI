@@ -39,6 +39,10 @@ interface Props {
   onToggleSync: () => void
   /** Jump a live URL stream's <audio> element to its live edge. */
   onLiveEdge: () => void
+  /** True when audio playhead is within ~2s of server's audio_received_s.
+   * Drives the red-dot indicator on the Live button — lit when you ARE
+   * live, hollow when you have catching up to do. */
+  atLiveEdge: boolean
   /** True while partials are still arriving — used to show the Live
    * jump button (URL streams only). */
   live: boolean
@@ -77,9 +81,16 @@ const SyncIcon = () => (
     <path d="M18 3v4h-4M6 21v-4h4" />
   </svg>
 )
-const LiveDotIcon = () => (
-  <svg viewBox="0 0 24 24" width={9} height={9} fill="currentColor" aria-hidden>
-    <circle cx="12" cy="12" r="6" />
+const LiveDotIcon = ({ filled }: { filled: boolean }) => (
+  <svg viewBox="0 0 24 24" width={9} height={9} aria-hidden>
+    <circle
+      cx="12"
+      cy="12"
+      r="6"
+      fill={filled ? 'oklch(0.62 0.22 25)' : 'transparent'}
+      stroke={filled ? 'oklch(0.62 0.22 25)' : 'currentColor'}
+      strokeWidth={filled ? 0 : 2}
+    />
   </svg>
 )
 const DownloadIcon = () => (
@@ -114,6 +125,7 @@ export function HeroRow({
   syncOn,
   onToggleSync,
   onLiveEdge,
+  atLiveEdge,
   live,
 }: Props) {
   const t = useCurrentTime()
@@ -245,12 +257,16 @@ export function HeroRow({
         {showLive && (
           <button
             type="button"
-            className="ma-pill ma-pill--lg"
+            className={
+              atLiveEdge
+                ? 'ma-pill ma-pill--lg ma-pill--active'
+                : 'ma-pill ma-pill--lg'
+            }
             onClick={onLiveEdge}
             aria-label="Jump to live edge"
-            title="Jump to live edge"
+            title={atLiveEdge ? 'You are live' : 'Jump to live edge'}
           >
-            <LiveDotIcon />
+            <LiveDotIcon filled={atLiveEdge} />
             Live
           </button>
         )}

@@ -270,26 +270,31 @@ function WordsView({
   partialWords: Word[]
 }) {
   const t = useCurrentTime()
-  // Same rule as ActiveWordTracker: only highlight committed words.
-  // Partial words' timestamps aren't authoritative until commit, so
-  // the active-cell highlight would skip around mid-sentence.
+  // Interval-containment: prefer word whose [start, end] contains t.
+  // Same rationale as ActiveWordTracker (handles overlap from
+  // 80ms-quantized engine timestamps).
   const activeIdx = useMemo(() => {
     const words = body.words
     if (!words || words.length === 0) return -1
     if (t < words[0].start) return -1
     let lo = 0,
       hi = words.length - 1,
-      found = -1
+      candidate = -1
     while (lo <= hi) {
       const mid = (lo + hi) >> 1
       if (words[mid].start <= t) {
-        found = mid
+        candidate = mid
         lo = mid + 1
       } else {
         hi = mid - 1
       }
     }
-    return found
+    if (candidate < 0) return -1
+    const lookback = Math.max(0, candidate - 3)
+    for (let i = candidate; i >= lookback; i--) {
+      if (words[i].end >= t) return i
+    }
+    return candidate
   }, [body.words, t])
   return <WordsGrid body={body} activeIdx={activeIdx} partialWords={partialWords} />
 }
@@ -445,45 +450,69 @@ function ActiveWordTracker({
   const t = useCurrentTime()
   const lineRef = useRef<HTMLSpanElement | null>(null)
   const lastIdxRef = useRef<number>(-1)
+  const lastTRef = useRef<number>(0)
 
-  // Binary search for the last COMMITTED word whose start time is <= t.
-  // We deliberately exclude partial words: their start times are
-  // approximate (the engine is mid-decode and may revise word→time
-  // assignments before the sentence commits), so the cursor would jitter
-  // off the actual spoken word. Sync mode keeps audio inside committed
-  // territory; without Sync the cursor parks at the last committed word
-  // while the user catches the audio cleanup tail.
+  // **Cursor selection — interval containment.**
+  // First binary-search for the latest word whose start ≤ t. Then prefer
+  // the latest word among those that ALSO contains t (start ≤ t ≤ end) —
+  // handles the common case where adjacent word timestamps overlap (the
+  // engine's 80ms encoder-stride quantization makes word boundaries
+  // approximate, so picking "last start ≤ t" alone can land on a word
+  // whose audio plays slightly AFTER what the user is currently hearing).
+  // Between-words case (no containment): fall back to the binary-search
+  // result (cursor parks on the last word that was spoken).
   const activeIdx = useMemo(() => {
     if (committed.length === 0) return -1
     if (t < committed[0].start) return -1
     let lo = 0,
       hi = committed.length - 1,
-      found = -1
+      candidate = -1
     while (lo <= hi) {
       const mid = (lo + hi) >> 1
       if (committed[mid].start <= t) {
-        found = mid
+        candidate = mid
         lo = mid + 1
       } else {
         hi = mid - 1
       }
     }
-    return found
+    if (candidate < 0) return -1
+    // Walk back a few indices to find a word whose [start, end] contains
+    // t. Word lengths are typically <1s so we don't go far.
+    const lookback = Math.max(0, candidate - 3)
+    for (let i = candidate; i >= lookback; i--) {
+      if (committed[i].end >= t) return i
+    }
+    return candidate
   }, [committed, t])
+
+  // **Monotonic forward-only guard.**
+  // Track t-deltas to detect explicit user seek-back. During normal
+  // forward playback, cursor only advances (never retreats), even if a
+  // new committed batch revises earlier word timestamps. On user seek
+  // backward (>0.5s reverse), drop the guard and let cursor re-anchor.
+  useEffect(() => {
+    if (t < lastTRef.current - 0.5) {
+      lastIdxRef.current = -1 // reset monotonic guard after user seek-back
+    }
+    lastTRef.current = t
+  }, [t])
 
   useEffect(() => {
     const container = containerRef.current
     const line = lineRef.current
     if (!container || !line) return
     if (activeIdx < 0) {
-      line.style.opacity = '0'
+      // No committed words yet (warm-up) — only hide if we never showed.
+      if (lastIdxRef.current < 0) line.style.opacity = '0'
+      // Otherwise keep the last good position; cursor doesn't disappear
+      // mid-session if the words array shrinks or t drops below the first.
       return
     }
-    // The effect only fires when activeIdx changes (deps below) — by
-    // construction the underline only needs to move at word boundaries
-    // (a few Hz at most), not every 60Hz currentTime tick. Dropping `t`
-    // from deps removes the per-frame effect-runner overhead that was
-    // showing up as waveform stutter in the text view.
+    // Monotonic guard: never move backward during forward playback.
+    // lastTRef-based seek-back reset (above) handles the legitimate
+    // backward case by clearing lastIdxRef.
+    if (activeIdx < lastIdxRef.current) return
     if (activeIdx === lastIdxRef.current) return
     lastIdxRef.current = activeIdx
     const wordEl = container.querySelector<HTMLSpanElement>(

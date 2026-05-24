@@ -7,7 +7,6 @@ import { formatTime } from '../lib/format'
 interface Props {
   result: TranscriptionResponse | null
   filename: string
-  currentTime: number
   /** True while partials are still arriving (live mic / progressive WS). Drives
    * the smoothstep fade-in reveal. For a finalized result we just colour
    * words by playback position — no fade. */
@@ -37,10 +36,16 @@ const NULL_TIPS: Record<string, string> = {
   seek: 'Not populated for now.',
 }
 
-export function TranscriptSection({
+/**
+ * Wrapped in React.memo so peaks-driven re-renders in App.tsx (~15Hz
+ * during URL playback) don't cascade into the transcript subtree.
+ * Currents-time-driven highlight tracking happens INSIDE the section
+ * (VerboseBody self-subscribes) so we don't need currentTime as a
+ * prop — that was the channel that defeated memo before.
+ */
+export const TranscriptSection = memo(function TranscriptSection({
   result,
   filename,
-  currentTime,
   live,
   segmentArrivals,
   wordArrivals,
@@ -158,7 +163,6 @@ export function TranscriptSection({
           <VerboseBody
             body={verboseBody}
             view={view}
-            currentTime={currentTime}
             filename={filename}
             live={live}
             segmentArrivals={segmentArrivals}
@@ -178,12 +182,11 @@ export function TranscriptSection({
       )}
     </section>
   )
-}
+})
 
 function VerboseBody({
   body,
   view,
-  currentTime,
   filename,
   live,
   segmentArrivals,
@@ -193,12 +196,6 @@ function VerboseBody({
 }: {
   body: VerboseJsonResponse
   view: View
-  /** Word + segments views still depend on currentTime for the
-   * active-row highlight — that's a per-tick visual on a single element,
-   * which React handles cheaply. The text view is the one we detached
-   * (PlainText no longer takes currentTime; ActiveWordTracker drives
-   * the underline imperatively). */
-  currentTime: number
   filename: string
   live: boolean
   segmentArrivals: Map<number, number>
@@ -206,29 +203,11 @@ function VerboseBody({
   partialSegment: WhisperSegment | null
   partialWords: Word[]
 }) {
-  const activeSegIdx = useMemo(
-    () => body.segments.findIndex((s) => currentTime >= s.start && currentTime <= s.end),
-    [body.segments, currentTime],
-  )
-  const activeWordIdx = useMemo(() => {
-    const words = body.words
-    if (!words || words.length === 0) return -1
-    if (currentTime < words[0].start) return -1
-    let lo = 0,
-      hi = words.length - 1,
-      found = -1
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1
-      if (words[mid].start <= currentTime) {
-        found = mid
-        lo = mid + 1
-      } else {
-        hi = mid - 1
-      }
-    }
-    return found
-  }, [body.words, currentTime])
-
+  // Text view doesn't need currentTime at all — ActiveWordTracker
+  // subscribes itself + drives the underline imperatively. Bypass the
+  // 60Hz useCurrentTime subscription so the heavy editorial-body
+  // subtree doesn't reconcile every tick (peaks + canvas redraws then
+  // share the main thread without contention → no waveform stutter).
   if (view === 'text')
     return (
       <PlainText
@@ -240,17 +219,76 @@ function VerboseBody({
     )
   if (view === 'segments')
     return (
-      <SegmentRows
+      <SegmentsView
         segments={body.segments}
-        activeIdx={activeSegIdx}
         live={live}
         segmentArrivals={segmentArrivals}
         partialSegment={partialSegment}
       />
     )
   if (view === 'words')
-    return <WordsGrid body={body} activeIdx={activeWordIdx} partialWords={partialWords} />
+    return <WordsView body={body} partialWords={partialWords} />
   return <Code text={JSON.stringify(body, null, 2)} filename={filename} syntaxColor />
+}
+
+// Thin wrappers that subscribe to currentTime + compute activeIdx, so
+// the work happens at the view level rather than VerboseBody — keeps
+// the text-view path completely off the per-tick re-render cascade.
+
+function SegmentsView({
+  segments,
+  live,
+  segmentArrivals,
+  partialSegment,
+}: {
+  segments: WhisperSegment[]
+  live: boolean
+  segmentArrivals: Map<number, number>
+  partialSegment: WhisperSegment | null
+}) {
+  const t = useCurrentTime()
+  const activeIdx = useMemo(
+    () => segments.findIndex((s) => t >= s.start && t <= s.end),
+    [segments, t],
+  )
+  return (
+    <SegmentRows
+      segments={segments}
+      activeIdx={activeIdx}
+      live={live}
+      segmentArrivals={segmentArrivals}
+      partialSegment={partialSegment}
+    />
+  )
+}
+
+function WordsView({
+  body,
+  partialWords,
+}: {
+  body: VerboseJsonResponse
+  partialWords: Word[]
+}) {
+  const t = useCurrentTime()
+  const activeIdx = useMemo(() => {
+    const words = body.words
+    if (!words || words.length === 0) return -1
+    if (t < words[0].start) return -1
+    let lo = 0,
+      hi = words.length - 1,
+      found = -1
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      if (words[mid].start <= t) {
+        found = mid
+        lo = mid + 1
+      } else {
+        hi = mid - 1
+      }
+    }
+    return found
+  }, [body.words, t])
+  return <WordsGrid body={body} activeIdx={activeIdx} partialWords={partialWords} />
 }
 
 // ── Plain text view with reveal animation ─────────────────────────
@@ -427,13 +465,15 @@ function ActiveWordTracker({
     const container = containerRef.current
     const line = lineRef.current
     if (!container || !line) return
-    if (activeIdx < 0 || t <= 0) {
+    if (activeIdx < 0) {
       line.style.opacity = '0'
       return
     }
-    // Skip the DOM measure when the active word hasn't actually changed
-    // — currentTime ticks ~60 Hz but the underline only moves at word
-    // boundaries (a few Hz at most).
+    // The effect only fires when activeIdx changes (deps below) — by
+    // construction the underline only needs to move at word boundaries
+    // (a few Hz at most), not every 60Hz currentTime tick. Dropping `t`
+    // from deps removes the per-frame effect-runner overhead that was
+    // showing up as waveform stutter in the text view.
     if (activeIdx === lastIdxRef.current) return
     lastIdxRef.current = activeIdx
     const wordEl = container.querySelector<HTMLSpanElement>(
@@ -443,11 +483,14 @@ function ActiveWordTracker({
     const cRect = container.getBoundingClientRect()
     const wRect = wordEl.getBoundingClientRect()
     line.style.opacity = '1'
+    // Sit the underline a hair below the word baseline rather than the
+    // bounding-box bottom — feels tucked to the descender rather than
+    // floating in space.
     line.style.transform = `translate(${wRect.left - cRect.left}px, ${
-      wRect.bottom - cRect.top + 2
+      wRect.bottom - cRect.top - 2
     }px)`
     line.style.width = `${wRect.width}px`
-  }, [activeIdx, t, containerRef])
+  }, [activeIdx, containerRef])
 
   // Re-measure on window resize — line wraps shift word positions, and
   // the imperative style cache (`lastIdxRef`) would otherwise stick at

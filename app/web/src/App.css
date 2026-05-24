@@ -1045,7 +1045,8 @@ body {
   padding-top: 2px;
   white-space: nowrap;
 }
-.segs-row--active .segs-row__t {
+.segs-row--active .segs-row__t,
+.segs-row--active .segs-row__t-end {
   color: var(--accent);
 }
 .segs-row__t-end {

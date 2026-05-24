@@ -492,7 +492,6 @@ export default function App() {
           <TranscriptSection
             result={result}
             filename={loaded?.title ?? 'transcript'}
-            currentTime={currentTime}
             live={live}
             segmentArrivals={arrivalRef.current}
             wordArrivals={wordArrivalRef.current}

@@ -49,32 +49,48 @@ export function FooterRail({
   const offlineRtfx = asr && asr > 0 ? verbose!.duration / asr : null
   const offlineLabel = offlineRtfx != null ? offlineRtfx.toFixed(1) + '×' : '—'
   let rtfxLabel = offlineLabel
-  let rtfxTip = ''
+  // Tooltip starts with offline-headroom info (when available) and
+  // appends raw counters in live mode for diagnostic transparency —
+  // the cap at min(1, committed/received) is hiding the true
+  // lag/overshoot otherwise.
+  const tipParts: string[] = []
+  if (offlineRtfx != null && live) {
+    tipParts.push(`headroom: ${offlineRtfx.toFixed(1)}× (asr_time vs duration)`)
+  }
   if (live) {
     // Live ratio expressed in **speech-seconds** so silence/music drops
     // out symmetrically. Server tracks Silero-detected speech in
     // (a) `speech_received_s` (cumulative wall-clock speech ingested)
-    // and (b) `speech_committed_s` (sum of committed segment durations).
-    // Ratio is bounded above by 1.0 (committed cannot exceed received);
-    // it asymptotes to (received - chunk_lag) / received during
-    // continuous speech, and dips only if the engine genuinely backlogs.
+    // and (b) `speech_committed_s` (sum of committed segment spans
+    // post-translation). Capped at 1.0 because committed segments can
+    // span more wall-time than VAD classified as speech (brief mid-
+    // sentence pauses below threshold).
     const received = verbose?.speech_received_s ?? 0
     const committed = verbose?.speech_committed_s ?? 0
+    const audio = verbose?.audio_received_s ?? 0
     // Warm-up guard: until we have a meaningful denominator the ratio
     // is too noisy to display. Also covers "Silero not loaded" (counters
     // never arrive → both stay at 0 → show —).
     if (received >= 1.0) {
-      const ratio = Math.min(1.0, committed / received)
+      const rawRatio = committed / received
+      const ratio = Math.min(1.0, rawRatio)
       const tag = ratio >= 0.9 ? 'LIVE' : 'falling behind'
       rtfxLabel = `${ratio.toFixed(2)}× ${tag}`
-      rtfxTip =
-        offlineRtfx != null
-          ? `headroom: ${offlineRtfx.toFixed(1)}× (asr_time vs duration)`
-          : ''
+      tipParts.push(
+        `received ${received.toFixed(1)}s speech / ${audio.toFixed(1)}s audio`,
+      )
+      tipParts.push(
+        `committed ${committed.toFixed(1)}s` +
+          (rawRatio > 1 ? ` (raw ratio ${rawRatio.toFixed(2)}× capped at 1.00×)` : ''),
+      )
     } else {
       rtfxLabel = '—'
+      tipParts.push(
+        `warming up — need ≥ 1.0s speech (have ${received.toFixed(1)}s)`,
+      )
     }
   }
+  const rtfxTip = tipParts.join('\n')
   const segs = verbose ? verbose.segments.length : '—'
   const words = verbose?.words?.length ?? '—'
   const asrLabel = asr ? `${asr.toFixed(2)}s` : '—'

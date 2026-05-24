@@ -61,13 +61,6 @@ export interface Settings {
 
   theme: ThemeMode
 
-  /** When true, newly-arrived transcript words cascade in one-by-one
-   * (CSS animation-delay stagger by index-within-batch) rather than
-   * all flashing at once. Purely cosmetic; matches the cadence of
-   * natural reading speed and feels closer to "text appearing as it's
-   * spoken" than the batch reveal does. */
-  typewriter: boolean
-
   set: <K extends keyof Settings>(key: K, value: Settings[K]) => void
   /** Per-modality partial patcher — collapses prop-drilling of individual
    * setters in the sidebar. */
@@ -108,7 +101,6 @@ const DEFAULTS: Omit<Settings, 'set' | 'update' | 'reset'> = {
   url: { ...COMMON_DEFAULTS, liveLatency: true },
   mic: { ...MIC_DEFAULTS },
   theme: 'system',
-  typewriter: true,
 }
 
 export const useSettings = create<Settings>()(

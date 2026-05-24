@@ -396,13 +396,17 @@ export default function App() {
     }
   }, [])
 
+  // Live indicator is purely the anchor state (set by Live click, cleared
+  // on pause/seek). The 10s diff backstop only applies when we HAVE a
+  // server-side audio_received signal — otherwise we trust liveAnchored
+  // alone. This way the dot lights up the instant Live is clicked,
+  // regardless of whether transcription has started feeding counters yet.
   const audioReceived =
     result?.format === 'verbose_json' ? result.body.audio_received_s ?? 0 : 0
   const atLiveEdge =
     loaded?.kind === 'url' &&
     liveAnchored &&
-    audioReceived > 0 &&
-    audioReceived - currentTime < 10.0
+    (audioReceived <= 0 || audioReceived - currentTime < 10.0)
 
   /** Jump the playback element to the "live edge" — the latest audio
    * we have. Source of truth is the server's `audio_received_s` counter
@@ -486,7 +490,6 @@ export default function App() {
             onNextSegment={seekNextSegment}
             onLiveEdge={seekLiveEdge}
             atLiveEdge={atLiveEdge}
-            live={live}
           />
           {error && <div className="error">{error}</div>}
           <TranscriptSection

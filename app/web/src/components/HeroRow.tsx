@@ -33,13 +33,9 @@ interface Props {
   onNextSegment: () => void
   /** Jump a live URL stream's <audio> element to its live edge. */
   onLiveEdge: () => void
-  /** True when audio playhead is within ~2s of server's audio_received_s.
-   * Drives the red-dot indicator on the Live button — lit when you ARE
-   * live, hollow when you have catching up to do. */
+  /** True when the playhead is anchored to the live edge (set on Live
+   * click, cleared on pause/seek). Drives the red-dot indicator. */
   atLiveEdge: boolean
-  /** True while partials are still arriving — used to show the Live
-   * jump button (URL streams only). */
-  live: boolean
 }
 
 const PlayIcon = ({ size = 20 }: { size?: number }) => (
@@ -105,15 +101,16 @@ export function HeroRow({
   onNextSegment,
   onLiveEdge,
   atLiveEdge,
-  live,
 }: Props) {
   const t = useCurrentTime()
   const dur = useDuration()
   const playing = useIsPlaying()
   const progress = dur > 0 ? Math.round((t / dur) * 100) : 0
-  // Live button is only meaningful for URL streams that are actively
-  // being fed — a file or finished recording has no head to seek to.
-  const showLive = loaded?.kind === 'url' && (live || playing)
+  // Live button shows for any URL source — decoupled from transcription
+  // state. seekLiveEdge falls back to seekable.end when the server's
+  // audio_received_s isn't available, so it works from the moment the
+  // URL is loaded (even before WS streaming starts).
+  const showLive = loaded?.kind === 'url'
 
   return (
     <section className="hero spin-in" key={loaded?.title ?? 'empty'}>

@@ -393,9 +393,14 @@ export default function App() {
   const SYNC_LEAD = 0.3
 
   const latestEnd = useMemo(() => {
-    if (segments.length > 0) return segments[segments.length - 1].end
-    if (partialSegment) return partialSegment.end
-    return 0
+    // Take the latest of (committed_last, partial) so Sync's boundary
+    // tracks the in-flight sentence too. With partials emitted ~250ms
+    // apart this shrinks the gating delay from ~chunk-lag (10s) to
+    // ~250ms — pause/resume becomes invisible and Sync turns into a
+    // usable "cursor always has a word" read-along mode.
+    const committed = segments.length > 0 ? segments[segments.length - 1].end : 0
+    const partial = partialSegment ? partialSegment.end : 0
+    return Math.max(committed, partial)
   }, [segments, partialSegment])
 
   const toggleSync = () => {
@@ -431,22 +436,26 @@ export default function App() {
     }
   }, [syncOn, audioPlaying, autoPaused, currentTime, latestEnd])
 
-  /** Jump the playback element to the live edge of an HLS / icecast
-   * source. Only meaningful for URL streams that are still being fed;
-   * file / finished recordings have a fixed end. */
+  /** Jump the playback element to the live edge — the leading edge of
+   * what the browser has buffered. Same idea as the "Live" button in a
+   * YouTube/Twitch player. Prefers `audio.seekable.end(last)` because
+   * `audio.duration` lies on some HLS sources (reports the playlist
+   * window end, not the broadcast head); seekable is always what's
+   * actually been fetched. Falls back to duration if seekable is empty
+   * (some non-stream sources). No safety buffer — we want exactly the
+   * leading edge; for live broadcasts the browser keeps fetching past
+   * it. */
   const seekLiveEdge = useCallback(() => {
     if (loaded?.kind !== 'url') return
     const el = getAudioElement()
     let edge = 0
-    if (isFinite(el.duration) && el.duration > 0) {
-      edge = el.duration
-    } else if (el.seekable && el.seekable.length > 0) {
+    if (el.seekable && el.seekable.length > 0) {
       edge = el.seekable.end(el.seekable.length - 1)
+    } else if (isFinite(el.duration) && el.duration > 0) {
+      edge = el.duration
     }
     if (edge > 0) {
-      // Step back ~1 s — sitting at the absolute end often pins the
-      // browser's playback policy and stops fresh chunks from playing.
-      seek(Math.max(0, edge - 1))
+      seek(edge)
       play()
     }
   }, [loaded?.kind])

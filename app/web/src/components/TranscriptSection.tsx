@@ -251,6 +251,12 @@ function SegmentsView({
     () => segments.findIndex((s) => t >= s.start && t <= s.end),
     [segments, t],
   )
+  // Partial segment is "active" when current time has reached its
+  // start. End may not be authoritative (engine is still extending it),
+  // so don't gate on t <= partial.end — once playback enters the
+  // in-flight sentence, light it up.
+  const partialActive =
+    partialSegment !== null && t >= partialSegment.start
   return (
     <SegmentRows
       segments={segments}
@@ -258,6 +264,7 @@ function SegmentsView({
       live={live}
       segmentArrivals={segmentArrivals}
       partialSegment={partialSegment}
+      partialActive={partialActive}
     />
   )
 }
@@ -271,23 +278,31 @@ function WordsView({
 }) {
   const t = useCurrentTime()
   const activeIdx = useMemo(() => {
-    const words = body.words
-    if (!words || words.length === 0) return -1
-    if (t < words[0].start) return -1
-    let lo = 0,
-      hi = words.length - 1,
-      found = -1
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1
-      if (words[mid].start <= t) {
-        found = mid
-        lo = mid + 1
+    const committed = body.words ?? []
+    if (committed.length === 0 && partialWords.length === 0) return -1
+    let found = -1
+    if (committed.length > 0 && t >= committed[0].start) {
+      let lo = 0,
+        hi = committed.length - 1
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1
+        if (committed[mid].start <= t) {
+          found = mid
+          lo = mid + 1
+        } else {
+          hi = mid - 1
+        }
+      }
+    }
+    for (let i = 0; i < partialWords.length; i++) {
+      if (partialWords[i].start <= t) {
+        found = committed.length + i
       } else {
-        hi = mid - 1
+        break
       }
     }
     return found
-  }, [body.words, t])
+  }, [body.words, partialWords, t])
   return <WordsGrid body={body} activeIdx={activeIdx} partialWords={partialWords} />
 }
 
@@ -417,7 +432,11 @@ function PlainText({
         wordArrivals={wordArrivals}
         partialWords={partialWords}
       />
-      <ActiveWordTracker words={body.words ?? []} containerRef={containerRef} />
+      <ActiveWordTracker
+        committed={body.words ?? []}
+        partialWords={partialWords}
+        containerRef={containerRef}
+      />
     </div>
   )
 }
@@ -430,36 +449,53 @@ function PlainText({
  * style write rather than React state — the only DOM mutation per tick
  * is the four style fields on a single element. */
 function ActiveWordTracker({
-  words,
+  committed,
+  partialWords,
   containerRef,
 }: {
-  words: Word[]
+  committed: Word[]
+  partialWords: Word[]
   containerRef: React.RefObject<HTMLDivElement | null>
 }) {
   const t = useCurrentTime()
   const lineRef = useRef<HTMLSpanElement | null>(null)
   const lastIdxRef = useRef<number>(-1)
 
-  // Binary search for the last word whose start time is <= currentTime.
-  // Mirrors the previous lookup; preserves the no-flicker behavior for
-  // overlapping word timestamps (engine 80 ms encoder-stride quantization).
+  // Binary search over COMMITTED first, then linear walk through PARTIAL
+  // for the in-flight sentence. data-word-idx in WordList runs
+  // 0..committedCount+partialCount-1, so a partial hit yields index
+  // committed.length + partialIdx — same DOM node the cursor can land on.
+  // Partial words may shuffle/extend as the engine decodes; the cursor
+  // tracks the latest model output. Acceptable trade-off for letting the
+  // underline live on preview text instead of dying at the last commit.
   const activeIdx = useMemo(() => {
-    if (!words || words.length === 0) return -1
-    if (t < words[0].start) return -1
-    let lo = 0,
-      hi = words.length - 1,
-      found = -1
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1
-      if (words[mid].start <= t) {
-        found = mid
-        lo = mid + 1
+    if (committed.length === 0 && partialWords.length === 0) return -1
+    // First: committed binary search.
+    let found = -1
+    if (committed.length > 0 && t >= committed[0].start) {
+      let lo = 0,
+        hi = committed.length - 1
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1
+        if (committed[mid].start <= t) {
+          found = mid
+          lo = mid + 1
+        } else {
+          hi = mid - 1
+        }
+      }
+    }
+    // Then: linear walk through partial (usually <20 words) for any
+    // newer hit. Partial words always come AFTER committed in audio time.
+    for (let i = 0; i < partialWords.length; i++) {
+      if (partialWords[i].start <= t) {
+        found = committed.length + i
       } else {
-        hi = mid - 1
+        break
       }
     }
     return found
-  }, [words, t])
+  }, [committed, partialWords, t])
 
   useEffect(() => {
     const container = containerRef.current
@@ -537,12 +573,16 @@ function SegmentRows({
   live,
   segmentArrivals,
   partialSegment,
+  partialActive = false,
 }: {
   segments: WhisperSegment[]
   activeIdx: number
   live: boolean
   segmentArrivals: Map<number, number>
   partialSegment: WhisperSegment | null
+  /** When true, the partial-segment row gets `--active` styling so the
+   * playhead's active highlight extends into in-flight preview text. */
+  partialActive?: boolean
 }) {
   const [openId, setOpenId] = useState<number | null>(null)
 
@@ -572,7 +612,7 @@ function SegmentRows({
   return (
     <div className="segs-list">
       {rows.map(({ seg: s, partial, activeIdx: i }) => {
-        const active = !partial && i === activeIdx
+        const active = partial ? partialActive : i === activeIdx
         const open = !partial && openId === s.id
         const reveal = !partial && live && segmentArrivals.has(s.id)
         const cls = [

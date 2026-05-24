@@ -3,6 +3,7 @@ import type { TranscriptionResponse } from '../lib/api'
 import type { VerboseJsonResponse, WhisperSegment, Word } from '../lib/types'
 import { play, seek, useCurrentTime } from '../lib/playback'
 import { formatTime } from '../lib/format'
+import { useSettings } from '../lib/settings'
 
 interface Props {
   result: TranscriptionResponse | null
@@ -16,6 +17,9 @@ interface Props {
   segmentArrivals: Map<number, number>
   /** Map of word-index → arrival ms. Drives the text view's word reveal. */
   wordArrivals: Map<number, number>
+  /** Map of word-index → 0-based offset within its arrival batch. Powers
+   * the typewriter stagger (each word's `animation-delay` is offset × STRIDE). */
+  wordBatchOffsets: Map<number, number>
   /** Engine's in-flight sentence buffer — uncommitted tokens streamed
    * by the server between actual .!? commits. Rendered as dimmed text
    * at the end of the transcript so the user sees words appear as the
@@ -49,9 +53,12 @@ export const TranscriptSection = memo(function TranscriptSection({
   live,
   segmentArrivals,
   wordArrivals,
+  wordBatchOffsets,
   partialSegment,
   partialWords,
 }: Props) {
+  const typewriter = useSettings((s) => s.typewriter)
+  const setTypewriter = useSettings((s) => s.set)
   const [view, setView] = useState<View>('text')
   const bodyRef = useRef<HTMLDivElement | null>(null)
   // `stuck` = pinned to the bottom (auto-follow). Scrolling up breaks
@@ -128,14 +135,25 @@ export const TranscriptSection = memo(function TranscriptSection({
           }
         : null
 
-  const formatLabel = result ? result.format : 'verbose_json'
-
   return (
     <section className="transcript">
       <div className="transcript__head">
         <div className="transcript__head-l">
           <span className="label-eyebrow">TRANSCRIPT</span>
-          <span className="format-pill">{formatLabel}</span>
+          <button
+            type="button"
+            className={
+              typewriter
+                ? 'ma-pill ma-pill--sm ma-pill--active'
+                : 'ma-pill ma-pill--sm'
+            }
+            onClick={() => setTypewriter('typewriter', !typewriter)}
+            aria-pressed={typewriter}
+            title="Typewriter reveal — staggers new words instead of flashing them in batches"
+          >
+            <TypewriterIcon />
+            Typewriter
+          </button>
         </div>
         {verboseBody && (
           <div className="ma-segmented">
@@ -167,6 +185,8 @@ export const TranscriptSection = memo(function TranscriptSection({
             live={live}
             segmentArrivals={segmentArrivals}
             wordArrivals={wordArrivals}
+            wordBatchOffsets={wordBatchOffsets}
+            typewriter={typewriter}
             partialSegment={partialSegment ?? null}
             partialWords={partialWords ?? []}
           />
@@ -191,6 +211,8 @@ function VerboseBody({
   live,
   segmentArrivals,
   wordArrivals,
+  wordBatchOffsets,
+  typewriter,
   partialSegment,
   partialWords,
 }: {
@@ -200,6 +222,8 @@ function VerboseBody({
   live: boolean
   segmentArrivals: Map<number, number>
   wordArrivals: Map<number, number>
+  wordBatchOffsets: Map<number, number>
+  typewriter: boolean
   partialSegment: WhisperSegment | null
   partialWords: Word[]
 }) {
@@ -214,6 +238,8 @@ function VerboseBody({
         body={body}
         live={live}
         wordArrivals={wordArrivals}
+        wordBatchOffsets={wordBatchOffsets}
+        typewriter={typewriter}
         partialWords={partialWords}
       />
     )
@@ -358,6 +384,7 @@ const Word = memo(function Word({
   reveal,
   partial,
   isLast,
+  staggerDelayMs,
 }: {
   idx: number
   word: string
@@ -365,15 +392,23 @@ const Word = memo(function Word({
   reveal: boolean
   partial: boolean
   isLast: boolean
+  /** When > 0 and `reveal` is true, delays the CSS reveal animation by
+   * this many ms — drives the typewriter cascade across a partial
+   * batch's words. */
+  staggerDelayMs: number
 }) {
   const classes = ['editorial-word']
   if (partial) classes.push('editorial-word--partial')
   if (reveal) classes.push('word-reveal')
+  const style = reveal && staggerDelayMs > 0
+    ? { animationDelay: `${staggerDelayMs}ms` }
+    : undefined
   return (
     <>
       <span
         className={classes.join(' ')}
         data-word-idx={idx}
+        style={style}
         onClick={() => {
           seek(start)
           play()
@@ -394,22 +429,32 @@ const WordList = memo(function WordList({
   body,
   live,
   wordArrivals,
+  wordBatchOffsets,
+  typewriter,
   partialWords,
 }: {
   body: VerboseJsonResponse
   live: boolean
   wordArrivals: Map<number, number>
+  wordBatchOffsets: Map<number, number>
+  typewriter: boolean
   partialWords: Word[]
 }) {
   const committed = body.words ?? []
   const committedCount = committed.length
   const total = committedCount + partialWords.length
+  // 80ms per word feels close to typewriter pace without dragging out
+  // long batches. 10 words = ~800ms of cascade, hidden inside the
+  // existing 380ms wordReveal opacity ramp.
+  const STAGGER_MS = 80
   return (
     <>
       {Array.from({ length: total }).map((_unused, i) => {
         const isPartial = i >= committedCount
         const w = isPartial ? partialWords[i - committedCount] : committed[i]
         const isLast = i === total - 1
+        const reveal = !isPartial && live && wordArrivals.has(i)
+        const offset = typewriter && reveal ? wordBatchOffsets.get(i) ?? 0 : 0
         return (
           <Word
             key={i}
@@ -417,8 +462,9 @@ const WordList = memo(function WordList({
             word={w.word}
             start={w.start}
             partial={isPartial}
-            reveal={!isPartial && live && wordArrivals.has(i)}
+            reveal={reveal}
             isLast={isLast}
+            staggerDelayMs={offset * STAGGER_MS}
           />
         )
       })}
@@ -430,6 +476,8 @@ function PlainText({
   body,
   live,
   wordArrivals,
+  wordBatchOffsets,
+  typewriter,
   partialWords,
 }: {
   body: VerboseJsonResponse
@@ -437,6 +485,8 @@ function PlainText({
    * arrival-based fade-in. False for finalized results. */
   live: boolean
   wordArrivals: Map<number, number>
+  wordBatchOffsets: Map<number, number>
+  typewriter: boolean
   partialWords: Word[]
 }) {
   const committed = body.words ?? []
@@ -452,6 +502,8 @@ function PlainText({
         body={body}
         live={live}
         wordArrivals={wordArrivals}
+        wordBatchOffsets={wordBatchOffsets}
+        typewriter={typewriter}
         partialWords={partialWords}
       />
       <ActiveWordTracker
@@ -782,6 +834,15 @@ function WordsGrid({
     </div>
   )
 }
+
+// ── Header toggle icon ────────────────────────────────────────────
+const TypewriterIcon = () => (
+  <svg viewBox="0 0 24 24" width={10} height={10} fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+    <path d="M5 7l2-3h10l2 3" />
+    <rect x="3" y="7" width="18" height="10" rx="1.5" />
+    <path d="M7 12h.01M10 12h.01M13 12h.01M16 12h.01M7 15h10" />
+  </svg>
+)
 
 // ── Code block with Copy + Expand controls ─────────────────────────
 const CopyIcon = () => (

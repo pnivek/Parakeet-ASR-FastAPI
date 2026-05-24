@@ -61,6 +61,13 @@ export default function App() {
   /** Per-word-index arrival timestamps, same idea — drives the streaming
    * word reveal in the text view. */
   const wordArrivalRef = useRef<Map<number, number>>(new Map())
+  /** Per-word index-within-batch (0, 1, 2, ...) — drives the typewriter
+   * mode's animation-delay stagger. Words in the same partial batch
+   * share an arrival timestamp; this map records each word's offset
+   * from its batch's first index, so WordList can apply
+   * `animation-delay: offset * STRIDE` without walking back through
+   * `wordArrivals` to find the batch start. */
+  const wordBatchOffsetRef = useRef<Map<number, number>>(new Map())
   /** Highest segment.id we've already stamped — lets us O(new) the arrival
    * walk instead of O(total). Segments are emitted with monotonically
    * increasing ids; words are append-only by index. */
@@ -124,6 +131,7 @@ export default function App() {
     setLive(false) // finalized — drop the streaming reveal
     arrivalRef.current = new Map() // settled results don't need arrival fades
     wordArrivalRef.current = new Map()
+    wordBatchOffsetRef.current = new Map()
     maxSeenSegIdRef.current = -1
     wordArrivalCountRef.current = 0
     if (l.kind === 'file') {
@@ -171,8 +179,10 @@ export default function App() {
       }
       if (r.body.words) {
         const total = r.body.words.length
-        for (let i = wordArrivalCountRef.current; i < total; i++) {
+        const batchStart = wordArrivalCountRef.current
+        for (let i = batchStart; i < total; i++) {
           wordArrivalRef.current.set(i, now)
+          wordBatchOffsetRef.current.set(i, i - batchStart)
         }
         if (total > wordArrivalCountRef.current) {
           wordArrivalCountRef.current = total
@@ -203,6 +213,7 @@ export default function App() {
     setTtfs(null)
     arrivalRef.current = new Map()
     wordArrivalRef.current = new Map()
+    wordBatchOffsetRef.current = new Map()
     maxSeenSegIdRef.current = -1
     wordArrivalCountRef.current = 0
     setLiveAnchored(false)
@@ -498,6 +509,7 @@ export default function App() {
             live={live}
             segmentArrivals={arrivalRef.current}
             wordArrivals={wordArrivalRef.current}
+            wordBatchOffsets={wordBatchOffsetRef.current}
             partialSegment={partialSegment}
             partialWords={partialWords}
           />

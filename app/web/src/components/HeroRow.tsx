@@ -31,8 +31,6 @@ interface Props {
   /** Seek to the previous / next segment start. */
   onPrevSegment: () => void
   onNextSegment: () => void
-  /** Pause + seek 0 (what the old single "Reset" button did). */
-  onRewind: () => void
   /** Jump a live URL stream's <audio> element to its live edge. */
   onLiveEdge: () => void
   /** True when audio playhead is within ~2s of server's audio_received_s.
@@ -63,12 +61,6 @@ const PrevIcon = () => (
 const NextIcon = () => (
   <svg viewBox="0 0 24 24" width={13} height={13} fill="currentColor" aria-hidden>
     <path d="M16 5h2v14h-2zM4 5l10 7-10 7z" />
-  </svg>
-)
-const RewindIcon = () => (
-  <svg viewBox="0 0 24 24" width={13} height={13} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" aria-hidden>
-    <path d="M19 12a7 7 0 1 1-2-4.9" />
-    <path d="M19 4v5h-5" />
   </svg>
 )
 const LiveDotIcon = ({ filled }: { filled: boolean }) => (
@@ -111,7 +103,6 @@ export function HeroRow({
   hasSegments,
   onPrevSegment,
   onNextSegment,
-  onRewind,
   onLiveEdge,
   atLiveEdge,
   live,
@@ -219,17 +210,6 @@ export function HeroRow({
           title="Next segment"
         >
           <NextIcon />
-        </button>
-        <button
-          type="button"
-          className="ma-pill ma-pill--lg"
-          onClick={onRewind}
-          disabled={!loaded}
-          aria-label="Rewind to start"
-          title="Rewind"
-        >
-          <RewindIcon />
-          Rewind
         </button>
         {showLive && (
           <button

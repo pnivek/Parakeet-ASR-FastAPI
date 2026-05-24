@@ -3,7 +3,6 @@ import type { TranscriptionResponse } from './lib/api'
 import {
   getAudioElement,
   getPlaybackAnalyser,
-  pause,
   play,
   seek,
   setAudioFile,
@@ -367,11 +366,6 @@ export default function App() {
     play()
   }, [segments, currentTime])
 
-  const rewind = useCallback(() => {
-    pause()
-    seek(0)
-  }, [])
-
   // Whether the playhead is currently at (or near) the live edge — drives
   // the red-dot indicator on the Live button. Threshold matches the
   // implicit "you can read along with this" window; small enough that
@@ -451,7 +445,6 @@ export default function App() {
             hasSegments={segments.length > 0}
             onPrevSegment={seekPrevSegment}
             onNextSegment={seekNextSegment}
-            onRewind={rewind}
             onLiveEdge={seekLiveEdge}
             atLiveEdge={atLiveEdge}
             live={live}

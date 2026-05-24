@@ -55,8 +55,9 @@ test('Maison v6 UI — boots, modality tabs switch, per-tab engine picker works'
   await expect(page.getByRole('button', { name: /Previous segment/i })).toBeVisible()
   await expect(page.getByRole('button', { name: /Next segment/i })).toBeVisible()
   await expect(page.getByRole('button', { name: /^Play$/ })).toBeVisible()
-  await expect(page.getByRole('button', { name: /Rewind/i })).toBeVisible()
-  // Sync was removed — cursor + Live cover the alignment use case now.
+  // Rewind + Sync both removed — waveform click-to-seek covers the
+  // back-to-start case, and the cursor + Live cover the alignment case.
+  await expect(page.getByRole('button', { name: /Rewind/i })).toHaveCount(0)
   await expect(page.getByRole('button', { name: /^Sync$/ })).toHaveCount(0)
 
   // URL tab — URL input + Engine picker.

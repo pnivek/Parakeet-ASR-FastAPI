@@ -251,6 +251,11 @@ function SegmentsView({
     () => segments.findIndex((s) => t >= s.start && t <= s.end),
     [segments, t],
   )
+  // Partial row is "active" once playback reaches its start; we don't
+  // gate on end because the engine is still extending it. Lets the
+  // active highlight follow the cursor into preview text.
+  const partialActive =
+    partialSegment !== null && t >= partialSegment.start
   return (
     <SegmentRows
       segments={segments}
@@ -258,6 +263,7 @@ function SegmentsView({
       live={live}
       segmentArrivals={segmentArrivals}
       partialSegment={partialSegment}
+      partialActive={partialActive}
     />
   )
 }
@@ -270,32 +276,55 @@ function WordsView({
   partialWords: Word[]
 }) {
   const t = useCurrentTime()
-  // Interval-containment: prefer word whose [start, end] contains t.
-  // Same rationale as ActiveWordTracker (handles overlap from
-  // 80ms-quantized engine timestamps).
+  // Interval-containment across committed + partial — same rule as
+  // ActiveWordTracker. WordsGrid renders partial cells immediately
+  // after committed at index committed.length + partialIdx.
   const activeIdx = useMemo(() => {
-    const words = body.words
-    if (!words || words.length === 0) return -1
-    if (t < words[0].start) return -1
-    let lo = 0,
-      hi = words.length - 1,
-      candidate = -1
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1
-      if (words[mid].start <= t) {
-        candidate = mid
-        lo = mid + 1
-      } else {
-        hi = mid - 1
+    const committed = body.words ?? []
+    if (committed.length === 0 && partialWords.length === 0) return -1
+    let found = -1
+    if (committed.length > 0 && t >= committed[0].start) {
+      let lo = 0,
+        hi = committed.length - 1,
+        candidate = -1
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1
+        if (committed[mid].start <= t) {
+          candidate = mid
+          lo = mid + 1
+        } else {
+          hi = mid - 1
+        }
+      }
+      if (candidate >= 0) {
+        const lookback = Math.max(0, candidate - 3)
+        found = candidate
+        for (let i = candidate; i >= lookback; i--) {
+          if (committed[i].end >= t) {
+            found = i
+            break
+          }
+        }
       }
     }
-    if (candidate < 0) return -1
-    const lookback = Math.max(0, candidate - 3)
-    for (let i = candidate; i >= lookback; i--) {
-      if (words[i].end >= t) return i
+    let partialHit = -1
+    for (let i = 0; i < partialWords.length; i++) {
+      if (partialWords[i].start <= t) partialHit = i
+      else break
     }
-    return candidate
-  }, [body.words, t])
+    if (partialHit >= 0) {
+      let pi = partialHit
+      const lookbackP = Math.max(0, partialHit - 3)
+      for (let i = partialHit; i >= lookbackP; i--) {
+        if (partialWords[i].end >= t) {
+          pi = i
+          break
+        }
+      }
+      found = committed.length + pi
+    }
+    return found
+  }, [body.words, partialWords, t])
   return <WordsGrid body={body} activeIdx={activeIdx} partialWords={partialWords} />
 }
 
@@ -427,6 +456,7 @@ function PlainText({
       />
       <ActiveWordTracker
         committed={body.words ?? []}
+        partialWords={partialWords}
         containerRef={containerRef}
       />
     </div>
@@ -442,9 +472,11 @@ function PlainText({
  * is the four style fields on a single element. */
 function ActiveWordTracker({
   committed,
+  partialWords,
   containerRef,
 }: {
   committed: Word[]
+  partialWords: Word[]
   containerRef: React.RefObject<HTMLDivElement | null>
 }) {
   const t = useCurrentTime()
@@ -452,39 +484,62 @@ function ActiveWordTracker({
   const lastIdxRef = useRef<number>(-1)
   const lastTRef = useRef<number>(0)
 
-  // **Cursor selection — interval containment.**
-  // First binary-search for the latest word whose start ≤ t. Then prefer
-  // the latest word among those that ALSO contains t (start ≤ t ≤ end) —
-  // handles the common case where adjacent word timestamps overlap (the
-  // engine's 80ms encoder-stride quantization makes word boundaries
-  // approximate, so picking "last start ≤ t" alone can land on a word
-  // whose audio plays slightly AFTER what the user is currently hearing).
-  // Between-words case (no containment): fall back to the binary-search
-  // result (cursor parks on the last word that was spoken).
+  // **Cursor selection — interval containment, across committed + partial.**
+  // First binary-search committed for the latest word with start ≤ t,
+  // preferring one whose [start, end] contains t (handles the engine's
+  // ~80ms-quantized timestamp overlap). Then linearly walk PARTIAL
+  // words (always <20) for any newer hit — partials extend the cursor
+  // into in-flight preview text instead of parking at the last commit.
+  // The monotonic guard in the effect below prevents partial-revision
+  // shuffles from yanking the cursor backward.
   const activeIdx = useMemo(() => {
-    if (committed.length === 0) return -1
-    if (t < committed[0].start) return -1
-    let lo = 0,
-      hi = committed.length - 1,
-      candidate = -1
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1
-      if (committed[mid].start <= t) {
-        candidate = mid
-        lo = mid + 1
-      } else {
-        hi = mid - 1
+    if (committed.length === 0 && partialWords.length === 0) return -1
+    let found = -1
+    if (committed.length > 0 && t >= committed[0].start) {
+      let lo = 0,
+        hi = committed.length - 1,
+        candidate = -1
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1
+        if (committed[mid].start <= t) {
+          candidate = mid
+          lo = mid + 1
+        } else {
+          hi = mid - 1
+        }
+      }
+      if (candidate >= 0) {
+        const lookback = Math.max(0, candidate - 3)
+        found = candidate
+        for (let i = candidate; i >= lookback; i--) {
+          if (committed[i].end >= t) {
+            found = i
+            break
+          }
+        }
       }
     }
-    if (candidate < 0) return -1
-    // Walk back a few indices to find a word whose [start, end] contains
-    // t. Word lengths are typically <1s so we don't go far.
-    const lookback = Math.max(0, candidate - 3)
-    for (let i = candidate; i >= lookback; i--) {
-      if (committed[i].end >= t) return i
+    // Walk partial words. They come AFTER committed in audio time.
+    // Pick the LATEST partial whose start ≤ t; prefer one whose end ≥ t
+    // (interval containment) the same way.
+    let partialHit = -1
+    for (let i = 0; i < partialWords.length; i++) {
+      if (partialWords[i].start <= t) partialHit = i
+      else break
     }
-    return candidate
-  }, [committed, t])
+    if (partialHit >= 0) {
+      let pi = partialHit
+      const lookbackP = Math.max(0, partialHit - 3)
+      for (let i = partialHit; i >= lookbackP; i--) {
+        if (partialWords[i].end >= t) {
+          pi = i
+          break
+        }
+      }
+      found = committed.length + pi
+    }
+    return found
+  }, [committed, partialWords, t])
 
   // **Monotonic forward-only guard.**
   // Track t-deltas to detect explicit user seek-back. During normal
@@ -576,12 +631,16 @@ function SegmentRows({
   live,
   segmentArrivals,
   partialSegment,
+  partialActive = false,
 }: {
   segments: WhisperSegment[]
   activeIdx: number
   live: boolean
   segmentArrivals: Map<number, number>
   partialSegment: WhisperSegment | null
+  /** True when audio playback has reached the in-flight partial row's
+   * start — extends the active highlight into preview text. */
+  partialActive?: boolean
 }) {
   const [openId, setOpenId] = useState<number | null>(null)
 
@@ -611,7 +670,7 @@ function SegmentRows({
   return (
     <div className="segs-list">
       {rows.map(({ seg: s, partial, activeIdx: i }) => {
-        const active = !partial && i === activeIdx
+        const active = partial ? partialActive : i === activeIdx
         const open = !partial && openId === s.id
         const reveal = !partial && live && segmentArrivals.has(s.id)
         const cls = [

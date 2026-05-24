@@ -372,11 +372,11 @@ export default function App() {
   // the dot stops glowing as soon as the user falls a few seconds behind.
   const audioReceived =
     result?.format === 'verbose_json' ? result.body.audio_received_s ?? 0 : 0
-  // 3s threshold — leaves headroom for the LIVE_BACKOFF (0.75s) plus
-  // normal playback drift while still going hollow when the user is
-  // meaningfully behind (paused for a while, scrubbed back).
+  // 5s threshold — accommodates the LIVE_BACKOFF (2s) + normal buffer
+  // drift while still flipping hollow when the user has meaningfully
+  // fallen behind (paused for a while, scrubbed back).
   const atLiveEdge =
-    loaded?.kind === 'url' && audioReceived > 0 && audioReceived - currentTime < 3.0
+    loaded?.kind === 'url' && audioReceived > 0 && audioReceived - currentTime < 5.0
 
   /** Jump the playback element to the "live edge" — the latest audio
    * we have. Source of truth is the server's `audio_received_s` counter
@@ -408,13 +408,13 @@ export default function App() {
     if (edge <= 0 && isFinite(el.duration) && el.duration > 0) {
       edge = el.duration
     }
-    // Back off slightly from the buffer head so the element has audio
-    // to play while the next HLS / icecast segment is being fetched.
-    // Seeking to exactly the leading edge gives 0s of buffer and the
-    // browser's audio element stalls (looks like "audio paused"). 0.75s
-    // is small enough that the user perceives this as "live" while
-    // leaving room for the next chunk to arrive.
-    const LIVE_BACKOFF = 0.75
+    // Back off from the buffer head so the element has audio to play
+    // through the typical HLS / icecast segment fetch window. Seeking
+    // to exactly the leading edge gives 0s of buffer and the audio
+    // element stalls (looks like "audio paused"). HLS segments are
+    // usually 6-10s; 2s of buffer is enough to ride through normal
+    // segment-boundary fetches, and the user still reads as "live".
+    const LIVE_BACKOFF = 2.0
     if (edge > LIVE_BACKOFF) edge -= LIVE_BACKOFF
     if (edge > 0) {
       seek(edge)

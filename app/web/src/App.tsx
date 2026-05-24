@@ -372,8 +372,11 @@ export default function App() {
   // the dot stops glowing as soon as the user falls a few seconds behind.
   const audioReceived =
     result?.format === 'verbose_json' ? result.body.audio_received_s ?? 0 : 0
+  // 3s threshold — leaves headroom for the LIVE_BACKOFF (0.75s) plus
+  // normal playback drift while still going hollow when the user is
+  // meaningfully behind (paused for a while, scrubbed back).
   const atLiveEdge =
-    loaded?.kind === 'url' && audioReceived > 0 && audioReceived - currentTime < 2.0
+    loaded?.kind === 'url' && audioReceived > 0 && audioReceived - currentTime < 3.0
 
   /** Jump the playback element to the "live edge" — the latest audio
    * we have. Source of truth is the server's `audio_received_s` counter
@@ -397,17 +400,22 @@ export default function App() {
         ? el.seekable.end(el.seekable.length - 1)
         : 0
     let edge = serverEdge
-    // Clamp to seekable.end if serverEdge overshoots — setting
-    // currentTime past the buffered range can stall the audio element
-    // on some HLS / icecast sources (browser waits for data it doesn't
-    // have yet). seekableEnd is "the leading edge we can definitely
-    // play"; only use it if the server hasn't gone further.
+    // Clamp to client buffer head if server has gone further — seeking
+    // past seekable.end leaves nothing to play.
     if (seekableEnd > 0 && (edge <= 0 || edge > seekableEnd)) {
       edge = seekableEnd
     }
     if (edge <= 0 && isFinite(el.duration) && el.duration > 0) {
       edge = el.duration
     }
+    // Back off slightly from the buffer head so the element has audio
+    // to play while the next HLS / icecast segment is being fetched.
+    // Seeking to exactly the leading edge gives 0s of buffer and the
+    // browser's audio element stalls (looks like "audio paused"). 0.75s
+    // is small enough that the user perceives this as "live" while
+    // leaving room for the next chunk to arrive.
+    const LIVE_BACKOFF = 0.75
+    if (edge > LIVE_BACKOFF) edge -= LIVE_BACKOFF
     if (edge > 0) {
       seek(edge)
       play()

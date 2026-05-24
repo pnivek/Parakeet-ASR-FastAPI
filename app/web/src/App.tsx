@@ -205,6 +205,7 @@ export default function App() {
     wordArrivalRef.current = new Map()
     maxSeenSegIdRef.current = -1
     wordArrivalCountRef.current = 0
+    setLiveAnchored(false)
     // Only wipe the hero waveform/identity when explicitly asked (mic =
     // fresh recording, url = new source). File mode keeps the already-
     // decoded waveform: clearing it here would null `loaded`, re-trigger
@@ -307,6 +308,7 @@ export default function App() {
     setPeaks(null)
     setTtfs(null)
     ttfsRef.current = null
+    setLiveAnchored(false)
     setAudioFile(null)
   }
 
@@ -366,17 +368,41 @@ export default function App() {
     play()
   }, [segments, currentTime])
 
-  // Whether the playhead is currently at (or near) the live edge — drives
-  // the red-dot indicator on the Live button. Threshold matches the
-  // implicit "you can read along with this" window; small enough that
-  // the dot stops glowing as soon as the user falls a few seconds behind.
+  // "At live edge" is a STATE — true after Live click, false the moment
+  // the user pauses or seeks (any direction). Survives micro-stalls in
+  // the audio buffer that briefly inflate the audio_received - currentTime
+  // diff. A 10s diff backstop kicks in only if the gap genuinely runs
+  // away (rare; means the user's been silently stalling for ages).
+  const [liveAnchored, setLiveAnchored] = useState(false)
+  const suppressNextSeekRef = useRef(false)
+  // Subscribe to the audio element's pause + seek events. Pause un-
+  // anchors immediately; seek un-anchors unless we just triggered it
+  // from Live click (suppression flag).
+  useEffect(() => {
+    const el = getAudioElement()
+    const onPause = () => setLiveAnchored(false)
+    const onSeeked = () => {
+      if (suppressNextSeekRef.current) {
+        suppressNextSeekRef.current = false
+        return
+      }
+      setLiveAnchored(false)
+    }
+    el.addEventListener('pause', onPause)
+    el.addEventListener('seeked', onSeeked)
+    return () => {
+      el.removeEventListener('pause', onPause)
+      el.removeEventListener('seeked', onSeeked)
+    }
+  }, [])
+
   const audioReceived =
     result?.format === 'verbose_json' ? result.body.audio_received_s ?? 0 : 0
-  // 5s threshold — accommodates the LIVE_BACKOFF (2s) + normal buffer
-  // drift while still flipping hollow when the user has meaningfully
-  // fallen behind (paused for a while, scrubbed back).
   const atLiveEdge =
-    loaded?.kind === 'url' && audioReceived > 0 && audioReceived - currentTime < 5.0
+    loaded?.kind === 'url' &&
+    liveAnchored &&
+    audioReceived > 0 &&
+    audioReceived - currentTime < 10.0
 
   /** Jump the playback element to the "live edge" — the latest audio
    * we have. Source of truth is the server's `audio_received_s` counter
@@ -417,6 +443,11 @@ export default function App() {
     const LIVE_BACKOFF = 2.0
     if (edge > LIVE_BACKOFF) edge -= LIVE_BACKOFF
     if (edge > 0) {
+      // Mark this seek as Live-initiated so the 'seeked' listener
+      // doesn't un-anchor us. Set the anchor BEFORE seeking so the
+      // event handler sees the suppression flag before it fires.
+      suppressNextSeekRef.current = true
+      setLiveAnchored(true)
       seek(edge)
       play()
     }

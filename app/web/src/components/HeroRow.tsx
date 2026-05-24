@@ -33,10 +33,6 @@ interface Props {
   onNextSegment: () => void
   /** Pause + seek 0 (what the old single "Reset" button did). */
   onRewind: () => void
-  /** Sync toggle: cursor-aligned playback that won't overrun the
-   * latest committed segment. */
-  syncOn: boolean
-  onToggleSync: () => void
   /** Jump a live URL stream's <audio> element to its live edge. */
   onLiveEdge: () => void
   /** True when audio playhead is within ~2s of server's audio_received_s.
@@ -73,12 +69,6 @@ const RewindIcon = () => (
   <svg viewBox="0 0 24 24" width={13} height={13} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" aria-hidden>
     <path d="M19 12a7 7 0 1 1-2-4.9" />
     <path d="M19 4v5h-5" />
-  </svg>
-)
-const SyncIcon = () => (
-  <svg viewBox="0 0 24 24" width={13} height={13} fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-    <path d="M3 12a9 9 0 0 1 15.5-6.3M21 12a9 9 0 0 1-15.5 6.3" />
-    <path d="M18 3v4h-4M6 21v-4h4" />
   </svg>
 )
 const LiveDotIcon = ({ filled }: { filled: boolean }) => (
@@ -122,8 +112,6 @@ export function HeroRow({
   onPrevSegment,
   onNextSegment,
   onRewind,
-  syncOn,
-  onToggleSync,
   onLiveEdge,
   atLiveEdge,
   live,
@@ -242,17 +230,6 @@ export function HeroRow({
         >
           <RewindIcon />
           Rewind
-        </button>
-        <button
-          type="button"
-          className={syncOn ? 'ma-pill ma-pill--lg ma-pill--active' : 'ma-pill ma-pill--lg'}
-          onClick={onToggleSync}
-          disabled={!loaded}
-          aria-pressed={syncOn}
-          title="Cursor-aligned playback — pauses when the playhead catches the transcript"
-        >
-          <SyncIcon />
-          Sync
         </button>
         {showLive && (
           <button

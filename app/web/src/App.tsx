@@ -67,12 +67,6 @@ export default function App() {
    * increasing ids; words are append-only by index. */
   const maxSeenSegIdRef = useRef<number>(-1)
   const wordArrivalCountRef = useRef<number>(0)
-  /** Sync (cursor-aligned playback) toggle + autoPaused tracker. Declared
-   * up here (not next to the gate effect below) so the various session
-   * handlers that need to reset autoPaused can reach `setAutoPaused`
-   * without tripping the "accessed before declared" lint rule. */
-  const [syncOn, setSyncOn] = useState(false)
-  const [autoPaused, setAutoPaused] = useState(false)
 
   // Hidden host for the singleton <audio>.
   const audioMountRef = useRef<HTMLDivElement>(null)
@@ -133,9 +127,6 @@ export default function App() {
     wordArrivalRef.current = new Map()
     maxSeenSegIdRef.current = -1
     wordArrivalCountRef.current = 0
-    // Sync gating is a live-only concern — clear the auto-pause marker
-    // so a finished result doesn't immediately re-pause on the boundary.
-    setAutoPaused(false)
     if (l.kind === 'file') {
       setAudioFile(l.file)
       // peaks decode runs in the useEffect above when loaded.file changes.
@@ -215,8 +206,6 @@ export default function App() {
     wordArrivalRef.current = new Map()
     maxSeenSegIdRef.current = -1
     wordArrivalCountRef.current = 0
-    setAutoPaused(false)
-    setBoundary(0) // monotonic boundary resets per session
     // Only wipe the hero waveform/identity when explicitly asked (mic =
     // fresh recording, url = new source). File mode keeps the already-
     // decoded waveform: clearing it here would null `loaded`, re-trigger
@@ -319,8 +308,6 @@ export default function App() {
     setPeaks(null)
     setTtfs(null)
     ttfsRef.current = null
-    setBoundary(0)
-    setAutoPaused(false)
     setAudioFile(null)
   }
 
@@ -385,69 +372,6 @@ export default function App() {
     seek(0)
   }, [])
 
-  // ── Sync as a lead-buffer ──────────────────────────────────────────
-  // Sync = "keep N seconds of committed transcript in front of the
-  // cursor." Pauses audio when the lead drops below SYNC_LEAD, resumes
-  // when the boundary advances enough to restore the lead. The boundary
-  // is monotonic (only ever grows) so partial-word revisions can't
-  // shrink it and pull audio backward.
-  //
-  // syncOn / autoPaused state declared at the top of the component so
-  // the handler functions can reach the setters.
-  const SYNC_LEAD = 2.0     // seconds of committed transcript to keep ahead of cursor
-  const SYNC_SLACK = 0.5    // dormancy: when audio is more than SLACK past the boundary
-                            // (Live, scrub-forward), Sync stops gating
-  const SYNC_RESUME_EPS = 0.05
-
-  // Monotonic boundary: max(committed_last_end, partial_end) over the
-  // session. Partials can extend the runway in real-time, but the
-  // boundary never retreats — if a partial later shrinks or vanishes
-  // (sentence finalizes with a different word count), playback keeps
-  // its earned lead.
-  const [boundary, setBoundary] = useState(0)
-  useEffect(() => {
-    const committed = segments.length > 0 ? segments[segments.length - 1].end : 0
-    const partial = partialSegment ? partialSegment.end : 0
-    const candidate = Math.max(committed, partial)
-    if (candidate > 0) setBoundary((prev) => Math.max(prev, candidate))
-  }, [segments, partialSegment])
-
-  const toggleSync = () => {
-    setSyncOn((on) => {
-      if (on) setAutoPaused(false) // turning off — drop pending auto-resume
-      return !on
-    })
-  }
-
-  // Auto-pause when audio is at the edge of the lead zone.
-  // "Edge" = currentTime >= boundary - LEAD AND currentTime <= boundary + SLACK.
-  // If user is significantly past boundary (Live, scrub-forward) we're
-  // dormant — Sync doesn't fight them. When they scrub back inside the
-  // zone, Sync re-engages.
-  useEffect(() => {
-    if (!syncOn) return
-    if (!audioPlaying) return
-    if (boundary <= 0) return
-    const target = boundary - SYNC_LEAD
-    if (currentTime >= target && currentTime <= boundary + SYNC_SLACK) {
-      pause()
-      setAutoPaused(true)
-    }
-  }, [syncOn, audioPlaying, currentTime, boundary])
-
-  // Auto-resume when the boundary moves forward enough to restore the lead.
-  useEffect(() => {
-    if (!syncOn) return
-    if (audioPlaying) return
-    if (!autoPaused) return
-    if (boundary <= 0) return
-    const target = boundary - SYNC_LEAD
-    if (currentTime < target - SYNC_RESUME_EPS) {
-      setAutoPaused(false)
-      play()
-    }
-  }, [syncOn, audioPlaying, autoPaused, currentTime, boundary])
-
   // Whether the playhead is currently at (or near) the live edge — drives
   // the red-dot indicator on the Live button. Threshold matches the
   // implicit "you can read along with this" window; small enough that
@@ -474,13 +398,21 @@ export default function App() {
     const el = getAudioElement()
     const serverEdge =
       result?.format === 'verbose_json' ? result.body.audio_received_s ?? 0 : 0
+    const seekableEnd =
+      el.seekable && el.seekable.length > 0
+        ? el.seekable.end(el.seekable.length - 1)
+        : 0
     let edge = serverEdge
-    if (edge <= 0) {
-      if (el.seekable && el.seekable.length > 0) {
-        edge = el.seekable.end(el.seekable.length - 1)
-      } else if (isFinite(el.duration) && el.duration > 0) {
-        edge = el.duration
-      }
+    // Clamp to seekable.end if serverEdge overshoots — setting
+    // currentTime past the buffered range can stall the audio element
+    // on some HLS / icecast sources (browser waits for data it doesn't
+    // have yet). seekableEnd is "the leading edge we can definitely
+    // play"; only use it if the server hasn't gone further.
+    if (seekableEnd > 0 && (edge <= 0 || edge > seekableEnd)) {
+      edge = seekableEnd
+    }
+    if (edge <= 0 && isFinite(el.duration) && el.duration > 0) {
+      edge = el.duration
     }
     if (edge > 0) {
       seek(edge)
@@ -520,8 +452,6 @@ export default function App() {
             onPrevSegment={seekPrevSegment}
             onNextSegment={seekNextSegment}
             onRewind={rewind}
-            syncOn={syncOn}
-            onToggleSync={toggleSync}
             onLiveEdge={seekLiveEdge}
             atLiveEdge={atLiveEdge}
             live={live}

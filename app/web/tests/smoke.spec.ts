@@ -56,7 +56,8 @@ test('Maison v6 UI — boots, modality tabs switch, per-tab engine picker works'
   await expect(page.getByRole('button', { name: /Next segment/i })).toBeVisible()
   await expect(page.getByRole('button', { name: /^Play$/ })).toBeVisible()
   await expect(page.getByRole('button', { name: /Rewind/i })).toBeVisible()
-  await expect(page.getByRole('button', { name: /^Sync$/ })).toBeVisible()
+  // Sync was removed — cursor + Live cover the alignment use case now.
+  await expect(page.getByRole('button', { name: /^Sync$/ })).toHaveCount(0)
 
   // URL tab — URL input + Engine picker.
   await urlTab.click()

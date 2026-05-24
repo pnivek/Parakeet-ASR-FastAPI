@@ -834,17 +834,31 @@ _VAD_NOISE_AMPLITUDE = 1e-3  # ~-60 dBFS gaussian; protects TDT decoder timing
 
 
 def _build_vad_state(client_config: dict) -> dict:
-    """Build the per-session VAD state + config. If Silero is unavailable
-    or the client opted out, returns a state dict with `enabled=False` so
-    the producer can fast-path through it."""
-    enabled = bool(client_config.get('vad_enabled', True)) and silero_vad_model is not None
-    if enabled:
+    """Build the per-session VAD state + config.
+
+    Two orthogonal axes:
+      - `enabled`  : whether the silence-clip state machine drops bytes
+                     before they reach the engine. User-controlled via
+                     the "Voice detection" sidebar toggle.
+      - `meter`    : whether Silero inference runs *at all* to populate
+                     the speech_ms counter that drives the live RTFx
+                     metric. Always on when the model is loaded —
+                     inference is cheap (~1ms per 32ms frame) and the
+                     metric needs it even when clip is off.
+
+    If Silero is unavailable, both flip to False and the filter fast-
+    paths through with `speech_ms` stuck at 0 (client falls back to —).
+    """
+    meter = silero_vad_model is not None
+    enabled = bool(client_config.get('vad_enabled', True)) and meter
+    if meter:
         try:
             silero_vad_model.reset_states()  # type: ignore[attr-defined]
         except Exception:
             pass
     return {
         'enabled': enabled,
+        'meter': meter,
         'model': silero_vad_model,
         'threshold': float(client_config.get('vad_threshold', 0.5)),
         'consecutive': max(1, int(client_config.get('vad_consecutive', 3))),
@@ -887,33 +901,52 @@ def _build_vad_state(client_config: dict) -> dict:
         'dropped_frames': 0,
         'speech_frames': 0,
         'padded_ms': 0.0,
+        # Cumulative wall-clock ms classified as speech by Silero VAD,
+        # *regardless* of the clip-state-machine outcome. Ticks per frame
+        # where prob >= threshold, including frames the gate later
+        # drops as part of pending/hangover bookkeeping. Drives the
+        # live RTFx denominator (speech_committed_s / speech_received_s)
+        # and is the single source of truth for "how much speech have
+        # we heard". 0 if the Silero model isn't loaded.
+        'speech_ms': 0.0,
+        # Cumulative wall-clock ms covered by segments the engine has
+        # committed (sum of post-translation seg.end - seg.start). Lives
+        # on vad_state so both PCM and URL consumer loops can update it
+        # in place and the final-payload assembly can read it without
+        # extra nonlocal plumbing.
+        'committed_speech_ms': 0.0,
     }
 
 
 def _vad_filter(pcm_bytes: bytes, st: dict) -> bytes:
-    """Run Silero on incoming PCM, return the speech-only subset.
+    """Run Silero on incoming PCM, return the engine-bound subset.
 
-    Maintains a small state machine across frames:
-      - silent → speech requires N consecutive frames above threshold
-        (defeats single-frame spikes — car horns, taps, plosives).
-      - Pending frames are buffered during the wait and flushed once
-        confirmed, so the first 96 ms of an utterance isn't dropped.
-      - In speech mode, every below-threshold frame extends the hangover
-        window. Once `engine_ms - last_speech_ms > hangover_ms`, drop to
-        silent.
-      - When silent→speech confirms and the prior silent run exceeded
-        `pad_min_gap_ms`, inject `pad_duration_ms` of low-noise PCM so the
-        TDT decoder doesn't see an instant cliff into speech.
+    Two responsibilities, kept distinct:
+
+    1. **Metric (always-on when Silero is loaded).** Every 32 ms frame
+       runs VAD inference; `speech_ms` ticks for any frame with
+       `prob >= threshold`. This feeds the live RTFx counter regardless
+       of whether the user has clipping enabled — silence still has to
+       fall out of both numerator and denominator for the metric to be
+       honest.
+
+    2. **Clip state machine (gated on `st['enabled']`).** When clip is
+       on, drops silence, hangs over speech, optionally pads onsets —
+       same behavior as before. When clip is off, every frame is
+       forwarded to the engine, but the metric counters still tick.
 
     Bytes returned should be appended to the engine's PCM accumulator.
 
     Timestamps emitted by the engine are on the speech-only "engine"
-    timeline. Callers should translate them back to wall-clock with
-    `_translate_segment_times(seg, vad_state)` before exposing them to
-    the client — the audio player plays the unfiltered wall-clock track
-    and word highlights need to match it.
+    timeline when clip is on. Callers should translate them back to
+    wall-clock with `_translate_segment_times(seg, vad_state)` before
+    exposing them to the client — the audio player plays the
+    unfiltered wall-clock track and word highlights need to match it.
+    When clip is off, engine clock == wall clock (no time_map entries).
     """
-    if not st['enabled']:
+    # No Silero at all — pass through, advance engine_ms for byte
+    # accounting, speech_ms stays at 0 (client will fall back to —).
+    if not st['meter']:
         st['engine_ms'] += (len(pcm_bytes) / 2) / 16.0  # 16 samples/ms @ 16 kHz
         return pcm_bytes
 
@@ -921,6 +954,7 @@ def _vad_filter(pcm_bytes: bytes, st: dict) -> bytes:
     out = bytearray()
     model = st['model']
     threshold = st['threshold']
+    clip_enabled = st['enabled']
     consec_target = st['consecutive']
     hangover_ms = st['hangover_ms']
     pad_min = st['pad_min_gap_ms']
@@ -948,6 +982,18 @@ def _vad_filter(pcm_bytes: bytes, st: dict) -> bytes:
             st['engine_ms'] += _VAD_FRAME_MS
             continue
         is_loud = prob >= threshold
+        # Metric counter — independent of clipping. Counts every frame
+        # the model classified as speech, including ones the gate later
+        # drops as part of pending/hangover bookkeeping.
+        if is_loud:
+            st['speech_ms'] += _VAD_FRAME_MS
+
+        # Clip off → forward every frame, skip the state-machine entirely.
+        # Counters still tick (above) so the metric stays honest.
+        if not clip_enabled:
+            out.extend(frame_bytes)
+            st['engine_ms'] += _VAD_FRAME_MS
+            continue
 
         if st['mode'] == 'silent':
             if is_loud:
@@ -1049,6 +1095,28 @@ def _translate_segment_times(segments: List[dict], vad_state: dict) -> None:
             seg['token_times'] = [
                 round(_wall_time_s(float(t), vad_state), 3) for t in token_times
             ]
+
+
+def _accumulate_committed_speech(segments: List[dict], vad_state: dict) -> None:
+    """Add the wall-clock spans of newly committed segments to the
+    cumulative `committed_speech_ms` counter. Call AFTER
+    `_translate_segment_times` so the spans are in wall-clock terms."""
+    vad_state['committed_speech_ms'] += sum(
+        max(0.0, float(s.get('end', 0.0)) - float(s.get('start', 0.0))) * 1000.0
+        for s in segments
+    )
+
+
+def _streaming_counters(vad_state: dict) -> dict:
+    """Snapshot of the streaming counters the client uses to compute the
+    live RTFx (speech_committed_s / speech_received_s) and to surface
+    audio receipt in the tooltip. Splatted into segments_batch /
+    partial_segment / final_transcription payloads via `**`."""
+    return {
+        'audio_received_s': round(vad_state.get('wall_ms', 0.0) / 1000.0, 3),
+        'speech_received_s': round(vad_state.get('speech_ms', 0.0) / 1000.0, 3),
+        'speech_committed_s': round(vad_state.get('committed_speech_ms', 0.0) / 1000.0, 3),
+    }
 
 
 async def handle_streaming_pcm(
@@ -1417,10 +1485,12 @@ async def handle_streaming_pcm(
         total_engine_chunks = 0
         # Stream the in-progress (uncommitted) sentence buffer to the
         # client between real commits so the UI doesn't sit blank for
-        # the 4–6 s emission lag while the user is speaking. Only the
-        # live-mic preset (live_latency=True) gets these; offline files
-        # render clean sentence-bounded segments only.
-        partial_emit_enabled = live_latency
+        # the 4–6 s emission lag while the user is speaking. Decoupled
+        # from `live_latency` — partials are cheap and useful for any
+        # streaming source (including file uploads, where they preview
+        # progress on a slow upload). `live_latency` now controls only
+        # the chunk preset (10-2-2 vs 10-10-5).
+        partial_emit_enabled = True
         try:
             while True:
                 item = await chunk_queue.get()
@@ -1444,11 +1514,13 @@ async def handle_streaming_pcm(
                         # recording before the client sees them. No-op when VAD
                         # is off (time_map is empty).
                         _translate_segment_times(new_segs, vad_state)
+                        _accumulate_committed_speech(new_segs, vad_state)
                         new_words = _segments_to_words(new_segs)
                         await websocket.send_json({
                             "type": "segments_batch",
                             "segments": new_segs,
                             "words": new_words,
+                            **_streaming_counters(vad_state),
                         })
                         sent_segments_pcm.extend(new_segs)
                     except Exception as e_send:
@@ -1465,6 +1537,7 @@ async def handle_streaming_pcm(
                                 "type": "partial_segment",
                                 "segment": partial,
                                 "words": partial_words,
+                                **_streaming_counters(vad_state),
                             })
                         except Exception as e_send:
                             logger.warning(f"({session_id}) Stream: partial send failed: {e_send}")
@@ -1475,11 +1548,13 @@ async def handle_streaming_pcm(
             if final_partials and websocket.application_state == WebSocketState.CONNECTED:
                 try:
                     _translate_segment_times(final_partials, vad_state)
+                    _accumulate_committed_speech(final_partials, vad_state)
                     final_words = _segments_to_words(final_partials)
                     await websocket.send_json({
                         "type": "segments_batch",
                         "segments": final_partials,
                         "words": final_words,
+                        **_streaming_counters(vad_state),
                     })
                     sent_segments_pcm.extend(final_partials)
                 except Exception as e_send:
@@ -1526,6 +1601,7 @@ async def handle_streaming_pcm(
                 "srt_content": generate_srt_content(sent_segments_pcm),
                 "vtt_content": _segments_to_vtt(sent_segments_pcm),
                 "streaming_mode": client_config.get("format", "unknown"),
+                **_streaming_counters(vad_state),
             }
             await websocket.send_json(final_message_payload)
             logger.info(f"({session_id}) Streaming: Final transcription message sent.")
@@ -1740,7 +1816,11 @@ async def handle_streaming_url(
             right_context_secs=right_context_secs,
             request_id=f"WS-URL-{session_id}-eng",
         )
-        partial_emit_enabled = live_latency
+        # Partials decoupled from `live_latency` — URL is always live; the
+        # preset only controls chunk size. Partials give the user preview
+        # text even when the user opted into the higher-throughput
+        # 10-10-5 preset.
+        partial_emit_enabled = True
         try:
             while True:
                 item = await chunk_queue.get()
@@ -1759,11 +1839,13 @@ async def handle_streaming_url(
                 if new_segs and websocket.application_state == WebSocketState.CONNECTED:
                     try:
                         _translate_segment_times(new_segs, vad_state)
+                        _accumulate_committed_speech(new_segs, vad_state)
                         new_words = _segments_to_words(new_segs)
                         await websocket.send_json({
                             "type": "segments_batch",
                             "segments": new_segs,
                             "words": new_words,
+                            **_streaming_counters(vad_state),
                         })
                         sent_segments_pcm.extend(new_segs)
                     except Exception as e_send:
@@ -1778,6 +1860,7 @@ async def handle_streaming_url(
                                 "type": "partial_segment",
                                 "segment": partial,
                                 "words": partial_words,
+                                **_streaming_counters(vad_state),
                             })
                         except Exception as e_send:
                             logger.warning(f"({session_id}) URL Stream: partial send failed: {e_send}")
@@ -1787,11 +1870,13 @@ async def handle_streaming_url(
             if final_partials and websocket.application_state == WebSocketState.CONNECTED:
                 try:
                     _translate_segment_times(final_partials, vad_state)
+                    _accumulate_committed_speech(final_partials, vad_state)
                     final_words = _segments_to_words(final_partials)
                     await websocket.send_json({
                         "type": "segments_batch",
                         "segments": final_partials,
                         "words": final_words,
+                        **_streaming_counters(vad_state),
                     })
                     sent_segments_pcm.extend(final_partials)
                 except Exception as e_send:
@@ -1829,6 +1914,7 @@ async def handle_streaming_url(
                 "srt_content": generate_srt_content(sent_segments_pcm),
                 "vtt_content": _segments_to_vtt(sent_segments_pcm),
                 "streaming_mode": "url",
+                **_streaming_counters(vad_state),
             }
             await websocket.send_json(final_message_payload)
     except Exception as e_pipeline:

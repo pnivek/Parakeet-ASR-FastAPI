@@ -81,6 +81,16 @@ export interface VerboseJsonResponse {
   csv_content?: string
   srt_content?: string
   vtt_content?: string
+  /** Live-streaming counters (present only on WS-streaming responses).
+   * Drive the live RTFx in the footer:
+   *   live_rtfx = speech_committed_s / speech_received_s
+   * Both counters are server-side cumulative wall-clock measurements
+   * derived from Silero VAD (received) and committed segment durations
+   * (committed). Absent on REST / offline responses — the footer falls
+   * back to the offline ratio there. */
+  audio_received_s?: number
+  speech_received_s?: number
+  speech_committed_s?: number
 }
 
 /** Plain-text response body — `response_format=text|srt|vtt` returns a string. */
@@ -124,6 +134,10 @@ export interface WSSegmentsBatch {
   segments: WhisperSegment[]
   /** Word-level timestamps for the segments in this batch. */
   words?: Word[]
+  /** Streaming counters — see VerboseJsonResponse for semantics. */
+  audio_received_s?: number
+  speech_received_s?: number
+  speech_committed_s?: number
 }
 
 /** Final summary message at end of stream — mirrors verbose_json with extras. */
@@ -144,6 +158,10 @@ export interface WSFinalTranscription {
   srt_content: string
   vtt_content?: string
   streaming_mode: string
+  /** Streaming counters — see VerboseJsonResponse for semantics. */
+  audio_received_s?: number
+  speech_received_s?: number
+  speech_committed_s?: number
 }
 
 export interface WSError {
@@ -162,6 +180,10 @@ export interface WSPartialSegment {
   type: 'partial_segment'
   segment: WhisperSegment
   words?: Word[]
+  /** Streaming counters — see VerboseJsonResponse for semantics. */
+  audio_received_s?: number
+  speech_received_s?: number
+  speech_committed_s?: number
 }
 
 export type WSMessage =

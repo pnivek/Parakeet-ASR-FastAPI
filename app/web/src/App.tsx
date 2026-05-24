@@ -44,12 +44,10 @@ export default function App() {
    * one-shot capture against state-update races. */
   const [ttfs, setTtfs] = useState<number | null>(null)
   const ttfsRef = useRef<number | null>(null)
-  /** performance.now() at the start of the active session. Mirrored
-   * into a ref so callbacks fired between renders (handlePartial /
-   * markFirstSegment) can read the live value without waiting for a
-   * re-render, while the state copy lets consumers (FooterRail) react
-   * to changes and avoids a render-time ref read. */
-  const [sessionStartMs, setSessionStartMs] = useState(0)
+  /** performance.now() at the start of the active session. Used by
+   * markFirstSegment to compute TTFS. The live RTFx no longer needs
+   * wall-elapsed client-side — it reads server-tracked counters from
+   * the verbose body — so we don't mirror this into state. */
   const sessionStartRef = useRef(0)
   /** True while we're receiving partials (mid-stream). False on final result
    * or no result. Drives the word-by-word reveal animation in the
@@ -211,7 +209,6 @@ export default function App() {
     setPartialSegment(null)
     setPartialWords([])
     sessionStartRef.current = performance.now()
-    setSessionStartMs(sessionStartRef.current)
     ttfsRef.current = null
     setTtfs(null)
     arrivalRef.current = new Map()
@@ -526,7 +523,6 @@ export default function App() {
         ttfs={ttfs}
         activeStrategy={activeStrategy}
         live={live}
-        sessionStartMs={sessionStartMs}
       />
 
       <div

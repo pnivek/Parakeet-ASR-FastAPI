@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react'
 import type { TranscriptionResponse } from '../lib/api'
 import type { LoadedAudio } from '../lib/download'
 import { useDuration } from '../lib/playback'
@@ -12,12 +11,9 @@ interface Props {
    * resolved one, so STRATEGY is never blank. */
   activeStrategy: string
   /** True while partials are arriving (mic+WS or URL+WS). Drives RTFx
-   * into the live-ratio formula instead of the offline duration/asr_time. */
+   * into the live counter-based formula instead of the offline
+   * duration/asr_time. */
   live: boolean
-  /** performance.now() at the start of the active session. Lets us compute
-   * wall-elapsed for the live RTFx ratio without re-reading state every
-   * tick. Pass 0 when no session is active. */
-  sessionStartMs: number
 }
 
 /** Map the server's resolved-strategy enum to a short, human-readable
@@ -42,7 +38,6 @@ export function FooterRail({
   ttfs,
   activeStrategy,
   live,
-  sessionStartMs,
 }: Props) {
   const dur = useDuration()
   const verbose = result?.format === 'verbose_json' ? result.body : null
@@ -53,29 +48,24 @@ export function FooterRail({
   // we hand it to the tooltip instead.
   const offlineRtfx = asr && asr > 0 ? verbose!.duration / asr : null
   const offlineLabel = offlineRtfx != null ? offlineRtfx.toFixed(1) + '×' : '—'
-  // Live ratio: how well are we keeping up with realtime? 1.0 = on pace,
-  // <1 = falling behind, >1 = burst-eating backlog. Ticked once a second
-  // by an interval that captures `performance.now()` outside render — the
-  // value is stored in state so the render pass stays pure. We only ever
-  // call setWallElapsed from the async interval callback (not from the
-  // effect body) so the lint rule doesn't flag a sync-in-effect setState.
-  const [wallElapsed, setWallElapsed] = useState(0)
-  useEffect(() => {
-    if (!live || sessionStartMs <= 0) return
-    const id = setInterval(() => {
-      setWallElapsed((performance.now() - sessionStartMs) / 1000)
-    }, 1000)
-    return () => clearInterval(id)
-  }, [live, sessionStartMs])
   let rtfxLabel = offlineLabel
   let rtfxTip = ''
-  if (live && sessionStartMs > 0) {
-    const audioReceived = verbose?.duration ?? 0
-    if (wallElapsed > 0 && audioReceived > 0) {
-      const ratio = audioReceived / wallElapsed
-      // Anything ≥ 0.95 reads as "keeping up" in practice (we're bounded
-      // by chunk emission cadence, not GPU). Below that label it.
-      const tag = ratio >= 0.95 ? 'LIVE' : 'falling behind'
+  if (live) {
+    // Live ratio expressed in **speech-seconds** so silence/music drops
+    // out symmetrically. Server tracks Silero-detected speech in
+    // (a) `speech_received_s` (cumulative wall-clock speech ingested)
+    // and (b) `speech_committed_s` (sum of committed segment durations).
+    // Ratio is bounded above by 1.0 (committed cannot exceed received);
+    // it asymptotes to (received - chunk_lag) / received during
+    // continuous speech, and dips only if the engine genuinely backlogs.
+    const received = verbose?.speech_received_s ?? 0
+    const committed = verbose?.speech_committed_s ?? 0
+    // Warm-up guard: until we have a meaningful denominator the ratio
+    // is too noisy to display. Also covers "Silero not loaded" (counters
+    // never arrive → both stay at 0 → show —).
+    if (received >= 1.0) {
+      const ratio = Math.min(1.0, committed / received)
+      const tag = ratio >= 0.9 ? 'LIVE' : 'falling behind'
       rtfxLabel = `${ratio.toFixed(2)}× ${tag}`
       rtfxTip =
         offlineRtfx != null

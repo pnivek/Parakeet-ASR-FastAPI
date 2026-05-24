@@ -143,6 +143,17 @@ export function Sidebar({
     hpf_hz: m.hpfHz,
   })
 
+  // Latest server-reported streaming counters. Refreshed on every WS
+   // message (segments_batch / partial_segment / final_transcription)
+   // and piped into the synthesized verbose body via buildPartialPayload
+   // so they reach FooterRail via the existing result flow. Absent on
+   // older servers — FooterRail falls back to "—" when undefined.
+  const countersRef = useRef<{
+    audio_received_s?: number
+    speech_received_s?: number
+    speech_committed_s?: number
+  }>({})
+
   // Partial-message throttle — see the original Sidebar's notes; same logic.
   const PARTIAL_THROTTLE_MS = 250
   const lastPartialAtRef = useRef(0)
@@ -162,6 +173,9 @@ export function Sidebar({
         words: words.length > 0 ? words : undefined,
         strategy: 'streaming',
         transcription_time_seconds: wall,
+        audio_received_s: countersRef.current.audio_received_s,
+        speech_received_s: countersRef.current.speech_received_s,
+        speech_committed_s: countersRef.current.speech_committed_s,
       },
     }
   }, [])
@@ -194,6 +208,19 @@ export function Sidebar({
   // caller has already set the audio source via onAudioReady.
   const handleMessage = useCallback(
     (msg: WSMessage, options?: { staged?: LoadedAudio }) => {
+      // Snapshot streaming counters from any message that carries them.
+      // They drive the live RTFx in FooterRail via the verbose body.
+      // Older servers omit the fields — keep whatever we had if absent.
+      if ('speech_received_s' in msg || 'speech_committed_s' in msg || 'audio_received_s' in msg) {
+        const m = msg as {
+          audio_received_s?: number
+          speech_received_s?: number
+          speech_committed_s?: number
+        }
+        if (m.audio_received_s !== undefined) countersRef.current.audio_received_s = m.audio_received_s
+        if (m.speech_received_s !== undefined) countersRef.current.speech_received_s = m.speech_received_s
+        if (m.speech_committed_s !== undefined) countersRef.current.speech_committed_s = m.speech_committed_s
+      }
       switch (msg.type) {
         case 'segments_batch': {
           segmentsRef.current = [...segmentsRef.current, ...msg.segments]
@@ -206,6 +233,9 @@ export function Sidebar({
         }
         case 'partial_segment':
           onPartialSegment?.(msg.segment, msg.words ?? [])
+          // Surface the freshest counters even when no segment commits —
+          // the partial message is the most frequent server tick.
+          schedulePartial()
           break
         case 'final_transcription': {
           cancelPendingPartial()
@@ -237,6 +267,9 @@ export function Sidebar({
               transcription_time_seconds: msg.transcription_time,
               csv_content: msg.csv_content,
               srt_content: msg.srt_content,
+              audio_received_s: msg.audio_received_s,
+              speech_received_s: msg.speech_received_s,
+              speech_committed_s: msg.speech_committed_s,
             },
           })
           wsRef.current?.abort()
@@ -349,6 +382,7 @@ export function Sidebar({
     segmentsRef.current = []
     wordsRef.current = []
     chunksRef.current = []
+    countersRef.current = {}
     recordStartRef.current = Date.now()
     setRecordElapsed(0)
     if (s.mic.engine === 'rest') {
@@ -397,6 +431,7 @@ export function Sidebar({
         segmentsRef.current = []
         wordsRef.current = []
         chunksRef.current = []
+        countersRef.current = {}
         recordStartRef.current = Date.now()
         const loaded: LoadedAudio = {
           kind: 'file',
@@ -491,6 +526,7 @@ export function Sidebar({
         segmentsRef.current = []
         wordsRef.current = []
         chunksRef.current = []
+        countersRef.current = {}
         recordStartRef.current = Date.now()
         let staged: LoadedAudio
         try {

@@ -200,6 +200,55 @@ def _avg_logprob(token_logprobs: List[Optional[float]]) -> Optional[float]:
     return round(sum(valid) / len(valid), 4)
 
 
+# Common abbreviations that look like sentence terminators (their token's
+# last char is '.') but aren't. Held in lowercase + with trailing period;
+# match is against the LAST whitespace-separated word in the current
+# sentence buffer. Closed list — we're not aiming to catch every possible
+# abbreviation, just the high-frequency English ones that would otherwise
+# defeat the lookahead rule (because "Dr. Smith" satisfies the "next
+# token is a new uppercase word" heuristic too).
+_HONORIFICS = frozenset({
+    "dr.", "mr.", "mrs.", "ms.", "miss.",
+    "jr.", "sr.",
+    "st.", "mt.",
+    "prof.", "rev.", "fr.",
+    "gen.", "lt.", "sgt.", "capt.", "col.", "maj.", "cmdr.",
+    "sen.", "rep.", "gov.", "hon.",
+    "vs.", "etc.", "no.", "co.", "inc.", "ltd.", "ave.", "blvd.",
+})
+
+
+def _ends_in_honorific(buffer_text: str) -> bool:
+    """True if the buffer's last whitespace-separated token (lowercased)
+    is in `_HONORIFICS`. Used to suppress sentence-commit deferral on
+    abbreviations like 'Dr.' that would otherwise be ambiguous."""
+    stripped = buffer_text.rstrip()
+    if not stripped:
+        return False
+    last_word = stripped.rsplit(None, 1)[-1].lower()
+    return last_word in _HONORIFICS
+
+
+def _looks_like_sentence_start(tok_str: str) -> bool:
+    """Used by the deferred-commit logic to decide whether the token after
+    a `.` confirms a sentence boundary. True when the token starts a new
+    word (leading space / ▁ marker) AND that word starts with an uppercase
+    letter. NeMo SentencePiece-style tokens that begin a word carry a
+    leading '▁' or space; sub-word continuations don't, so "U" followed by
+    ".S." stays inside the abbreviation."""
+    if not tok_str:
+        return False
+    # SentencePiece word-boundary marker.
+    if tok_str.startswith('▁'):  # '▁'
+        rest = tok_str[1:]
+    elif tok_str[0].isspace():
+        rest = tok_str.lstrip()
+    else:
+        # Sub-word continuation — not a sentence start.
+        return False
+    return bool(rest) and rest[0].isupper()
+
+
 def tokens_to_sentence_segments(
     token_ids: List[int],
     token_times_s: List[float],
@@ -228,6 +277,12 @@ def tokens_to_sentence_segments(
     buf_last_t: float = 0.0
     seg_id = start_seg_id
     n = len(token_ids)
+    # Decode all token surface forms up front — needed for honorific +
+    # lookahead checks below.
+    try:
+        all_tok_strs = [tokenizer.ids_to_tokens([tid])[0] for tid in token_ids]
+    except Exception:
+        all_tok_strs = ["" for _ in token_ids]
     for i in range(n):
         tid = token_ids[i]
         t_s = token_times_s[i]
@@ -238,11 +293,25 @@ def tokens_to_sentence_segments(
         buf_logprobs.append(lp)
         buf_times.append(t_s)
         buf_last_t = t_s
-        try:
-            tok = tokenizer.ids_to_tokens([tid])[0]
-        except Exception:
-            tok = ""
-        if tok and tok[-1] in ".!?":
+        tok = all_tok_strs[i]
+        last_char = tok[-1] if tok else ""
+        # '!' and '?' are unambiguous sentence terminators.
+        # '.' is ambiguous (abbreviations, decimals, URLs) — use lookahead:
+        # commit only if the buffer doesn't end in a known honorific AND
+        # the next token starts a new uppercase word.
+        commit = False
+        if last_char in "!?":
+            commit = True
+        elif last_char == ".":
+            buf_text_so_far = tokenizer.ids_to_text(buf_ids).strip()
+            if not _ends_in_honorific(buf_text_so_far):
+                next_tok = all_tok_strs[i + 1] if i + 1 < n else ""
+                # End-of-stream commit happens below via the trailing-flush
+                # branch — only commit mid-loop if we can confirm the next
+                # token IS a sentence start.
+                if next_tok and _looks_like_sentence_start(next_tok):
+                    commit = True
+        if commit:
             text = tokenizer.ids_to_text(buf_ids).strip()
             if text:
                 segments.append(_whisper_segment(
@@ -364,6 +433,10 @@ class StreamingPrevBatchedEngine:
         self._sentence_buffer_times: List[float] = []
         self._sentence_buffer_start: Optional[float] = None
         self._sentence_buffer_last_t: float = 0.0
+        # Index into the sentence buffer where a `.` token was seen and the
+        # commit was deferred — see _consume_tokens_into_segments for the
+        # lookahead rule. None when there's no pending decision.
+        self._pending_commit_idx: Optional[int] = None
 
         # Index into `_committed_tokens` of tokens already emitted
         self._tokens_emitted_through: int = 0
@@ -560,6 +633,7 @@ class StreamingPrevBatchedEngine:
         self._sentence_buffer_times = []
         self._sentence_buffer_start = None
         self._sentence_buffer_last_t = 0.0
+        self._pending_commit_idx = None
         self._tokens_emitted_through = 0
 
     # --------- Internals ----------
@@ -692,29 +766,99 @@ class StreamingPrevBatchedEngine:
         flush_partial: bool,
     ) -> List[dict]:
         """Group new `(id, time, logprob)` triples into sentence-bounded segment dicts.
-        Carries running sentence state across pop calls so a sentence spanning
-        many chunks emits exactly once when its terminal '.!?' lands."""
+
+        Sentence-boundary detection:
+          - '!' and '?' commit immediately (unambiguous terminators).
+          - '.' is ambiguous (abbreviations, decimals, URLs). We defer the
+            commit by ONE token and use a two-rule lookahead:
+              1. Honorific suppression — if the buffer ends in a known
+                 abbreviation like "Dr." / "p.m.", don't even defer.
+              2. Look at the next token. If it starts a new word AND the
+                 first letter is uppercase, the '.' was a real sentence
+                 end → commit through the deferred token. Else, the '.'
+                 was an abbreviation → keep accumulating.
+
+        `_pending_commit_idx` tracks the index into the sentence buffer
+        where the deferred '.' lives. It survives across pop calls so a
+        deferred sentence-end at chunk K resolves cleanly when the next
+        token lands in chunk K+1. On EOF flush, any pending commit is
+        flushed unconditionally.
+        """
         segments: List[dict] = []
         tokenizer = self.tokenizer
+
+        def _emit_through(end_idx: int, end_t: float) -> None:
+            """Slice buffer[:end_idx+1] into a segment, keep the rest."""
+            commit_ids = self._sentence_buffer_ids[: end_idx + 1]
+            commit_lps = self._sentence_buffer_logprobs[: end_idx + 1]
+            commit_times = self._sentence_buffer_times[: end_idx + 1]
+            text = tokenizer.ids_to_text(commit_ids).strip()
+            if text:
+                has_lps = any(x is not None for x in commit_lps)
+                segments.append(_whisper_segment(
+                    self._next_seg_id,
+                    self._sentence_buffer_start or 0.0,
+                    end_t,
+                    text,
+                    commit_ids,
+                    avg_logprob=_avg_logprob(commit_lps) if has_lps else None,
+                    token_times=commit_times,
+                ))
+                self._next_seg_id += 1
+            # Keep the tail (anything after the deferred terminator).
+            self._sentence_buffer_ids = self._sentence_buffer_ids[end_idx + 1:]
+            self._sentence_buffer_logprobs = self._sentence_buffer_logprobs[end_idx + 1:]
+            self._sentence_buffer_times = self._sentence_buffer_times[end_idx + 1:]
+            self._sentence_buffer_start = (
+                self._sentence_buffer_times[0] if self._sentence_buffer_times else None
+            )
+            self._pending_commit_idx = None
+
         for tid, t, lp in new_tokens:
+            try:
+                tok_str = tokenizer.ids_to_tokens([tid])[0]
+            except Exception:
+                tok_str = ""
+
+            # Resolve any pending '.' commit FIRST, before this token enters
+            # the buffer. The current token's surface form tells us whether
+            # the prior '.' was a real boundary.
+            if self._pending_commit_idx is not None:
+                if _looks_like_sentence_start(tok_str):
+                    end_t = self._sentence_buffer_times[self._pending_commit_idx]
+                    _emit_through(self._pending_commit_idx, end_t)
+                else:
+                    # False alarm — abbreviation / decimal continues.
+                    self._pending_commit_idx = None
+
+            # Now append this token to the (possibly truncated) buffer.
             if self._sentence_buffer_start is None:
                 self._sentence_buffer_start = t
             self._sentence_buffer_ids.append(tid)
             self._sentence_buffer_logprobs.append(lp)
             self._sentence_buffer_times.append(t)
             self._sentence_buffer_last_t = t
-            try:
-                tok = tokenizer.ids_to_tokens([tid])[0]
-            except Exception:
-                tok = ""
-            if tok and tok[-1] in ".!?":
+
+            last_char = tok_str[-1] if tok_str else ""
+            if last_char in "!?":
+                # Unambiguous — commit immediately.
+                _emit_through(len(self._sentence_buffer_ids) - 1, t)
+            elif last_char == ".":
+                buf_text = tokenizer.ids_to_text(self._sentence_buffer_ids).strip()
+                if not _ends_in_honorific(buf_text):
+                    # Defer the decision until we see the next token.
+                    self._pending_commit_idx = len(self._sentence_buffer_ids) - 1
+
+        if flush_partial:
+            # EOF: commit anything left, pending or not.
+            if self._sentence_buffer_ids:
                 text = tokenizer.ids_to_text(self._sentence_buffer_ids).strip()
                 if text:
                     has_lps = any(x is not None for x in self._sentence_buffer_logprobs)
                     segments.append(_whisper_segment(
                         self._next_seg_id,
                         self._sentence_buffer_start or 0.0,
-                        t,
+                        self._sentence_buffer_last_t,
                         text,
                         self._sentence_buffer_ids,
                         avg_logprob=_avg_logprob(self._sentence_buffer_logprobs) if has_lps else None,
@@ -725,22 +869,5 @@ class StreamingPrevBatchedEngine:
                 self._sentence_buffer_logprobs = []
                 self._sentence_buffer_times = []
                 self._sentence_buffer_start = None
-        if flush_partial and self._sentence_buffer_ids:
-            text = tokenizer.ids_to_text(self._sentence_buffer_ids).strip()
-            if text:
-                has_lps = any(x is not None for x in self._sentence_buffer_logprobs)
-                segments.append(_whisper_segment(
-                    self._next_seg_id,
-                    self._sentence_buffer_start or 0.0,
-                    self._sentence_buffer_last_t,
-                    text,
-                    self._sentence_buffer_ids,
-                    avg_logprob=_avg_logprob(self._sentence_buffer_logprobs) if has_lps else None,
-                    token_times=self._sentence_buffer_times,
-                ))
-                self._next_seg_id += 1
-            self._sentence_buffer_ids = []
-            self._sentence_buffer_logprobs = []
-            self._sentence_buffer_times = []
-            self._sentence_buffer_start = None
+            self._pending_commit_idx = None
         return segments

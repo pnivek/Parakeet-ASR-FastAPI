@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react'
+import { createContext, memo, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { TranscriptionResponse } from '../lib/api'
 import type { VerboseJsonResponse, WhisperSegment, Word } from '../lib/types'
 import { play, seek, useCurrentTime } from '../lib/playback'
@@ -53,7 +53,11 @@ export const TranscriptSection = memo(function TranscriptSection({
   partialWords,
 }: Props) {
   const [view, setView] = useState<View>('text')
-  const bodyRef = useRef<HTMLDivElement | null>(null)
+  // Callback ref so LazyChunks downstream can react to the scroll
+  // container becoming available (IntersectionObserver needs its root).
+  // Doubles as the bodyRef the auto-follow + scroll handlers need.
+  const [bodyEl, setBodyEl] = useState<HTMLDivElement | null>(null)
+  const bodyRef = (el: HTMLDivElement | null) => setBodyEl(el)
   // `stuck` = pinned to the bottom (auto-follow). Scrolling up breaks
   // the pin; scrolling back to the bottom (or the Follow button) restores
   // it. `lastTopRef` lets us tell a user scroll-up from our own writes:
@@ -62,7 +66,7 @@ export const TranscriptSection = memo(function TranscriptSection({
   const [stuck, setStuck] = useState(true)
   const lastTopRef = useRef(0)
   const followBottom = () => {
-    const el = bodyRef.current
+    const el = bodyEl
     if (!el) return
     // Smooth scroll on a multi-thousand-pixel-tall scroller is heavy —
     // the browser has to compute intermediate positions and reflow on
@@ -86,7 +90,7 @@ export const TranscriptSection = memo(function TranscriptSection({
   }, [live, stuck, result, partialSegment, partialWords, view])
 
   const onBodyScroll = () => {
-    const el = bodyRef.current
+    const el = bodyEl
     if (!el) return
     const cur = el.scrollTop
     const dist = el.scrollHeight - cur - el.clientHeight
@@ -173,6 +177,7 @@ export const TranscriptSection = memo(function TranscriptSection({
             wordArrivals={wordArrivals}
             partialSegment={partialSegment ?? null}
             partialWords={partialWords ?? []}
+            scrollRoot={bodyEl}
           />
         )}
       </div>
@@ -197,6 +202,7 @@ function VerboseBody({
   wordArrivals,
   partialSegment,
   partialWords,
+  scrollRoot,
 }: {
   body: VerboseJsonResponse
   view: View
@@ -206,6 +212,7 @@ function VerboseBody({
   wordArrivals: Map<number, number>
   partialSegment: WhisperSegment | null
   partialWords: Word[]
+  scrollRoot: HTMLElement | null
 }) {
   // Text view doesn't need currentTime at all — ActiveWordTracker
   // subscribes itself + drives the underline imperatively. Bypass the
@@ -219,6 +226,7 @@ function VerboseBody({
         live={live}
         wordArrivals={wordArrivals}
         partialWords={partialWords}
+        scrollRoot={scrollRoot}
       />
     )
   if (view === 'segments')
@@ -355,18 +363,20 @@ const Word = memo(function Word({
   start,
   reveal,
   partial,
-  isLast,
 }: {
   idx: number
   word: string
   start: number
   reveal: boolean
   partial: boolean
-  isLast: boolean
 }) {
   const classes = ['editorial-word']
   if (partial) classes.push('editorial-word--partial')
   if (reveal) classes.push('word-reveal')
+  // Always emit trailing space — makes spans-mode and text-node-mode
+  // chunks visually identical (text-node chunks always end in space).
+  // The very last word in the entire transcript has an invisible
+  // trailing space, which is fine.
   return (
     <>
       <span
@@ -380,28 +390,44 @@ const Word = memo(function Word({
       >
         {word}
       </span>
-      {!isLast && ' '}
+      {' '}
     </>
   )
 })
 
-/** One sentence-bounded segment's worth of word spans.
+/** Function passed via context to LazyChunk so chunks can register with
+ * the parent's shared IntersectionObserver. Returns an unobserve
+ * function. Null when no observer is wired up yet (chunks render
+ * text-mode by default until they hear from the IO). */
+type ChunkObserveFn = (
+  el: Element,
+  cb: (isIntersecting: boolean) => void,
+) => () => void
+const ChunkObserverContext = createContext<ChunkObserveFn | null>(null)
+
+/** One sentence-bounded segment, rendered in one of two modes:
  *
- * Memo comparator deliberately IGNORES the `words` array reference —
- * a committed segment is finalized server-side and its word slice never
- * changes content after it lands. We only need to re-render when the
- * segment identity or its index window changes (which only happens for
- * the NEWEST segment when a fresh commit lands). All old chunks bail,
- * meaning a 27 k-word transcript only walks ~1 new chunk's worth of
- * children per commit instead of all 27 k.
+ *  - **Text mode** (default, off-screen): a single text node containing
+ *    the segment's full text. ~1 DOM node per chunk regardless of word
+ *    count. Layout cost ~zero per chunk.
+ *  - **Spans mode** (on-screen + nearby): full Word spans for cursor
+ *    underline tracking and click-to-seek. Mounted only while the chunk
+ *    is within the IO's rootMargin of the scroll viewport.
  *
- * `display: contents` on the wrapper means the children flow inline as
- * if the wrapper weren't there — text layout is identical to a flat
- * span list.
+ * The wrapper uses `display: inline` so both modes flow inline within
+ * the editorial body. Text always ends with a trailing space, matching
+ * the trailing space Word always emits, so chunk-to-chunk spacing is
+ * identical across modes.
+ *
+ * Memo comparator ignores the `words` array reference — committed
+ * segments are finalized server-side so the slice content never changes
+ * after this chunk's first render. Only re-renders when identity or
+ * index window changes (= for the newest segment after each commit).
  */
-const SegmentChunk = memo(
-  function SegmentChunk({
+const LazyChunk = memo(
+  function LazyChunk({
     segId,
+    text,
     startIdx,
     endIdx,
     words,
@@ -409,16 +435,44 @@ const SegmentChunk = memo(
     wordArrivals,
   }: {
     segId: number
+    text: string
     startIdx: number
     endIdx: number
     words: Word[]
     live: boolean
     wordArrivals: Map<number, number>
   }) {
-    void segId // identity prop; consumed by the memo comparator
+    void segId // identity prop, consumed by memo comparator
+    const wrapperRef = useRef<HTMLSpanElement | null>(null)
+    const [mounted, setMounted] = useState(false)
+    const observe = useContext(ChunkObserverContext)
+
+    useEffect(() => {
+      const el = wrapperRef.current
+      if (!el || !observe) return
+      return observe(el, setMounted)
+    }, [observe])
+
+    if (!mounted) {
+      // Off-screen: single text node, inline. ~1 DOM node + 1 text
+      // node total. Browser layouts the text string as one wrappable
+      // run, which is much cheaper than per-word spans.
+      return <span ref={wrapperRef}>{text + ' '}</span>
+    }
+    // On-screen: full Word spans for cursor + click-to-seek.
+    // Reveal animation only fires for words that arrived recently —
+    // when the user scrolls back through old text the chunk remounts
+    // and we'd otherwise re-trigger the keyframe on hours-old words,
+    // which reads as a wave of "new" text appearing. The 2s window
+    // covers the actual reveal duration with a small safety margin.
+    const now = performance.now()
+    const REVEAL_MAX_AGE_MS = 2000
     const out: React.ReactElement[] = []
     for (let i = startIdx; i < endIdx; i++) {
       const w = words[i]
+      const arrival = wordArrivals.get(i)
+      const reveal =
+        live && arrival !== undefined && now - arrival < REVEAL_MAX_AGE_MS
       out.push(
         <Word
           key={i}
@@ -426,57 +480,105 @@ const SegmentChunk = memo(
           word={w.word}
           start={w.start}
           partial={false}
-          reveal={live && wordArrivals.has(i)}
-          isLast={false}
+          reveal={reveal}
         />,
       )
     }
-    return <span style={{ display: 'contents' }}>{out}</span>
+    return <span ref={wrapperRef}>{out}</span>
   },
   (prev, next) =>
     prev.segId === next.segId &&
     prev.startIdx === next.startIdx &&
     prev.endIdx === next.endIdx &&
+    prev.text === next.text &&
     prev.live === next.live,
 )
 
 /** Renders the COMMITTED word stream chunked by segment. Each chunk is
- * its own memo'd subtree (see SegmentChunk above), so React's
- * reconciliation cost when a new segment commits drops from
- * O(total_words) → O(segments) at the chunk level + O(words in new
- * segment) inside the new chunk. Old chunks bail without descending. */
+ * a memo'd LazyChunk that swaps between text-mode (off-screen, cheap)
+ * and spans-mode (on-screen, full Word components). At any moment only
+ * ~5-10 chunks are in spans-mode regardless of total segment count, so
+ * DOM size and layout cost are flat in long sessions.
+ *
+ * The IntersectionObserver is shared across all chunks via context (one
+ * IO instance, many observed targets) — much cheaper than per-chunk
+ * observers at 2700+ segments.
+ */
 const CommittedWordList = memo(function CommittedWordList({
   segments,
   words,
   live,
   wordArrivals,
+  scrollRoot,
 }: {
   segments: WhisperSegment[]
   words: Word[]
   live: boolean
   wordArrivals: Map<number, number>
+  scrollRoot: HTMLElement | null
 }) {
-  // Partition words across segments by start time. Walks segments + words
-  // once per commit; cheap (a few µs even at 2700 segments / 27k words).
   const partition = useMemo(() => {
-    const out: Array<{ segId: number; startIdx: number; endIdx: number }> = []
+    const out: Array<{
+      segId: number
+      text: string
+      startIdx: number
+      endIdx: number
+    }> = []
     let wIdx = 0
     for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i]
       const startIdx = wIdx
       const nextSegStart =
         i + 1 < segments.length ? segments[i + 1].start : Infinity
       while (wIdx < words.length && words[wIdx].start < nextSegStart) wIdx++
-      out.push({ segId: segments[i].id, startIdx, endIdx: wIdx })
+      out.push({
+        segId: seg.id,
+        text: (seg.text || '').trim(),
+        startIdx,
+        endIdx: wIdx,
+      })
     }
     return out
   }, [segments, words])
 
+  // Shared IO — one instance, all chunks register via context.
+  // rootMargin 800px gives us ~3-4 viewports of pre-mount buffer so
+  // chunks are ready as the user scrolls into them.
+  const [observe, setObserve] = useState<ChunkObserveFn | null>(null)
+  useEffect(() => {
+    if (!scrollRoot) return
+    const callbacks = new Map<Element, (v: boolean) => void>()
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const cb = callbacks.get(entry.target)
+          if (cb) cb(entry.isIntersecting)
+        }
+      },
+      { root: scrollRoot, rootMargin: '800px' },
+    )
+    const fn: ChunkObserveFn = (el, cb) => {
+      callbacks.set(el, cb)
+      io.observe(el)
+      return () => {
+        callbacks.delete(el)
+        io.unobserve(el)
+      }
+    }
+    setObserve(() => fn)
+    return () => {
+      io.disconnect()
+      setObserve(null)
+    }
+  }, [scrollRoot])
+
   return (
-    <>
+    <ChunkObserverContext.Provider value={observe}>
       {partition.map((p) => (
-        <SegmentChunk
+        <LazyChunk
           key={p.segId}
           segId={p.segId}
+          text={p.text}
           startIdx={p.startIdx}
           endIdx={p.endIdx}
           words={words}
@@ -484,7 +586,7 @@ const CommittedWordList = memo(function CommittedWordList({
           wordArrivals={wordArrivals}
         />
       ))}
-    </>
+    </ChunkObserverContext.Provider>
   )
 })
 
@@ -500,7 +602,6 @@ const PartialWordList = memo(function PartialWordList({
   partialWords: Word[]
   offset: number
 }) {
-  const total = partialWords.length
   return (
     <>
       {partialWords.map((w, i) => (
@@ -511,7 +612,6 @@ const PartialWordList = memo(function PartialWordList({
           start={w.start}
           partial={true}
           reveal={false}
-          isLast={i === total - 1}
         />
       ))}
     </>
@@ -523,6 +623,7 @@ function PlainText({
   live,
   wordArrivals,
   partialWords,
+  scrollRoot,
 }: {
   body: VerboseJsonResponse
   /** True only while transcripts are arriving mid-stream — drives the
@@ -530,6 +631,7 @@ function PlainText({
   live: boolean
   wordArrivals: Map<number, number>
   partialWords: Word[]
+  scrollRoot: HTMLElement | null
 }) {
   const committed = body.words ?? []
   const containerRef = useRef<HTMLDivElement | null>(null)
@@ -545,6 +647,7 @@ function PlainText({
         words={committed}
         live={live}
         wordArrivals={wordArrivals}
+        scrollRoot={scrollRoot}
       />
       <PartialWordList partialWords={partialWords} offset={committed.length} />
       <ActiveWordTracker

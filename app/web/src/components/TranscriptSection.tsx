@@ -213,7 +213,6 @@ function VerboseBody({
     return (
       <PlainText
         body={body}
-        live={live}
         partialSegment={partialSegment}
         partialWords={partialWords}
         scrollRoot={scrollRoot}
@@ -372,76 +371,22 @@ function caretFromPoint(
   return null
 }
 
-/** Concatenate words into their text representation and return the
- * character offset of each word's start in that concatenation.
- *
- *   words = [{word:'Hi'}, {word:'there'}, {word:'!'}]
- *   text = "Hi there !"
- *   offsets = [0, 3, 9]
- *
- * Words are joined by single spaces — same convention as the engine's
- * `seg.text`. Cursor + click math both work against these offsets. */
-function buildTextAndOffsets(words: Word[]): { text: string; offsets: number[] } {
-  const offsets: number[] = new Array(words.length)
-  let pos = 0
-  const parts: string[] = new Array(words.length)
-  for (let i = 0; i < words.length; i++) {
-    offsets[i] = pos
-    parts[i] = words[i].word
-    pos += words[i].word.length + 1 // +1 for the joining space
-  }
-  return { text: parts.join(' '), offsets }
-}
-
-/** Apply a CSS Highlight to a range covering newly-committed text, then
- * remove after `MS` so the area falls back to the default committed
- * (white) color. Color rule lives in `App.css` under
- * `::highlight(just-committed)`. Browser support check is defensive —
- * Highlight API is in Chromium 105+, WebKit 17.2+; falls back to no-op
- * (the text just appears committed immediately) on older browsers. */
-const JUST_COMMITTED_MS = 320
-function flashJustCommitted(textNode: Node, start: number, end: number): void {
-  type CSSWithHighlights = typeof CSS & { highlights?: { get: (name: string) => unknown; set: (name: string, h: unknown) => void } }
-  type WithHighlight = Window & { Highlight?: new (...ranges: Range[]) => { add: (r: Range) => void; delete: (r: Range) => void } }
-  const cssH = (CSS as CSSWithHighlights).highlights
-  const HighlightCtor = (window as unknown as WithHighlight).Highlight
-  if (!cssH || !HighlightCtor) return
-  let highlight = cssH.get('just-committed') as { add: (r: Range) => void; delete: (r: Range) => void } | undefined
-  if (!highlight) {
-    highlight = new HighlightCtor()
-    cssH.set('just-committed', highlight)
-  }
-  const range = document.createRange()
-  try {
-    range.setStart(textNode, start)
-    range.setEnd(textNode, end)
-  } catch {
-    return // text node was replaced before we got here; bail.
-  }
-  highlight.add(range)
-  setTimeout(() => {
-    try {
-      highlight!.delete(range)
-    } catch {
-      /* range/highlight gone; nothing to do */
-    }
-  }, JUST_COMMITTED_MS)
-}
-
-/** Pure text-node renderer. Two spans (committed + partial), one click
- * handler, one underline overlay. Scales O(1) in DOM with session
- * length. */
+/** Pure text-node renderer. ONE text span carries the entire transcript
+ * (committed words + in-flight partial words joined by spaces). The
+ * partial tail is coloured grey via the CSS Highlight API — a Range
+ * positioned over the partial char range, with `::highlight(partial)`
+ * setting the color in CSS. When a chunk commits, only the highlight
+ * range shrinks — the text node content at the formerly-partial
+ * positions doesn't change, so there's zero layout shift and the
+ * transition is literally "characters change color" without any
+ * content/height jitter to bounce the auto-scroll. */
 function PlainText({
   body,
-  live,
   partialSegment,
   partialWords,
   scrollRoot,
 }: {
   body: VerboseJsonResponse
-  /** True only while transcripts are arriving mid-stream. Used by the
-   * just-committed flash logic (don't bother on finalized results). */
-  live: boolean
   partialSegment: WhisperSegment | null
   partialWords: Word[]
   /** Kept for prop signature compat with VerboseBody — not used in
@@ -453,104 +398,110 @@ function PlainText({
 
   const committed = body.words ?? []
   const containerRef = useRef<HTMLDivElement | null>(null)
-  const committedSpanRef = useRef<HTMLSpanElement | null>(null)
-  const partialSpanRef = useRef<HTMLSpanElement | null>(null)
+  const textSpanRef = useRef<HTMLSpanElement | null>(null)
 
-  // Text + offset arrays for committed and partial. Recompute when
-  // committed length OR partial words change. Cheap even at 27k words —
-  // a single linear walk per recompute (~ms).
-  const { text: committedText, offsets: committedOffsets } = useMemo(
-    () => buildTextAndOffsets(committed),
-    [committed],
-  )
-  const { text: partialText, offsets: partialOffsets } = useMemo(
-    () => buildTextAndOffsets(partialWords),
-    [partialWords],
-  )
+  // Build the full joined text + per-word char offsets in one pass.
+  // Committed words first, then partial. The partial start offset is
+  // the boundary the highlight Range anchors to. Recomputed only when
+  // committed or partialWords actually change identity (React batches
+  // partial updates well — typically ~4 Hz during streaming).
+  const { text, offsets, partialStartChar } = useMemo(() => {
+    const total = committed.length + partialWords.length
+    const offsets: number[] = new Array(total)
+    const parts: string[] = new Array(total)
+    let pos = 0
+    for (let i = 0; i < committed.length; i++) {
+      offsets[i] = pos
+      parts[i] = committed[i].word
+      pos += committed[i].word.length + 1
+    }
+    const partialStart = pos
+    for (let i = 0; i < partialWords.length; i++) {
+      offsets[committed.length + i] = pos
+      parts[committed.length + i] = partialWords[i].word
+      pos += partialWords[i].word.length + 1
+    }
+    return { text: parts.join(' '), offsets, partialStartChar: partialStart }
+  }, [committed, partialWords])
 
-  // Fade newly-committed text from grey → default. Tracks committed
-  // length across renders; on growth, applies a brief CSS Highlight to
-  // the new character range so it stays muted for ~320ms before
-  // snapping back to default. Only runs in live mode (finalized
-  // results don't need the indicator).
-  const prevCommittedLenRef = useRef<number>(0)
+  // Position the 'partial' CSS Highlight over the partial char range.
+  // Replaced (not mutated) every time the boundary shifts so the
+  // highlight never holds a stale Range. When `partialWords.length`
+  // hits 0, the highlight is cleared instead — no partial tail to
+  // colour. The Highlight API is supported in Chromium 105+ /
+  // WebKit 17.2+; on older engines the partial text just renders in
+  // the default colour (graceful degradation; no JS error).
   useEffect(() => {
-    const prev = prevCommittedLenRef.current
-    const curr = committed.length
-    prevCommittedLenRef.current = curr
-    if (!live) return
-    if (curr <= prev) return // no new commit
-    const span = committedSpanRef.current
+    type CSSWithHighlights = typeof CSS & {
+      highlights?: {
+        get: (name: string) => unknown
+        set: (name: string, h: unknown) => void
+        delete: (name: string) => void
+      }
+    }
+    type WithHighlight = Window & {
+      Highlight?: new (...ranges: Range[]) => unknown
+    }
+    const cssH = (CSS as CSSWithHighlights).highlights
+    const HighlightCtor = (window as unknown as WithHighlight).Highlight
+    if (!cssH || !HighlightCtor) return
+    const span = textSpanRef.current
     const textNode = span?.firstChild
-    if (!textNode || textNode.nodeType !== Node.TEXT_NODE) return
-    const startChar = committedOffsets[prev] ?? 0
-    const lastIdx = curr - 1
-    const endChar =
-      committedOffsets[lastIdx] + committed[lastIdx].word.length
-    flashJustCommitted(textNode, startChar, endChar)
-  }, [committed, committedOffsets, live])
+    if (!textNode || textNode.nodeType !== Node.TEXT_NODE) {
+      cssH.delete('partial')
+      return
+    }
+    if (partialWords.length === 0) {
+      cssH.delete('partial')
+      return
+    }
+    const range = document.createRange()
+    try {
+      range.setStart(textNode, partialStartChar)
+      range.setEnd(textNode, text.length)
+    } catch {
+      cssH.delete('partial')
+      return
+    }
+    cssH.set('partial', new HighlightCtor(range))
+  }, [text, partialStartChar, partialWords.length])
 
-  // Click handler: map (x, y) → text caret → character offset → word
-  // index → seek. One handler for the whole editorial body.
+  // Click handler: caret → char offset → word index → seek. Binary
+  // search over the unified offsets array (committed + partial in one).
   const onClick = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
       const caret = caretFromPoint(e.clientX, e.clientY)
       if (!caret) return
-      const node = caret.node
+      const span = textSpanRef.current
+      if (!span || caret.node !== span.firstChild) return
       const offset = caret.offset
-      const committedSpan = committedSpanRef.current
-      const partialSpan = partialSpanRef.current
-      let inCommitted = false
-      let inPartial = false
-      if (committedSpan && node === committedSpan.firstChild) inCommitted = true
-      else if (partialSpan && node === partialSpan.firstChild) inPartial = true
-      if (inCommitted) {
-        // Binary search committedOffsets for the largest entry ≤ offset.
-        let lo = 0,
-          hi = committedOffsets.length - 1,
-          found = -1
-        while (lo <= hi) {
-          const mid = (lo + hi) >> 1
-          if (committedOffsets[mid] <= offset) {
-            found = mid
-            lo = mid + 1
-          } else {
-            hi = mid - 1
-          }
-        }
-        if (found >= 0) {
-          seek(committed[found].start)
-          play()
-        }
-      } else if (inPartial) {
-        let lo = 0,
-          hi = partialOffsets.length - 1,
-          found = -1
-        while (lo <= hi) {
-          const mid = (lo + hi) >> 1
-          if (partialOffsets[mid] <= offset) {
-            found = mid
-            lo = mid + 1
-          } else {
-            hi = mid - 1
-          }
-        }
-        if (found >= 0) {
-          seek(partialWords[found].start)
-          play()
+      let lo = 0,
+        hi = offsets.length - 1,
+        found = -1
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1
+        if (offsets[mid] <= offset) {
+          found = mid
+          lo = mid + 1
+        } else {
+          hi = mid - 1
         }
       }
+      if (found < 0) return
+      const word =
+        found < committed.length
+          ? committed[found]
+          : partialWords[found - committed.length]
+      seek(word.start)
+      play()
     },
-    [committed, committedOffsets, partialWords, partialOffsets],
+    [committed, partialWords, offsets],
   )
 
   if (committed.length === 0 && partialWords.length === 0) {
     return <div className="editorial-body">{body.text}</div>
   }
 
-  // Both spans always render so the spans have stable DOM identity
-  // across renders — React updates their text content in place rather
-  // than mounting/unmounting them.
   return (
     <div
       className="editorial-body"
@@ -558,20 +509,12 @@ function PlainText({
       onClick={onClick}
       style={{ position: 'relative', cursor: 'text' }}
     >
-      <span ref={committedSpanRef}>
-        {committedText}
-        {committedText && partialText ? ' ' : ''}
-      </span>
-      <span ref={partialSpanRef} className="editorial-text--partial">
-        {partialText}
-      </span>
+      <span ref={textSpanRef}>{text}</span>
       <CursorOverlay
         committed={committed}
-        committedOffsets={committedOffsets}
         partialWords={partialWords}
-        partialOffsets={partialOffsets}
-        committedSpanRef={committedSpanRef}
-        partialSpanRef={partialSpanRef}
+        offsets={offsets}
+        textSpanRef={textSpanRef}
         containerRef={containerRef}
       />
     </div>
@@ -581,24 +524,18 @@ function PlainText({
 /** Plays the role of the old `ActiveWordTracker`. Subscribes to
  * `useCurrentTime()`, computes the active word index, and imperatively
  * positions an absolutely-positioned underline span via the Range API
- * (instead of looking up per-word elements by ID).
- *
- * Same monotonic-forward guard + seek-back reset as the old tracker. */
+ * over the single text node. */
 function CursorOverlay({
   committed,
-  committedOffsets,
   partialWords,
-  partialOffsets,
-  committedSpanRef,
-  partialSpanRef,
+  offsets,
+  textSpanRef,
   containerRef,
 }: {
   committed: Word[]
-  committedOffsets: number[]
   partialWords: Word[]
-  partialOffsets: number[]
-  committedSpanRef: React.RefObject<HTMLSpanElement | null>
-  partialSpanRef: React.RefObject<HTMLSpanElement | null>
+  offsets: number[]
+  textSpanRef: React.RefObject<HTMLSpanElement | null>
   containerRef: React.RefObject<HTMLDivElement | null>
 }) {
   const t = useCurrentTime()
@@ -676,22 +613,17 @@ function CursorOverlay({
     if (activeIdx === lastIdxRef.current) return
     lastIdxRef.current = activeIdx
 
-    const inCommitted = activeIdx < committed.length
-    const span = inCommitted ? committedSpanRef.current : partialSpanRef.current
+    const span = textSpanRef.current
     const textNode = span?.firstChild
     if (!textNode || textNode.nodeType !== Node.TEXT_NODE) return
 
-    let charStart: number
-    let wordLen: number
-    if (inCommitted) {
-      charStart = committedOffsets[activeIdx]
-      wordLen = committed[activeIdx].word.length
-    } else {
-      const pi = activeIdx - committed.length
-      if (pi >= partialWords.length) return
-      charStart = partialOffsets[pi]
-      wordLen = partialWords[pi].word.length
-    }
+    const charStart = offsets[activeIdx]
+    const word =
+      activeIdx < committed.length
+        ? committed[activeIdx]
+        : partialWords[activeIdx - committed.length]
+    if (!word) return
+    const wordLen = word.word.length
 
     const range = document.createRange()
     try {
@@ -707,16 +639,7 @@ function CursorOverlay({
       wRect.bottom - cRect.top - 2
     }px)`
     line.style.width = `${wRect.width}px`
-  }, [
-    activeIdx,
-    committed,
-    committedOffsets,
-    partialWords,
-    partialOffsets,
-    committedSpanRef,
-    partialSpanRef,
-    containerRef,
-  ])
+  }, [activeIdx, committed, partialWords, offsets, textSpanRef, containerRef])
 
   // Resize handler — wrap shifts invalidate the cached underline position.
   useEffect(() => {

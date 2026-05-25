@@ -1019,17 +1019,13 @@ body {
   display: inline-block;
 }
 
-/* Partial (in-flight) text — same dimmed treatment the old per-word
- * partials had, but applied to one contiguous span. */
-.editorial-text--partial {
-  color: var(--muted);
-}
-
-/* Just-committed flash — applied via CSS Highlight API in TranscriptSection
- * to the character range of words that crossed from partial → committed
- * on this render. Highlight is removed after ~320ms so the text falls
- * back to default (white) color, giving a subtle grey→white reveal. */
-::highlight(just-committed) {
+/* Partial (in-flight) text — coloured via the CSS Highlight API in
+ * TranscriptSection. The committed text + the partial tail live in one
+ * text node so commits don't restructure the DOM; the highlight Range
+ * just shrinks. End result: chunks transitioning from partial to
+ * committed look like the characters changing colour, with zero
+ * layout shift / scroll bounce. */
+::highlight(partial) {
   color: var(--muted);
 }
 

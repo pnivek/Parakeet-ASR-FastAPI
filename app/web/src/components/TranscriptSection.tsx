@@ -248,11 +248,6 @@ function SegmentsView({
     () => segments.findIndex((s) => t >= s.start && t <= s.end),
     [segments, t],
   )
-  // Partial row is "active" once playback reaches its start; we don't
-  // gate on end because the engine is still extending it. Lets the
-  // active highlight follow the cursor into preview text.
-  const partialActive =
-    partialSegment !== null && t >= partialSegment.start
   return (
     <SegmentRows
       segments={segments}
@@ -260,7 +255,6 @@ function SegmentsView({
       live={live}
       segmentArrivals={segmentArrivals}
       partialSegment={partialSegment}
-      partialActive={partialActive}
     />
   )
 }
@@ -628,16 +622,12 @@ function SegmentRows({
   live,
   segmentArrivals,
   partialSegment,
-  partialActive = false,
 }: {
   segments: WhisperSegment[]
   activeIdx: number
   live: boolean
   segmentArrivals: Map<number, number>
   partialSegment: WhisperSegment | null
-  /** True when audio playback has reached the in-flight partial row's
-   * start — extends the active highlight into preview text. */
-  partialActive?: boolean
 }) {
   const [openId, setOpenId] = useState<number | null>(null)
 
@@ -667,7 +657,10 @@ function SegmentRows({
   return (
     <div className="segs-list">
       {rows.map(({ seg: s, partial, activeIdx: i }) => {
-        const active = partial ? partialActive : i === activeIdx
+        // Partial rows keep their --partial dimming regardless of where
+        // the playhead is — the active highlight only marks committed
+        // rows so preview text stays visually "tentative."
+        const active = !partial && i === activeIdx
         const open = !partial && openId === s.id
         const reveal = !partial && live && segmentArrivals.has(s.id)
         const cls = [

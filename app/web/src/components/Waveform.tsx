@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useRef } from 'react'
-import { play, seek } from '../lib/playback'
+import { getAudioElement, play, seek } from '../lib/playback'
 
 interface Props {
   peaks: number[] | null
-  currentTime: number
-  duration: number
   height?: number
   barWidth?: number
   gap?: number
@@ -15,19 +13,21 @@ interface Props {
 }
 
 /**
- * Horizontal bar waveform rendered to a single canvas. Played portion
- * uses `accent`; the rest is `dim`. Click anywhere along the strip to
- * seek the audio.
+ * Horizontal bar waveform on a single canvas. Played portion uses
+ * `accent`; the rest is `dim`. Click anywhere to seek the audio.
  *
- * Canvas-based on purpose: the SVG version reconciled 220 <rect> nodes
- * per `currentTime` tick (~60 Hz) because each bar's fill depended on
- * the cutoff position. Canvas turns that into a single imperative paint
- * per change — no React reconcile, no per-bar prop diff.
+ * **Self-driven via requestAnimationFrame** — the canvas draws every
+ * frame from the latest peaks (via ref) + audio element's currentTime
+ * + duration (read imperatively). This decouples the canvas update
+ * from React's commit + browser layout cycle: even if the main thread
+ * is briefly blocked by heavy DOM work elsewhere, the rAF loop still
+ * fires per frame and keeps the waveform smooth.
+ *
+ * Skips redundant draws via hash comparison so 60Hz ticks with no
+ * change are cheap (just a cache check, no canvas re-paint).
  */
 export function Waveform({
   peaks,
-  currentTime,
-  duration,
   height = 90,
   barWidth = 2.6,
   gap = 1.4,
@@ -39,6 +39,10 @@ export function Waveform({
   // canvas fills its container and stays sharp on Retina (DPR scaling
   // is handled inside draw()).
   const widthRef = useRef<number>(0)
+  // Latest peaks ref — refreshed every render so the rAF loop reads
+  // the current value without React re-subscribing.
+  const peaksRef = useRef<number[] | null>(peaks)
+  peaksRef.current = peaks
 
   // Resolve the CSS color tokens (`var(--accent)`) into actual color
   // strings exactly once per mount. Canvas 2D doesn't accept CSS
@@ -58,13 +62,18 @@ export function Waveform({
     return colorsRef.current
   }, [accent, dim])
 
+  // Imperative draw. Reads all dynamic inputs at call time so the rAF
+  // caller doesn't need to thread them in.
   const draw = useCallback(() => {
     const canvas = canvasRef.current
     if (!canvas) return
     const w = widthRef.current || canvas.clientWidth || 0
     if (w <= 0) return
+    const peaks = peaksRef.current
+    const el = getAudioElement()
+    const currentTime = el.currentTime
+    const duration = isFinite(el.duration) && el.duration > 0 ? el.duration : 0
     const dpr = window.devicePixelRatio || 1
-    // Keep the backing store at device-pixel resolution.
     const targetW = Math.round(w * dpr)
     const targetH = Math.round(height * dpr)
     if (canvas.width !== targetW) canvas.width = targetW
@@ -77,8 +86,6 @@ export function Waveform({
 
     const data = peaks ?? new Array(220).fill(0.18)
     const N = data.length
-    // Fit the bars to the actual canvas width — keep barWidth/gap ratio
-    // but scale so the strip ends flush with the right edge.
     const totalNatural = N * (barWidth + gap)
     const scale = totalNatural > 0 ? w / totalNatural : 1
     const sBw = barWidth * scale
@@ -87,8 +94,6 @@ export function Waveform({
     const cutoff = progress * N
     const { accent: accentColor, dim: dimColor } = resolveColors()
 
-    // Two passes: dim bars first, then accent. Avoids per-bar fillStyle
-    // churn (more cache-friendly on the GPU compositor).
     const radius = sBw / 2
     for (let pass = 0; pass < 2; pass++) {
       ctx.fillStyle = pass === 0 ? dimColor : accentColor
@@ -99,13 +104,11 @@ export function Waveform({
         const h = Math.max(2, data[i] * (height - 4))
         const y = (height - h) / 2
         const x = i * (sBw + sGap)
-        // roundRect is widely supported in modern browsers.
         ctx.roundRect(x, y, sBw, h, radius)
       }
       ctx.fill()
     }
 
-    // Playhead — a thin accent line at the progress position.
     const px = progress * w
     ctx.strokeStyle = accentColor
     ctx.lineWidth = 1.5
@@ -118,15 +121,37 @@ export function Waveform({
     ctx.globalAlpha = 1
 
     ctx.restore()
-  }, [peaks, currentTime, duration, height, barWidth, gap, resolveColors])
+  }, [height, barWidth, gap, resolveColors])
 
-  // Repaint on any prop change.
+  // Self-driven rAF loop. Runs continuously while the component is
+  // mounted; skips actual canvas painting when nothing changed (hash
+  // comparison). Cheap when idle (~one comparison per frame), runs in
+  // the compositor-friendly rAF callback queue so it's never blocked
+  // by React commit timing.
   useEffect(() => {
-    draw()
+    let raf = 0
+    let lastHash = ''
+    const tick = () => {
+      const canvas = canvasRef.current
+      const el = getAudioElement()
+      const peaks = peaksRef.current
+      const w = canvas?.clientWidth ?? 0
+      // Round to a coarse-enough hash that tiny float jitter doesn't
+      // trigger a paint, but precise enough to look smooth.
+      const hash = `${peaks?.length ?? 0}|${el.currentTime.toFixed(2)}|${el.duration.toFixed(0)}|${w}`
+      if (hash !== lastHash) {
+        draw()
+        lastHash = hash
+      }
+      raf = requestAnimationFrame(tick)
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
   }, [draw])
 
-  // Observe the container so the canvas re-fits on window/layout
-  // resizes (e.g. sidebar toggling, viewport changes).
+  // Observe the container for resize → trigger a fresh draw via the
+  // width change. The rAF loop's hash includes width so it picks up
+  // the change on the next tick.
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -135,27 +160,23 @@ export function Waveform({
         const next = Math.round(entry.contentRect.width)
         if (next > 0 && next !== widthRef.current) {
           widthRef.current = next
-          draw()
         }
       }
     })
     ro.observe(canvas)
-    // Seed with the current width.
     widthRef.current = canvas.clientWidth
-    draw()
     return () => ro.disconnect()
-  }, [draw])
+  }, [])
 
-  const onClick = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (duration <= 0) return
-      const r = e.currentTarget.getBoundingClientRect()
-      const ratio = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width))
-      seek(ratio * duration)
-      play()
-    },
-    [duration],
-  )
+  const onClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const el = getAudioElement()
+    const duration = isFinite(el.duration) && el.duration > 0 ? el.duration : 0
+    if (duration <= 0) return
+    const r = e.currentTarget.getBoundingClientRect()
+    const ratio = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width))
+    seek(ratio * duration)
+    play()
+  }, [])
 
   return (
     <canvas
@@ -165,7 +186,7 @@ export function Waveform({
         display: 'block',
         width: '100%',
         height,
-        cursor: duration > 0 ? 'pointer' : 'default',
+        cursor: 'pointer',
       }}
     />
   )

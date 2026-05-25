@@ -163,7 +163,7 @@ export function HeroRow({
         {/* Key flip on peaks ready triggers the CSS fade-in. Static
             keys keep the placeholder bars stable. */}
         <div key={peaks ? 'wf-ready' : 'wf-placeholder'} className={peaks ? 'wf-fade-in' : undefined}>
-          <Waveform peaks={peaks} currentTime={t} duration={dur} height={90} />
+          <Waveform peaks={peaks} height={90} />
         </div>
         <div className="hero__wf-times">
           <span>0:00</span>

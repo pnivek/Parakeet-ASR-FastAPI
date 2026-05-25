@@ -63,7 +63,14 @@ export const TranscriptSection = memo(function TranscriptSection({
   const lastTopRef = useRef(0)
   const followBottom = () => {
     const el = bodyRef.current
-    if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+    if (!el) return
+    // Smooth scroll on a multi-thousand-pixel-tall scroller is heavy —
+    // the browser has to compute intermediate positions and reflow on
+    // each frame. After hours of streaming the transcript can be 30k+
+    // pixels tall; snap-scroll there to avoid the perf cost. Smooth
+    // stays on for shorter sessions where the animation reads well.
+    const behavior: ScrollBehavior = el.scrollHeight > 5000 ? 'auto' : 'smooth'
+    el.scrollTo({ top: el.scrollHeight, behavior })
   }
 
   // Re-pin whenever a fresh live stream begins.
@@ -363,6 +370,7 @@ const Word = memo(function Word({
   return (
     <>
       <span
+        id={`tx-word-${idx}`}
         className={classes.join(' ')}
         data-word-idx={idx}
         onClick={() => {
@@ -561,9 +569,11 @@ function ActiveWordTracker({
     if (activeIdx < lastIdxRef.current) return
     if (activeIdx === lastIdxRef.current) return
     lastIdxRef.current = activeIdx
-    const wordEl = container.querySelector<HTMLSpanElement>(
-      `[data-word-idx="${activeIdx}"]`,
-    )
+    // O(1) ID lookup — querySelector with attribute selector is
+    // O(n) worst case on the 27k+ span trees we see after hours of
+    // streaming. Stable id per word index ('tx-word-N') is unique
+    // because there's only one transcript on screen.
+    const wordEl = document.getElementById(`tx-word-${activeIdx}`) as HTMLSpanElement | null
     if (!wordEl) return
     const cRect = container.getBoundingClientRect()
     const wRect = wordEl.getBoundingClientRect()

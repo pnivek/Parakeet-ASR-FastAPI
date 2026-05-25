@@ -1032,6 +1032,10 @@ body {
   border-top: 1px solid var(--rule);
   cursor: pointer;
   transition: color 0.15s;
+  /* Each segment row is independent for layout/paint/style purposes.
+   * Lets the browser skip re-layout of off-screen rows when content
+   * grows or scroll moves — meaningful after thousands of rows. */
+  contain: layout paint style;
 }
 .segs-row:first-child {
   border-top: none;

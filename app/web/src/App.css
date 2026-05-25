@@ -962,7 +962,7 @@ body {
   border: 1px solid color-mix(in oklch, var(--accent) 38%, transparent);
   cursor: pointer;
   box-shadow: 0 6px 20px -8px rgba(0, 0, 0, 0.6);
-  transition: background 0.15s ease, border-color 0.15s ease;
+  transition: background 0.15s ease, border-color 0.15s ease, opacity 120ms ease-out;
 }
 .transcript__follow:hover {
   background: color-mix(in oklch, var(--accent) 22%, var(--bg));

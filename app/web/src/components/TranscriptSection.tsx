@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { TranscriptionResponse } from '../lib/api'
 import type { VerboseJsonResponse, WhisperSegment, Word } from '../lib/types'
 import { play, seek, useCurrentTime } from '../lib/playback'
@@ -50,55 +50,66 @@ export const TranscriptSection = memo(function TranscriptSection({
   partialWords,
 }: Props) {
   const [view, setView] = useState<View>('text')
-  // Callback ref so LazyChunks downstream can react to the scroll
-  // container becoming available (IntersectionObserver needs its root).
-  // Doubles as the bodyRef the auto-follow + scroll handlers need.
   const [bodyEl, setBodyEl] = useState<HTMLDivElement | null>(null)
   const bodyRef = (el: HTMLDivElement | null) => setBodyEl(el)
-  // `stuck` = pinned to the bottom (auto-follow). Scrolling up breaks
-  // the pin; scrolling back to the bottom (or the Follow button) restores
-  // it. `lastTopRef` lets us tell a user scroll-up from our own writes:
-  // auto-follow only ever scrolls DOWN, so any decrease in scrollTop is
-  // the user.
-  const [stuck, setStuck] = useState(true)
-  const lastTopRef = useRef(0)
-  const followBottom = () => {
-    const el = bodyEl
-    if (!el) return
-    // Always instant. Smooth scroll on a tall, fast-growing scroller
-    // queues per-frame layout work that interleaves with React commits
-    // — the result is bouncy + stuttery. Snap-scroll is one paint per
-    // call and is what the user explicitly asked for.
-    el.scrollTo({ top: el.scrollHeight, behavior: 'auto' })
-  }
+  // Bottom sentinel — a 1px invisible div placed after the transcript
+  // content. IntersectionObserver watches its visibility against the
+  // body element as root; that's the only signal we use for both
+  // "user is pinned to bottom" and "should we auto-scroll new content".
+  //
+  // This replaces a scroll-event-based `stuck` state machine that flashed
+  // the Follow button for one frame on every auto-scroll: `scrollTo`
+  // fires a scroll event before layout settles for the just-appended
+  // partial text, the `dist = scrollHeight - scrollTop - clientHeight`
+  // calc reads > 40 momentarily, and the button toggles on/off in a
+  // single render. IO is layout-driven and async — it can't race with
+  // its own writes. Same pattern use-stick-to-bottom + react-virtuoso use.
+  const sentinelRef = useRef<HTMLDivElement | null>(null)
+  // `atBottomRef` is the source of truth for the auto-scroll decision
+  // (read synchronously inside the content-update useLayoutEffect).
+  // `atBottomState` mirrors it for the Follow-button conditional render.
+  // Initialised true so the first batch of content auto-scrolls.
+  const atBottomRef = useRef(true)
+  const [atBottomState, setAtBottomState] = useState(true)
 
-  // Re-pin whenever a fresh live stream begins.
   useEffect(() => {
-    if (live) setStuck(true)
+    if (!bodyEl) return
+    const sentinel = sentinelRef.current
+    if (!sentinel) return
+    const obs = new IntersectionObserver(
+      (entries) => {
+        const visible = entries[0]?.isIntersecting ?? false
+        atBottomRef.current = visible
+        setAtBottomState(visible)
+      },
+      { root: bodyEl, threshold: 0 },
+    )
+    obs.observe(sentinel)
+    return () => obs.disconnect()
+  }, [bodyEl])
+
+  // Force re-pin to bottom when a new live session starts. Otherwise
+  // a "scrolled up" state carried over from a previous session would
+  // suppress auto-follow until the user manually scrolled back.
+  useEffect(() => {
+    if (!live) return
+    atBottomRef.current = true
+    setAtBottomState(true)
+    sentinelRef.current?.scrollIntoView({ block: 'end' })
   }, [live])
 
-  // Follow new content while streaming + pinned. One smooth scroll per
-  // update (~4×/s) toward the *real* bottom — so it can't fall behind,
-  // and there's no per-frame reflow to jank the render.
-  useEffect(() => {
-    if (live && stuck) followBottom()
-  }, [live, stuck, result, partialSegment, partialWords, view])
+  // Auto-scroll: keyed on content changes. `useLayoutEffect` so we
+  // read atBottomRef + write scrollIntoView before the browser paints
+  // the new content, eliminating the flash of un-anchored bottom-edge
+  // before the IO callback fires.
+  useLayoutEffect(() => {
+    if (!live) return
+    if (!atBottomRef.current) return
+    sentinelRef.current?.scrollIntoView({ block: 'end' })
+  }, [live, result, partialSegment, partialWords, view])
 
-  const onBodyScroll = () => {
-    const el = bodyEl
-    if (!el) return
-    const cur = el.scrollTop
-    const dist = el.scrollHeight - cur - el.clientHeight
-    if (cur < lastTopRef.current - 6) {
-      setStuck(false) // user dragged up
-    } else if (dist < 40) {
-      setStuck(true) // back at the bottom
-    }
-    lastTopRef.current = cur
-  }
   const snapToBottom = () => {
-    setStuck(true)
-    followBottom()
+    sentinelRef.current?.scrollIntoView({ block: 'end' })
   }
 
   // Empty state — nothing committed and nothing streaming yet.
@@ -155,7 +166,7 @@ export const TranscriptSection = memo(function TranscriptSection({
           </div>
         )}
       </div>
-      <div className="transcript__body" ref={bodyRef} onScroll={onBodyScroll}>
+      <div className="transcript__body" ref={bodyRef}>
         {result?.format === 'json' && (
           <Code text={JSON.stringify(result.body, null, 2)} filename={filename} />
         )}
@@ -174,15 +185,23 @@ export const TranscriptSection = memo(function TranscriptSection({
             scrollRoot={bodyEl}
           />
         )}
+        <div ref={sentinelRef} aria-hidden style={{ height: 1 }} />
       </div>
-      {live && !stuck && (
-        <button type="button" className="transcript__follow" onClick={snapToBottom}>
-          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-            <path d="M12 5v14M5 12l7 7 7-7" />
-          </svg>
-          Follow
-        </button>
-      )}
+      <button
+        type="button"
+        className="transcript__follow"
+        onClick={snapToBottom}
+        aria-hidden={!live || atBottomState}
+        style={{
+          opacity: live && !atBottomState ? 1 : 0,
+          pointerEvents: live && !atBottomState ? 'auto' : 'none',
+        }}
+      >
+        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+          <path d="M12 5v14M5 12l7 7 7-7" />
+        </svg>
+        Follow
+      </button>
     </section>
   )
 })

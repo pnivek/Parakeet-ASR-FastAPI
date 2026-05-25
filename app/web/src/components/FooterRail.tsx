@@ -54,10 +54,17 @@ export function FooterRail({
   // the cap at min(1, committed/received) is hiding the true
   // lag/overshoot otherwise.
   const tipParts: string[] = []
-  if (offlineRtfx != null && live) {
+  // "Live" formula is only meaningful for true realtime sources (mic
+  // recording in progress, broadcast URL stream). File uploads — even
+  // when streamed via WebSocket — process the source faster than
+  // realtime, and the offline duration/asr_time metric correctly
+  // shows the "X× faster" ratio. Without this gate the live formula
+  // caps at 1.00× LIVE which hides the file's real throughput.
+  const useLiveFormula = live && loaded?.kind !== 'file'
+  if (offlineRtfx != null && useLiveFormula) {
     tipParts.push(`headroom: ${offlineRtfx.toFixed(1)}× (asr_time vs duration)`)
   }
-  if (live) {
+  if (useLiveFormula) {
     // Live ratio expressed in **speech-seconds** so silence/music drops
     // out symmetrically. Server tracks Silero-detected speech in
     // (a) `speech_received_s` (cumulative wall-clock speech ingested)

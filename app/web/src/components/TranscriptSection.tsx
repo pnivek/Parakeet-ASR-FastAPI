@@ -225,6 +225,7 @@ function VerboseBody({
         body={body}
         live={live}
         wordArrivals={wordArrivals}
+        partialSegment={partialSegment}
         partialWords={partialWords}
         scrollRoot={scrollRoot}
       />
@@ -405,65 +406,79 @@ type ChunkObserveFn = (
 ) => () => void
 const ChunkObserverContext = createContext<ChunkObserveFn | null>(null)
 
-/** One sentence-bounded segment, rendered in one of two modes:
+/** One chunk = one sentence-bounded segment, in one of two modes:
  *
- *  - **Text mode** (default, off-screen): a single text node containing
- *    the segment's full text. ~1 DOM node per chunk regardless of word
- *    count. Layout cost ~zero per chunk.
- *  - **Spans mode** (on-screen + nearby): full Word spans for cursor
- *    underline tracking and click-to-seek. Mounted only while the chunk
- *    is within the IO's rootMargin of the scroll viewport.
+ *  - **`'committed'`**: words are finalized. Renders text-mode by
+ *    default; IntersectionObserver swaps to spans-mode when the chunk
+ *    is within the scroll viewport's rootMargin. Words inside have
+ *    `partial: false` (committed styling).
+ *  - **`'partial'`**: words are the engine's in-flight buffer (still
+ *    decoding). Always rendered as spans with `partial: true` (grey).
+ *    No IO observation — partial is always at the end of the
+ *    transcript, in the auto-scrolled visible area.
  *
- * The wrapper uses `display: inline` so both modes flow inline within
- * the editorial body. Text always ends with a trailing space, matching
- * the trailing space Word always emits, so chunk-to-chunk spacing is
- * identical across modes.
- *
- * Memo comparator ignores the `words` array reference — committed
- * segments are finalized server-side so the slice content never changes
- * after this chunk's first render. Only re-renders when identity or
- * index window changes (= for the newest segment after each commit).
+ * The KEY thing for smoothness: when a sentence commits, the partial
+ * chunk and the new committed chunk share the same segId (= the
+ * engine's `_next_seg_id` that the partial was peeking at). React
+ * reconciles them as the SAME instance — the `mode` prop flips, the
+ * Word children reconcile by global index, the only thing that
+ * changes is each Word's `partial` flag (= a CSS class change). No
+ * DOM destruction, no flash. The class change becomes a smooth
+ * color transition via the `.editorial-word` CSS rule.
  */
-const LazyChunk = memo(
-  function LazyChunk({
+type ChunkMode = 'committed' | 'partial'
+
+const Chunk = memo(
+  function Chunk({
     segId,
+    mode,
     text,
     segStart,
     startIdx,
     endIdx,
-    words,
+    committedWords,
+    partialWords,
     live,
     wordArrivals,
   }: {
     segId: number
+    mode: ChunkMode
     text: string
     segStart: number
     startIdx: number
     endIdx: number
-    words: Word[]
+    committedWords: Word[]
+    partialWords: Word[]
     live: boolean
     wordArrivals: Map<number, number>
   }) {
     void segId // identity prop, consumed by memo comparator
     const wrapperRef = useRef<HTMLSpanElement | null>(null)
-    const [mounted, setMounted] = useState(false)
+    // Initial mounted state depends on mode:
+    //  - Partial chunks render spans immediately (always visible).
+    //  - Committed chunks default to text-mode; IO will mount them
+    //    if they fall in the visible window.
+    // State is preserved across mode flips by React, so a partial
+    // chunk that commits transitions WITHOUT unmounting spans —
+    // mounted was already true from partial mode.
+    const [mounted, setMounted] = useState(mode === 'partial')
     const observe = useContext(ChunkObserverContext)
 
     useEffect(() => {
+      // Only observe in committed mode. Partial chunks are always
+      // mounted as spans; observation would just flip them to text
+      // mode if briefly off-screen, which we don't want for the
+      // in-flight buffer (it's the active reading area).
+      if (mode !== 'committed') return
       const el = wrapperRef.current
       if (!el || !observe) return
       return observe(el, setMounted)
-    }, [observe])
+    }, [mode, observe])
 
-    if (!mounted) {
-      // Off-screen: single text node, inline. ~1 DOM node + 1 text
-      // node total. Browser layouts the text string as one wrappable
-      // run, which is much cheaper than per-word spans.
-      // Clicks fall through to segment-start seek — coarser than the
-      // mounted per-word seek but covers the "scroll back, click old
-      // text to replay that sentence" case. seek() is now safe-clamped
-      // to audio.seekable so unreachable targets (live URL streams)
-      // silently no-op rather than stalling audio.
+    // Text-mode (committed + off-screen). Single text node, clickable
+    // at segment-start granularity. seek() is safe-clamped so clicks
+    // on unreachable old text (live URL streams) silently no-op.
+    if (mode === 'committed' && !mounted) {
       return (
         <span
           ref={wrapperRef}
@@ -477,61 +492,80 @@ const LazyChunk = memo(
         </span>
       )
     }
-    // On-screen: full Word spans for cursor + click-to-seek.
-    // Reveal animation only fires for words that arrived recently —
-    // when the user scrolls back through old text the chunk remounts
-    // and we'd otherwise re-trigger the keyframe on hours-old words,
-    // which reads as a wave of "new" text appearing. The 2s window
-    // covers the actual reveal duration with a small safety margin.
+
+    // Spans mode (committed mounted OR partial).
+    const isPartial = mode === 'partial'
     const now = performance.now()
     const REVEAL_MAX_AGE_MS = 2000
     const out: React.ReactElement[] = []
-    for (let i = startIdx; i < endIdx; i++) {
-      const w = words[i]
-      const arrival = wordArrivals.get(i)
+    const count = endIdx - startIdx
+    for (let i = 0; i < count; i++) {
+      const globalIdx = startIdx + i
+      const w = isPartial ? partialWords[i] : committedWords[globalIdx]
+      if (!w) continue // defensive: partial buffer might briefly shrink
+      const arrival = isPartial ? undefined : wordArrivals.get(globalIdx)
       const reveal =
-        live && arrival !== undefined && now - arrival < REVEAL_MAX_AGE_MS
+        !isPartial &&
+        live &&
+        arrival !== undefined &&
+        now - arrival < REVEAL_MAX_AGE_MS
       out.push(
         <Word
-          key={i}
-          idx={i}
+          key={globalIdx}
+          idx={globalIdx}
           word={w.word}
           start={w.start}
-          partial={false}
+          partial={isPartial}
           reveal={reveal}
         />,
       )
     }
     return <span ref={wrapperRef}>{out}</span>
   },
-  (prev, next) =>
-    prev.segId === next.segId &&
-    prev.startIdx === next.startIdx &&
-    prev.endIdx === next.endIdx &&
-    prev.text === next.text &&
-    prev.segStart === next.segStart &&
-    prev.live === next.live,
+  (prev, next) => {
+    if (prev.segId !== next.segId) return false
+    if (prev.mode !== next.mode) return false
+    if (prev.startIdx !== next.startIdx) return false
+    if (prev.endIdx !== next.endIdx) return false
+    if (prev.text !== next.text) return false
+    if (prev.segStart !== next.segStart) return false
+    if (prev.live !== next.live) return false
+    // For committed mode we intentionally SKIP the committedWords ref
+    // check — committed segments are finalized, their slice content
+    // never changes. For partial mode we MUST check partialWords ref
+    // because the engine revises the in-flight buffer mid-decode.
+    if (next.mode === 'partial' && prev.partialWords !== next.partialWords) {
+      return false
+    }
+    return true
+  },
 )
 
-/** Renders the COMMITTED word stream chunked by segment. Each chunk is
- * a memo'd LazyChunk that swaps between text-mode (off-screen, cheap)
- * and spans-mode (on-screen, full Word components). At any moment only
- * ~5-10 chunks are in spans-mode regardless of total segment count, so
- * DOM size and layout cost are flat in long sessions.
+/** Renders BOTH committed segments AND the in-flight partial as one
+ * unified list of memo'd `Chunk`s. Crucially: the partial chunk's
+ * key = `partialSegment.id`, which matches the segment id the engine
+ * will assign when it commits. React reconciles by key → same Chunk
+ * instance → mode prop flips partial→committed → child Words
+ * reconcile (same global-index keys) → only the CSS class on each
+ * Word changes. No DOM destruction = no commit-flash.
  *
- * The IntersectionObserver is shared across all chunks via context (one
- * IO instance, many observed targets) — much cheaper than per-chunk
- * observers at 2700+ segments.
+ * Committed chunks still use IO-swap (text-mode off-screen, spans
+ * on-screen). The partial chunk always renders as spans (it's at
+ * the end of the transcript, in the auto-scrolled live area).
  */
-const CommittedWordList = memo(function CommittedWordList({
+const ChunkList = memo(function ChunkList({
   segments,
   words,
+  partialSegment,
+  partialWords,
   live,
   wordArrivals,
   scrollRoot,
 }: {
   segments: WhisperSegment[]
   words: Word[]
+  partialSegment: WhisperSegment | null
+  partialWords: Word[]
   live: boolean
   wordArrivals: Map<number, number>
   scrollRoot: HTMLElement | null
@@ -539,6 +573,7 @@ const CommittedWordList = memo(function CommittedWordList({
   const partition = useMemo(() => {
     const out: Array<{
       segId: number
+      mode: ChunkMode
       text: string
       segStart: number
       startIdx: number
@@ -553,14 +588,32 @@ const CommittedWordList = memo(function CommittedWordList({
       while (wIdx < words.length && words[wIdx].start < nextSegStart) wIdx++
       out.push({
         segId: seg.id,
+        mode: 'committed',
         text: (seg.text || '').trim(),
         segStart: seg.start,
         startIdx,
         endIdx: wIdx,
       })
     }
+    // Append partial chunk if there's an in-flight sentence. Its key
+    // (= partialSegment.id) matches the segment id the engine will use
+    // on commit — so React reconciles partial → committed as a mode
+    // flip on the same instance, no DOM swap.
+    if (partialSegment && partialWords.length > 0) {
+      out.push({
+        segId: partialSegment.id,
+        mode: 'partial',
+        text: (partialSegment.text || '').trim(),
+        segStart: partialSegment.start,
+        // Partial words occupy the global indices immediately after
+        // the last committed word, matching what they'll become once
+        // committed.
+        startIdx: words.length,
+        endIdx: words.length + partialWords.length,
+      })
+    }
     return out
-  }, [segments, words])
+  }, [segments, words, partialSegment, partialWords])
 
   // Shared IO — one instance, all chunks register via context.
   // rootMargin 800px gives us ~3-4 viewports of pre-mount buffer so
@@ -596,14 +649,16 @@ const CommittedWordList = memo(function CommittedWordList({
   return (
     <ChunkObserverContext.Provider value={observe}>
       {partition.map((p) => (
-        <LazyChunk
+        <Chunk
           key={p.segId}
           segId={p.segId}
+          mode={p.mode}
           text={p.text}
           segStart={p.segStart}
           startIdx={p.startIdx}
           endIdx={p.endIdx}
-          words={words}
+          committedWords={words}
+          partialWords={partialWords}
           live={live}
           wordArrivals={wordArrivals}
         />
@@ -612,38 +667,11 @@ const CommittedWordList = memo(function CommittedWordList({
   )
 })
 
-/** Renders the PARTIAL (in-flight) word stream. Memoized on
- * (partialWords, offset) — re-renders per partial (~250 ms) but only
- * walks the partial words (~5-20 of them), not the 27k committed
- * tree. `offset` = committed.length, so partial word indices align
- * with the global cursor index space. */
-const PartialWordList = memo(function PartialWordList({
-  partialWords,
-  offset,
-}: {
-  partialWords: Word[]
-  offset: number
-}) {
-  return (
-    <>
-      {partialWords.map((w, i) => (
-        <Word
-          key={offset + i}
-          idx={offset + i}
-          word={w.word}
-          start={w.start}
-          partial={true}
-          reveal={false}
-        />
-      ))}
-    </>
-  )
-})
-
 function PlainText({
   body,
   live,
   wordArrivals,
+  partialSegment,
   partialWords,
   scrollRoot,
 }: {
@@ -652,6 +680,7 @@ function PlainText({
    * arrival-based fade-in. False for finalized results. */
   live: boolean
   wordArrivals: Map<number, number>
+  partialSegment: WhisperSegment | null
   partialWords: Word[]
   scrollRoot: HTMLElement | null
 }) {
@@ -664,14 +693,15 @@ function PlainText({
 
   return (
     <div className="editorial-body" ref={containerRef} style={{ position: 'relative' }}>
-      <CommittedWordList
+      <ChunkList
         segments={body.segments}
         words={committed}
+        partialSegment={partialWords.length > 0 ? partialSegment : null}
+        partialWords={partialWords}
         live={live}
         wordArrivals={wordArrivals}
         scrollRoot={scrollRoot}
       />
-      <PartialWordList partialWords={partialWords} offset={committed.length} />
       <ActiveWordTracker
         committed={committed}
         partialWords={partialWords}

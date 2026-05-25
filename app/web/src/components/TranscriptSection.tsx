@@ -385,23 +385,41 @@ const Word = memo(function Word({
   )
 })
 
-/** Renders the COMMITTED word stream. Memoized on `committed` reference
- * — only re-renders when a new committed batch lands (every chunk
- * commit, ~2-10 s), not on every partial (every ~250 ms). Walks 27k+
- * words inside; the outer memo keeps that walk off the partial path. */
-const CommittedWordList = memo(function CommittedWordList({
-  committed,
-  live,
-  wordArrivals,
-}: {
-  committed: Word[]
-  live: boolean
-  wordArrivals: Map<number, number>
-}) {
-  const total = committed.length
-  return (
-    <>
-      {committed.map((w, i) => (
+/** One sentence-bounded segment's worth of word spans.
+ *
+ * Memo comparator deliberately IGNORES the `words` array reference —
+ * a committed segment is finalized server-side and its word slice never
+ * changes content after it lands. We only need to re-render when the
+ * segment identity or its index window changes (which only happens for
+ * the NEWEST segment when a fresh commit lands). All old chunks bail,
+ * meaning a 27 k-word transcript only walks ~1 new chunk's worth of
+ * children per commit instead of all 27 k.
+ *
+ * `display: contents` on the wrapper means the children flow inline as
+ * if the wrapper weren't there — text layout is identical to a flat
+ * span list.
+ */
+const SegmentChunk = memo(
+  function SegmentChunk({
+    segId,
+    startIdx,
+    endIdx,
+    words,
+    live,
+    wordArrivals,
+  }: {
+    segId: number
+    startIdx: number
+    endIdx: number
+    words: Word[]
+    live: boolean
+    wordArrivals: Map<number, number>
+  }) {
+    void segId // identity prop; consumed by the memo comparator
+    const out: React.ReactElement[] = []
+    for (let i = startIdx; i < endIdx; i++) {
+      const w = words[i]
+      out.push(
         <Word
           key={i}
           idx={i}
@@ -409,7 +427,61 @@ const CommittedWordList = memo(function CommittedWordList({
           start={w.start}
           partial={false}
           reveal={live && wordArrivals.has(i)}
-          isLast={i === total - 1}
+          isLast={false}
+        />,
+      )
+    }
+    return <span style={{ display: 'contents' }}>{out}</span>
+  },
+  (prev, next) =>
+    prev.segId === next.segId &&
+    prev.startIdx === next.startIdx &&
+    prev.endIdx === next.endIdx &&
+    prev.live === next.live,
+)
+
+/** Renders the COMMITTED word stream chunked by segment. Each chunk is
+ * its own memo'd subtree (see SegmentChunk above), so React's
+ * reconciliation cost when a new segment commits drops from
+ * O(total_words) → O(segments) at the chunk level + O(words in new
+ * segment) inside the new chunk. Old chunks bail without descending. */
+const CommittedWordList = memo(function CommittedWordList({
+  segments,
+  words,
+  live,
+  wordArrivals,
+}: {
+  segments: WhisperSegment[]
+  words: Word[]
+  live: boolean
+  wordArrivals: Map<number, number>
+}) {
+  // Partition words across segments by start time. Walks segments + words
+  // once per commit; cheap (a few µs even at 2700 segments / 27k words).
+  const partition = useMemo(() => {
+    const out: Array<{ segId: number; startIdx: number; endIdx: number }> = []
+    let wIdx = 0
+    for (let i = 0; i < segments.length; i++) {
+      const startIdx = wIdx
+      const nextSegStart =
+        i + 1 < segments.length ? segments[i + 1].start : Infinity
+      while (wIdx < words.length && words[wIdx].start < nextSegStart) wIdx++
+      out.push({ segId: segments[i].id, startIdx, endIdx: wIdx })
+    }
+    return out
+  }, [segments, words])
+
+  return (
+    <>
+      {partition.map((p) => (
+        <SegmentChunk
+          key={p.segId}
+          segId={p.segId}
+          startIdx={p.startIdx}
+          endIdx={p.endIdx}
+          words={words}
+          live={live}
+          wordArrivals={wordArrivals}
         />
       ))}
     </>
@@ -469,7 +541,8 @@ function PlainText({
   return (
     <div className="editorial-body" ref={containerRef} style={{ position: 'relative' }}>
       <CommittedWordList
-        committed={committed}
+        segments={body.segments}
+        words={committed}
         live={live}
         wordArrivals={wordArrivals}
       />

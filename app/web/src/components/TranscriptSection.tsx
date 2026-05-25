@@ -385,42 +385,63 @@ const Word = memo(function Word({
   )
 })
 
-/** Memoization fence: re-render the word list only when its identity
- * actually changes — not on every 60Hz currentTime tick. The combined
- * (committed + partial) list is keyed by length and the last partial's
- * start time, which moves whenever new content lands. */
-const WordList = memo(function WordList({
-  body,
+/** Renders the COMMITTED word stream. Memoized on `committed` reference
+ * — only re-renders when a new committed batch lands (every chunk
+ * commit, ~2-10 s), not on every partial (every ~250 ms). Walks 27k+
+ * words inside; the outer memo keeps that walk off the partial path. */
+const CommittedWordList = memo(function CommittedWordList({
+  committed,
   live,
   wordArrivals,
-  partialWords,
 }: {
-  body: VerboseJsonResponse
+  committed: Word[]
   live: boolean
   wordArrivals: Map<number, number>
-  partialWords: Word[]
 }) {
-  const committed = body.words ?? []
-  const committedCount = committed.length
-  const total = committedCount + partialWords.length
+  const total = committed.length
   return (
     <>
-      {Array.from({ length: total }).map((_unused, i) => {
-        const isPartial = i >= committedCount
-        const w = isPartial ? partialWords[i - committedCount] : committed[i]
-        const isLast = i === total - 1
-        return (
-          <Word
-            key={i}
-            idx={i}
-            word={w.word}
-            start={w.start}
-            partial={isPartial}
-            reveal={!isPartial && live && wordArrivals.has(i)}
-            isLast={isLast}
-          />
-        )
-      })}
+      {committed.map((w, i) => (
+        <Word
+          key={i}
+          idx={i}
+          word={w.word}
+          start={w.start}
+          partial={false}
+          reveal={live && wordArrivals.has(i)}
+          isLast={i === total - 1}
+        />
+      ))}
+    </>
+  )
+})
+
+/** Renders the PARTIAL (in-flight) word stream. Memoized on
+ * (partialWords, offset) — re-renders per partial (~250 ms) but only
+ * walks the partial words (~5-20 of them), not the 27k committed
+ * tree. `offset` = committed.length, so partial word indices align
+ * with the global cursor index space. */
+const PartialWordList = memo(function PartialWordList({
+  partialWords,
+  offset,
+}: {
+  partialWords: Word[]
+  offset: number
+}) {
+  const total = partialWords.length
+  return (
+    <>
+      {partialWords.map((w, i) => (
+        <Word
+          key={offset + i}
+          idx={offset + i}
+          word={w.word}
+          start={w.start}
+          partial={true}
+          reveal={false}
+          isLast={i === total - 1}
+        />
+      ))}
     </>
   )
 })
@@ -447,14 +468,14 @@ function PlainText({
 
   return (
     <div className="editorial-body" ref={containerRef} style={{ position: 'relative' }}>
-      <WordList
-        body={body}
+      <CommittedWordList
+        committed={committed}
         live={live}
         wordArrivals={wordArrivals}
-        partialWords={partialWords}
       />
+      <PartialWordList partialWords={partialWords} offset={committed.length} />
       <ActiveWordTracker
-        committed={body.words ?? []}
+        committed={committed}
         partialWords={partialWords}
         containerRef={containerRef}
       />

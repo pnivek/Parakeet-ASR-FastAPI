@@ -58,14 +58,10 @@ export default function App() {
    * handleSessionStart and on handleResult.
    */
   const arrivalRef = useRef<Map<number, number>>(new Map())
-  /** Per-word-index arrival timestamps, same idea — drives the streaming
-   * word reveal in the text view. */
-  const wordArrivalRef = useRef<Map<number, number>>(new Map())
   /** Highest segment.id we've already stamped — lets us O(new) the arrival
    * walk instead of O(total). Segments are emitted with monotonically
-   * increasing ids; words are append-only by index. */
+   * increasing ids. */
   const maxSeenSegIdRef = useRef<number>(-1)
-  const wordArrivalCountRef = useRef<number>(0)
 
   // Hidden host for the singleton <audio>.
   const audioMountRef = useRef<HTMLDivElement>(null)
@@ -123,9 +119,7 @@ export default function App() {
     setError(null)
     setLive(false) // finalized — drop the streaming reveal
     arrivalRef.current = new Map() // settled results don't need arrival fades
-    wordArrivalRef.current = new Map()
     maxSeenSegIdRef.current = -1
-    wordArrivalCountRef.current = 0
     if (l.kind === 'file') {
       setAudioFile(l.file)
       // peaks decode runs in the useEffect above when loaded.file changes.
@@ -156,26 +150,16 @@ export default function App() {
 
   const handlePartial = (r: TranscriptionResponse) => {
     if (r.format === 'verbose_json') markFirstSegment(r.body.segments.length)
-    // Stamp any newly-seen segments + words with their arrival time.
-    // Segments are emitted with monotonically increasing ids and words
-    // are append-only, so we only need to walk the NEW tail — not the
-    // whole accumulated list. The latter would be O(N²) over a long
-    // streaming session.
+    // Stamp any newly-seen segments with their arrival time. Segments
+    // are emitted with monotonically increasing ids, so we only need
+    // to walk the NEW tail — not the whole accumulated list. The
+    // latter would be O(N²) over a long streaming session.
     if (r.format === 'verbose_json') {
       const now = performance.now()
       for (const s of r.body.segments) {
         if (s.id > maxSeenSegIdRef.current) {
           arrivalRef.current.set(s.id, now)
           maxSeenSegIdRef.current = s.id
-        }
-      }
-      if (r.body.words) {
-        const total = r.body.words.length
-        for (let i = wordArrivalCountRef.current; i < total; i++) {
-          wordArrivalRef.current.set(i, now)
-        }
-        if (total > wordArrivalCountRef.current) {
-          wordArrivalCountRef.current = total
         }
       }
     }
@@ -202,9 +186,7 @@ export default function App() {
     ttfsRef.current = null
     setTtfs(null)
     arrivalRef.current = new Map()
-    wordArrivalRef.current = new Map()
     maxSeenSegIdRef.current = -1
-    wordArrivalCountRef.current = 0
     setLiveAnchored(false)
     // Only wipe the hero waveform/identity when explicitly asked (mic =
     // fresh recording, url = new source). File mode keeps the already-
@@ -497,7 +479,6 @@ export default function App() {
             filename={loaded?.title ?? 'transcript'}
             live={live}
             segmentArrivals={arrivalRef.current}
-            wordArrivals={wordArrivalRef.current}
             partialSegment={partialSegment}
             partialWords={partialWords}
           />

@@ -1,4 +1,4 @@
-import { createContext, memo, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { TranscriptionResponse } from '../lib/api'
 import type { VerboseJsonResponse, WhisperSegment, Word } from '../lib/types'
 import { play, seek, useCurrentTime } from '../lib/playback'
@@ -14,8 +14,6 @@ interface Props {
   /** Map of segment.id → performance.now() at first observation. Drives the
    * fade-in of newly arrived segments during live streaming. */
   segmentArrivals: Map<number, number>
-  /** Map of word-index → arrival ms. Drives the text view's word reveal. */
-  wordArrivals: Map<number, number>
   /** Engine's in-flight sentence buffer — uncommitted tokens streamed
    * by the server between actual .!? commits. Rendered as dimmed text
    * at the end of the transcript so the user sees words appear as the
@@ -48,7 +46,6 @@ export const TranscriptSection = memo(function TranscriptSection({
   filename,
   live,
   segmentArrivals,
-  wordArrivals,
   partialSegment,
   partialWords,
 }: Props) {
@@ -68,13 +65,11 @@ export const TranscriptSection = memo(function TranscriptSection({
   const followBottom = () => {
     const el = bodyEl
     if (!el) return
-    // Smooth scroll on a multi-thousand-pixel-tall scroller is heavy —
-    // the browser has to compute intermediate positions and reflow on
-    // each frame. After hours of streaming the transcript can be 30k+
-    // pixels tall; snap-scroll there to avoid the perf cost. Smooth
-    // stays on for shorter sessions where the animation reads well.
-    const behavior: ScrollBehavior = el.scrollHeight > 5000 ? 'auto' : 'smooth'
-    el.scrollTo({ top: el.scrollHeight, behavior })
+    // Always instant. Smooth scroll on a tall, fast-growing scroller
+    // queues per-frame layout work that interleaves with React commits
+    // — the result is bouncy + stuttery. Snap-scroll is one paint per
+    // call and is what the user explicitly asked for.
+    el.scrollTo({ top: el.scrollHeight, behavior: 'auto' })
   }
 
   // Re-pin whenever a fresh live stream begins.
@@ -174,7 +169,6 @@ export const TranscriptSection = memo(function TranscriptSection({
             filename={filename}
             live={live}
             segmentArrivals={segmentArrivals}
-            wordArrivals={wordArrivals}
             partialSegment={partialSegment ?? null}
             partialWords={partialWords ?? []}
             scrollRoot={bodyEl}
@@ -199,7 +193,6 @@ function VerboseBody({
   filename,
   live,
   segmentArrivals,
-  wordArrivals,
   partialSegment,
   partialWords,
   scrollRoot,
@@ -209,22 +202,18 @@ function VerboseBody({
   filename: string
   live: boolean
   segmentArrivals: Map<number, number>
-  wordArrivals: Map<number, number>
   partialSegment: WhisperSegment | null
   partialWords: Word[]
   scrollRoot: HTMLElement | null
 }) {
-  // Text view doesn't need currentTime at all — ActiveWordTracker
-  // subscribes itself + drives the underline imperatively. Bypass the
-  // 60Hz useCurrentTime subscription so the heavy editorial-body
-  // subtree doesn't reconcile every tick (peaks + canvas redraws then
-  // share the main thread without contention → no waveform stutter).
+  // Text view is now pure-text-node + Range-API; it self-subscribes
+  // to useCurrentTime inside CursorOverlay. The other views (segments,
+  // words) wrap their own subscribers below.
   if (view === 'text')
     return (
       <PlainText
         body={body}
         live={live}
-        wordArrivals={wordArrivals}
         partialSegment={partialSegment}
         partialWords={partialWords}
         scrollRoot={scrollRoot}
@@ -335,396 +324,281 @@ function WordsView({
   return <WordsGrid body={body} activeIdx={activeIdx} partialWords={partialWords} />
 }
 
-// ── Plain text view with reveal animation ─────────────────────────
-// Animation strategy: each new word is mounted with a `.word-reveal`
-// class that runs a 380ms CSS keyframe (App.css → @keyframes wordReveal).
-// The browser drives the animation in the compositor — React doesn't
-// re-render per frame. Result: zero per-frame React work during a
-// live stream, regardless of how many words have accumulated.
+// ── Text view: pure text node + cursor overlay ────────────────────
 //
-// Once a word is mounted, subsequent re-renders keep its className
-// stable (same arrival stamp → same class), so the animation does
-// NOT replay. Stable keys (`${i}-${w.start}`) also keep React from
-// unmounting + remounting elements as new partials arrive.
+// The whole committed transcript is rendered as a SINGLE text node
+// inside one <span>; the partial in-flight sentence is a second
+// <span>. No per-word DOM, no per-chunk DOM, no IntersectionObserver.
+// DOM size is O(1) regardless of session length — five elements total.
+//
+// Cursor + click work via the Range API on the text nodes:
+//   - Cursor: word index → character offset → Range → getBoundingClientRect.
+//   - Click: caretRangeFromPoint(x, y) → character offset → binary
+//     search wordCharOffsets → word → seek.
+//
+// Browser handles inline-text layout once for the whole transcript
+// (extremely well-optimized); scroll is pure compositor work; React
+// only reconciles when new committed words actually land. The Chunk
+// /IO/Word machinery this replaced was generating dozens of React
+// re-renders per frame during auto-scroll which caused the bouncy
+// auto-scroll + Follow-button jank.
 
-/**
- * Per-word render. Two states:
- *   - committed: solid `--fg` (white). Drives no per-word highlight or
- *     underline — playback position is tracked by a single moving
- *     underline element in PlainText below, not by recoloring words.
- *   - partial:  `--muted` (grey) via the `--partial` class.
+/** Cross-engine wrapper around caretRangeFromPoint / caretPositionFromPoint
+ * (Chromium/Safari vs Firefox respectively). Returns the text node + the
+ * character offset within it at the given client (x, y). Null if the
+ * point isn't on text. */
+function caretFromPoint(
+  x: number,
+  y: number,
+): { node: Node; offset: number } | null {
+  type Doc = Document & {
+    caretRangeFromPoint?: (x: number, y: number) => Range | null
+    caretPositionFromPoint?: (
+      x: number,
+      y: number,
+    ) => { offsetNode: Node; offset: number } | null
+  }
+  const doc = document as Doc
+  if (doc.caretRangeFromPoint) {
+    const r = doc.caretRangeFromPoint(x, y)
+    if (!r) return null
+    return { node: r.startContainer, offset: r.startOffset }
+  }
+  if (doc.caretPositionFromPoint) {
+    const p = doc.caretPositionFromPoint(x, y)
+    if (!p) return null
+    return { node: p.offsetNode, offset: p.offset }
+  }
+  return null
+}
+
+/** Concatenate words into their text representation and return the
+ * character offset of each word's start in that concatenation.
  *
- * The data-word-idx attribute lets PlainText's underline effect look
- * up the active word's DOM rect without ref management (which would
- * defeat memo).
- */
-const Word = memo(function Word({
-  idx,
-  word,
-  start,
-  reveal,
-  partial,
-}: {
-  idx: number
-  word: string
-  start: number
-  reveal: boolean
-  partial: boolean
-}) {
-  const classes = ['editorial-word']
-  if (partial) classes.push('editorial-word--partial')
-  if (reveal) classes.push('word-reveal')
-  // Always emit trailing space — makes spans-mode and text-node-mode
-  // chunks visually identical (text-node chunks always end in space).
-  // The very last word in the entire transcript has an invisible
-  // trailing space, which is fine.
-  return (
-    <>
-      <span
-        id={`tx-word-${idx}`}
-        className={classes.join(' ')}
-        data-word-idx={idx}
-        onClick={() => {
-          seek(start)
-          play()
-        }}
-      >
-        {word}
-      </span>
-      {' '}
-    </>
-  )
-})
-
-/** Function passed via context to LazyChunk so chunks can register with
- * the parent's shared IntersectionObserver. Returns an unobserve
- * function. Null when no observer is wired up yet (chunks render
- * text-mode by default until they hear from the IO). */
-type ChunkObserveFn = (
-  el: Element,
-  cb: (isIntersecting: boolean) => void,
-) => () => void
-const ChunkObserverContext = createContext<ChunkObserveFn | null>(null)
-
-/** One chunk = one sentence-bounded segment, in one of two modes:
+ *   words = [{word:'Hi'}, {word:'there'}, {word:'!'}]
+ *   text = "Hi there !"
+ *   offsets = [0, 3, 9]
  *
- *  - **`'committed'`**: words are finalized. Renders text-mode by
- *    default; IntersectionObserver swaps to spans-mode when the chunk
- *    is within the scroll viewport's rootMargin. Words inside have
- *    `partial: false` (committed styling).
- *  - **`'partial'`**: words are the engine's in-flight buffer (still
- *    decoding). Always rendered as spans with `partial: true` (grey).
- *    No IO observation — partial is always at the end of the
- *    transcript, in the auto-scrolled visible area.
- *
- * The KEY thing for smoothness: when a sentence commits, the partial
- * chunk and the new committed chunk share the same segId (= the
- * engine's `_next_seg_id` that the partial was peeking at). React
- * reconciles them as the SAME instance — the `mode` prop flips, the
- * Word children reconcile by global index, the only thing that
- * changes is each Word's `partial` flag (= a CSS class change). No
- * DOM destruction, no flash. The class change becomes a smooth
- * color transition via the `.editorial-word` CSS rule.
- */
-type ChunkMode = 'committed' | 'partial'
+ * Words are joined by single spaces — same convention as the engine's
+ * `seg.text`. Cursor + click math both work against these offsets. */
+function buildTextAndOffsets(words: Word[]): { text: string; offsets: number[] } {
+  const offsets: number[] = new Array(words.length)
+  let pos = 0
+  const parts: string[] = new Array(words.length)
+  for (let i = 0; i < words.length; i++) {
+    offsets[i] = pos
+    parts[i] = words[i].word
+    pos += words[i].word.length + 1 // +1 for the joining space
+  }
+  return { text: parts.join(' '), offsets }
+}
 
-const Chunk = memo(
-  function Chunk({
-    segId,
-    mode,
-    text,
-    segStart,
-    startIdx,
-    endIdx,
-    committedWords,
-    partialWords,
-    live,
-    wordArrivals,
-  }: {
-    segId: number
-    mode: ChunkMode
-    text: string
-    segStart: number
-    startIdx: number
-    endIdx: number
-    committedWords: Word[]
-    partialWords: Word[]
-    live: boolean
-    wordArrivals: Map<number, number>
-  }) {
-    void segId // identity prop, consumed by memo comparator
-    const wrapperRef = useRef<HTMLSpanElement | null>(null)
-    // Initial mounted state depends on mode:
-    //  - Partial chunks render spans immediately (always visible).
-    //  - Committed chunks default to text-mode; IO will mount them
-    //    if they fall in the visible window.
-    // State is preserved across mode flips by React, so a partial
-    // chunk that commits transitions WITHOUT unmounting spans —
-    // mounted was already true from partial mode.
-    const [mounted, setMounted] = useState(mode === 'partial')
-    const observe = useContext(ChunkObserverContext)
-
-    useEffect(() => {
-      // Only observe in committed mode. Partial chunks are always
-      // mounted as spans; observation would just flip them to text
-      // mode if briefly off-screen, which we don't want for the
-      // in-flight buffer (it's the active reading area).
-      if (mode !== 'committed') return
-      const el = wrapperRef.current
-      if (!el || !observe) return
-      return observe(el, setMounted)
-    }, [mode, observe])
-
-    // Text-mode (committed + off-screen). Single text node, clickable
-    // at segment-start granularity. seek() is safe-clamped so clicks
-    // on unreachable old text (live URL streams) silently no-op.
-    if (mode === 'committed' && !mounted) {
-      return (
-        <span
-          ref={wrapperRef}
-          onClick={() => {
-            seek(segStart)
-            play()
-          }}
-          style={{ cursor: 'pointer' }}
-        >
-          {text + ' '}
-        </span>
-      )
+/** Apply a CSS Highlight to a range covering newly-committed text, then
+ * remove after `MS` so the area falls back to the default committed
+ * (white) color. Color rule lives in `App.css` under
+ * `::highlight(just-committed)`. Browser support check is defensive —
+ * Highlight API is in Chromium 105+, WebKit 17.2+; falls back to no-op
+ * (the text just appears committed immediately) on older browsers. */
+const JUST_COMMITTED_MS = 320
+function flashJustCommitted(textNode: Node, start: number, end: number): void {
+  type CSSWithHighlights = typeof CSS & { highlights?: { get: (name: string) => unknown; set: (name: string, h: unknown) => void } }
+  type WithHighlight = Window & { Highlight?: new (...ranges: Range[]) => { add: (r: Range) => void; delete: (r: Range) => void } }
+  const cssH = (CSS as CSSWithHighlights).highlights
+  const HighlightCtor = (window as unknown as WithHighlight).Highlight
+  if (!cssH || !HighlightCtor) return
+  let highlight = cssH.get('just-committed') as { add: (r: Range) => void; delete: (r: Range) => void } | undefined
+  if (!highlight) {
+    highlight = new HighlightCtor()
+    cssH.set('just-committed', highlight)
+  }
+  const range = document.createRange()
+  try {
+    range.setStart(textNode, start)
+    range.setEnd(textNode, end)
+  } catch {
+    return // text node was replaced before we got here; bail.
+  }
+  highlight.add(range)
+  setTimeout(() => {
+    try {
+      highlight!.delete(range)
+    } catch {
+      /* range/highlight gone; nothing to do */
     }
+  }, JUST_COMMITTED_MS)
+}
 
-    // Spans mode (committed mounted OR partial).
-    const isPartial = mode === 'partial'
-    const now = performance.now()
-    const REVEAL_MAX_AGE_MS = 2000
-    const out: React.ReactElement[] = []
-    const count = endIdx - startIdx
-    for (let i = 0; i < count; i++) {
-      const globalIdx = startIdx + i
-      const w = isPartial ? partialWords[i] : committedWords[globalIdx]
-      if (!w) continue // defensive: partial buffer might briefly shrink
-      const arrival = isPartial ? undefined : wordArrivals.get(globalIdx)
-      const reveal =
-        !isPartial &&
-        live &&
-        arrival !== undefined &&
-        now - arrival < REVEAL_MAX_AGE_MS
-      out.push(
-        <Word
-          key={globalIdx}
-          idx={globalIdx}
-          word={w.word}
-          start={w.start}
-          partial={isPartial}
-          reveal={reveal}
-        />,
-      )
-    }
-    return <span ref={wrapperRef}>{out}</span>
-  },
-  (prev, next) => {
-    if (prev.segId !== next.segId) return false
-    if (prev.mode !== next.mode) return false
-    if (prev.startIdx !== next.startIdx) return false
-    if (prev.endIdx !== next.endIdx) return false
-    if (prev.text !== next.text) return false
-    if (prev.segStart !== next.segStart) return false
-    if (prev.live !== next.live) return false
-    // For committed mode we intentionally SKIP the committedWords ref
-    // check — committed segments are finalized, their slice content
-    // never changes. For partial mode we MUST check partialWords ref
-    // because the engine revises the in-flight buffer mid-decode.
-    if (next.mode === 'partial' && prev.partialWords !== next.partialWords) {
-      return false
-    }
-    return true
-  },
-)
-
-/** Renders BOTH committed segments AND the in-flight partial as one
- * unified list of memo'd `Chunk`s. Crucially: the partial chunk's
- * key = `partialSegment.id`, which matches the segment id the engine
- * will assign when it commits. React reconciles by key → same Chunk
- * instance → mode prop flips partial→committed → child Words
- * reconcile (same global-index keys) → only the CSS class on each
- * Word changes. No DOM destruction = no commit-flash.
- *
- * Committed chunks still use IO-swap (text-mode off-screen, spans
- * on-screen). The partial chunk always renders as spans (it's at
- * the end of the transcript, in the auto-scrolled live area).
- */
-const ChunkList = memo(function ChunkList({
-  segments,
-  words,
-  partialSegment,
-  partialWords,
-  live,
-  wordArrivals,
-  scrollRoot,
-}: {
-  segments: WhisperSegment[]
-  words: Word[]
-  partialSegment: WhisperSegment | null
-  partialWords: Word[]
-  live: boolean
-  wordArrivals: Map<number, number>
-  scrollRoot: HTMLElement | null
-}) {
-  const partition = useMemo(() => {
-    const out: Array<{
-      segId: number
-      mode: ChunkMode
-      text: string
-      segStart: number
-      startIdx: number
-      endIdx: number
-    }> = []
-    let wIdx = 0
-    for (let i = 0; i < segments.length; i++) {
-      const seg = segments[i]
-      const startIdx = wIdx
-      const nextSegStart =
-        i + 1 < segments.length ? segments[i + 1].start : Infinity
-      while (wIdx < words.length && words[wIdx].start < nextSegStart) wIdx++
-      out.push({
-        segId: seg.id,
-        mode: 'committed',
-        text: (seg.text || '').trim(),
-        segStart: seg.start,
-        startIdx,
-        endIdx: wIdx,
-      })
-    }
-    // Append partial chunk if there's an in-flight sentence. Its key
-    // (= partialSegment.id) matches the segment id the engine will use
-    // on commit — so React reconciles partial → committed as a mode
-    // flip on the same instance, no DOM swap.
-    if (partialSegment && partialWords.length > 0) {
-      out.push({
-        segId: partialSegment.id,
-        mode: 'partial',
-        text: (partialSegment.text || '').trim(),
-        segStart: partialSegment.start,
-        // Partial words occupy the global indices immediately after
-        // the last committed word, matching what they'll become once
-        // committed.
-        startIdx: words.length,
-        endIdx: words.length + partialWords.length,
-      })
-    }
-    return out
-  }, [segments, words, partialSegment, partialWords])
-
-  // Shared IO — one instance, all chunks register via context.
-  // rootMargin 800px gives us ~3-4 viewports of pre-mount buffer so
-  // chunks are ready as the user scrolls into them.
-  const [observe, setObserve] = useState<ChunkObserveFn | null>(null)
-  useEffect(() => {
-    if (!scrollRoot) return
-    const callbacks = new Map<Element, (v: boolean) => void>()
-    const io = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) {
-          const cb = callbacks.get(entry.target)
-          if (cb) cb(entry.isIntersecting)
-        }
-      },
-      { root: scrollRoot, rootMargin: '800px' },
-    )
-    const fn: ChunkObserveFn = (el, cb) => {
-      callbacks.set(el, cb)
-      io.observe(el)
-      return () => {
-        callbacks.delete(el)
-        io.unobserve(el)
-      }
-    }
-    setObserve(() => fn)
-    return () => {
-      io.disconnect()
-      setObserve(null)
-    }
-  }, [scrollRoot])
-
-  return (
-    <ChunkObserverContext.Provider value={observe}>
-      {partition.map((p) => (
-        <Chunk
-          key={p.segId}
-          segId={p.segId}
-          mode={p.mode}
-          text={p.text}
-          segStart={p.segStart}
-          startIdx={p.startIdx}
-          endIdx={p.endIdx}
-          committedWords={words}
-          partialWords={partialWords}
-          live={live}
-          wordArrivals={wordArrivals}
-        />
-      ))}
-    </ChunkObserverContext.Provider>
-  )
-})
-
+/** Pure text-node renderer. Two spans (committed + partial), one click
+ * handler, one underline overlay. Scales O(1) in DOM with session
+ * length. */
 function PlainText({
   body,
   live,
-  wordArrivals,
   partialSegment,
   partialWords,
   scrollRoot,
 }: {
   body: VerboseJsonResponse
-  /** True only while transcripts are arriving mid-stream — drives the
-   * arrival-based fade-in. False for finalized results. */
+  /** True only while transcripts are arriving mid-stream. Used by the
+   * just-committed flash logic (don't bother on finalized results). */
   live: boolean
-  wordArrivals: Map<number, number>
   partialSegment: WhisperSegment | null
   partialWords: Word[]
+  /** Kept for prop signature compat with VerboseBody — not used in
+   * pure text mode (no IntersectionObserver per chunk). */
   scrollRoot: HTMLElement | null
 }) {
+  void scrollRoot
+  void partialSegment
+
   const committed = body.words ?? []
   const containerRef = useRef<HTMLDivElement | null>(null)
+  const committedSpanRef = useRef<HTMLSpanElement | null>(null)
+  const partialSpanRef = useRef<HTMLSpanElement | null>(null)
+
+  // Text + offset arrays for committed and partial. Recompute when
+  // committed length OR partial words change. Cheap even at 27k words —
+  // a single linear walk per recompute (~ms).
+  const { text: committedText, offsets: committedOffsets } = useMemo(
+    () => buildTextAndOffsets(committed),
+    [committed],
+  )
+  const { text: partialText, offsets: partialOffsets } = useMemo(
+    () => buildTextAndOffsets(partialWords),
+    [partialWords],
+  )
+
+  // Fade newly-committed text from grey → default. Tracks committed
+  // length across renders; on growth, applies a brief CSS Highlight to
+  // the new character range so it stays muted for ~320ms before
+  // snapping back to default. Only runs in live mode (finalized
+  // results don't need the indicator).
+  const prevCommittedLenRef = useRef<number>(0)
+  useEffect(() => {
+    const prev = prevCommittedLenRef.current
+    const curr = committed.length
+    prevCommittedLenRef.current = curr
+    if (!live) return
+    if (curr <= prev) return // no new commit
+    const span = committedSpanRef.current
+    const textNode = span?.firstChild
+    if (!textNode || textNode.nodeType !== Node.TEXT_NODE) return
+    const startChar = committedOffsets[prev] ?? 0
+    const lastIdx = curr - 1
+    const endChar =
+      committedOffsets[lastIdx] + committed[lastIdx].word.length
+    flashJustCommitted(textNode, startChar, endChar)
+  }, [committed, committedOffsets, live])
+
+  // Click handler: map (x, y) → text caret → character offset → word
+  // index → seek. One handler for the whole editorial body.
+  const onClick = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      const caret = caretFromPoint(e.clientX, e.clientY)
+      if (!caret) return
+      const node = caret.node
+      const offset = caret.offset
+      const committedSpan = committedSpanRef.current
+      const partialSpan = partialSpanRef.current
+      let inCommitted = false
+      let inPartial = false
+      if (committedSpan && node === committedSpan.firstChild) inCommitted = true
+      else if (partialSpan && node === partialSpan.firstChild) inPartial = true
+      if (inCommitted) {
+        // Binary search committedOffsets for the largest entry ≤ offset.
+        let lo = 0,
+          hi = committedOffsets.length - 1,
+          found = -1
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1
+          if (committedOffsets[mid] <= offset) {
+            found = mid
+            lo = mid + 1
+          } else {
+            hi = mid - 1
+          }
+        }
+        if (found >= 0) {
+          seek(committed[found].start)
+          play()
+        }
+      } else if (inPartial) {
+        let lo = 0,
+          hi = partialOffsets.length - 1,
+          found = -1
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1
+          if (partialOffsets[mid] <= offset) {
+            found = mid
+            lo = mid + 1
+          } else {
+            hi = mid - 1
+          }
+        }
+        if (found >= 0) {
+          seek(partialWords[found].start)
+          play()
+        }
+      }
+    },
+    [committed, committedOffsets, partialWords, partialOffsets],
+  )
 
   if (committed.length === 0 && partialWords.length === 0) {
     return <div className="editorial-body">{body.text}</div>
   }
 
+  // Both spans always render so the spans have stable DOM identity
+  // across renders — React updates their text content in place rather
+  // than mounting/unmounting them.
   return (
-    <div className="editorial-body" ref={containerRef} style={{ position: 'relative' }}>
-      <ChunkList
-        segments={body.segments}
-        words={committed}
-        partialSegment={partialWords.length > 0 ? partialSegment : null}
-        partialWords={partialWords}
-        live={live}
-        wordArrivals={wordArrivals}
-        scrollRoot={scrollRoot}
-      />
-      <ActiveWordTracker
+    <div
+      className="editorial-body"
+      ref={containerRef}
+      onClick={onClick}
+      style={{ position: 'relative', cursor: 'text' }}
+    >
+      <span ref={committedSpanRef}>
+        {committedText}
+        {committedText && partialText ? ' ' : ''}
+      </span>
+      <span ref={partialSpanRef} className="editorial-text--partial">
+        {partialText}
+      </span>
+      <CursorOverlay
         committed={committed}
+        committedOffsets={committedOffsets}
         partialWords={partialWords}
+        partialOffsets={partialOffsets}
+        committedSpanRef={committedSpanRef}
+        partialSpanRef={partialSpanRef}
         containerRef={containerRef}
       />
     </div>
   )
 }
 
-/** Sibling component that drives the playhead underline.
+/** Plays the role of the old `ActiveWordTracker`. Subscribes to
+ * `useCurrentTime()`, computes the active word index, and imperatively
+ * positions an absolutely-positioned underline span via the Range API
+ * (instead of looking up per-word elements by ID).
  *
- * Subscribes to `useCurrentTime()` ITSELF so the parent (PlainText /
- * WordList) doesn't reconcile on every 60Hz tick. Updates the
- * absolutely-positioned underline `<div>` via a ref-driven imperative
- * style write rather than React state — the only DOM mutation per tick
- * is the four style fields on a single element. */
-function ActiveWordTracker({
+ * Same monotonic-forward guard + seek-back reset as the old tracker. */
+function CursorOverlay({
   committed,
+  committedOffsets,
   partialWords,
+  partialOffsets,
+  committedSpanRef,
+  partialSpanRef,
   containerRef,
 }: {
   committed: Word[]
+  committedOffsets: number[]
   partialWords: Word[]
+  partialOffsets: number[]
+  committedSpanRef: React.RefObject<HTMLSpanElement | null>
+  partialSpanRef: React.RefObject<HTMLSpanElement | null>
   containerRef: React.RefObject<HTMLDivElement | null>
 }) {
   const t = useCurrentTime()
@@ -732,14 +606,9 @@ function ActiveWordTracker({
   const lastIdxRef = useRef<number>(-1)
   const lastTRef = useRef<number>(0)
 
-  // **Cursor selection — interval containment, across committed + partial.**
-  // First binary-search committed for the latest word with start ≤ t,
-  // preferring one whose [start, end] contains t (handles the engine's
-  // ~80ms-quantized timestamp overlap). Then linearly walk PARTIAL
-  // words (always <20) for any newer hit — partials extend the cursor
-  // into in-flight preview text instead of parking at the last commit.
-  // The monotonic guard in the effect below prevents partial-revision
-  // shuffles from yanking the cursor backward.
+  // Interval-containment across committed + partial — same selection
+  // rule as the previous ActiveWordTracker. Indices are "global":
+  // 0..committed.length-1 = committed, committed.length..= partial.
   const activeIdx = useMemo(() => {
     if (committed.length === 0 && partialWords.length === 0) return -1
     let found = -1
@@ -767,9 +636,6 @@ function ActiveWordTracker({
         }
       }
     }
-    // Walk partial words. They come AFTER committed in audio time.
-    // Pick the LATEST partial whose start ≤ t; prefer one whose end ≥ t
-    // (interval containment) the same way.
     let partialHit = -1
     for (let i = 0; i < partialWords.length; i++) {
       if (partialWords[i].start <= t) partialHit = i
@@ -789,14 +655,11 @@ function ActiveWordTracker({
     return found
   }, [committed, partialWords, t])
 
-  // **Monotonic forward-only guard.**
-  // Track t-deltas to detect explicit user seek-back. During normal
-  // forward playback, cursor only advances (never retreats), even if a
-  // new committed batch revises earlier word timestamps. On user seek
-  // backward (>0.5s reverse), drop the guard and let cursor re-anchor.
+  // Detect user seek-back via t-delta; reset monotonic guard so the
+  // cursor can re-anchor backward.
   useEffect(() => {
     if (t < lastTRef.current - 0.5) {
-      lastIdxRef.current = -1 // reset monotonic guard after user seek-back
+      lastIdxRef.current = -1
     }
     lastTRef.current = t
   }, [t])
@@ -806,42 +669,59 @@ function ActiveWordTracker({
     const line = lineRef.current
     if (!container || !line) return
     if (activeIdx < 0) {
-      // No committed words yet (warm-up) — only hide if we never showed.
       if (lastIdxRef.current < 0) line.style.opacity = '0'
-      // Otherwise keep the last good position; cursor doesn't disappear
-      // mid-session if the words array shrinks or t drops below the first.
       return
     }
-    // Monotonic guard: never move backward during forward playback.
-    // lastTRef-based seek-back reset (above) handles the legitimate
-    // backward case by clearing lastIdxRef.
     if (activeIdx < lastIdxRef.current) return
     if (activeIdx === lastIdxRef.current) return
     lastIdxRef.current = activeIdx
-    // O(1) ID lookup — querySelector with attribute selector is
-    // O(n) worst case on the 27k+ span trees we see after hours of
-    // streaming. Stable id per word index ('tx-word-N') is unique
-    // because there's only one transcript on screen.
-    const wordEl = document.getElementById(`tx-word-${activeIdx}`) as HTMLSpanElement | null
-    if (!wordEl) return
+
+    const inCommitted = activeIdx < committed.length
+    const span = inCommitted ? committedSpanRef.current : partialSpanRef.current
+    const textNode = span?.firstChild
+    if (!textNode || textNode.nodeType !== Node.TEXT_NODE) return
+
+    let charStart: number
+    let wordLen: number
+    if (inCommitted) {
+      charStart = committedOffsets[activeIdx]
+      wordLen = committed[activeIdx].word.length
+    } else {
+      const pi = activeIdx - committed.length
+      if (pi >= partialWords.length) return
+      charStart = partialOffsets[pi]
+      wordLen = partialWords[pi].word.length
+    }
+
+    const range = document.createRange()
+    try {
+      range.setStart(textNode, charStart)
+      range.setEnd(textNode, charStart + wordLen)
+    } catch {
+      return
+    }
+    const wRect = range.getBoundingClientRect()
     const cRect = container.getBoundingClientRect()
-    const wRect = wordEl.getBoundingClientRect()
     line.style.opacity = '1'
-    // Sit the underline a hair below the word baseline rather than the
-    // bounding-box bottom — feels tucked to the descender rather than
-    // floating in space.
     line.style.transform = `translate(${wRect.left - cRect.left}px, ${
       wRect.bottom - cRect.top - 2
     }px)`
     line.style.width = `${wRect.width}px`
-  }, [activeIdx, containerRef])
+  }, [
+    activeIdx,
+    committed,
+    committedOffsets,
+    partialWords,
+    partialOffsets,
+    committedSpanRef,
+    partialSpanRef,
+    containerRef,
+  ])
 
-  // Re-measure on window resize — line wraps shift word positions, and
-  // the imperative style cache (`lastIdxRef`) would otherwise stick at
-  // the pre-resize coordinates.
+  // Resize handler — wrap shifts invalidate the cached underline position.
   useEffect(() => {
     const onResize = () => {
-      lastIdxRef.current = -1 // force a re-measure on the next tick
+      lastIdxRef.current = -1
     }
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
@@ -869,6 +749,7 @@ function ActiveWordTracker({
     />
   )
 }
+
 
 // ── Segments with single-line timestamps + compact metadata ─────
 // Same animation strategy as words: each new row mounts with a CSS

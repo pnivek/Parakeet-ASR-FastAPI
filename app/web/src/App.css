@@ -1019,6 +1019,20 @@ body {
   display: inline-block;
 }
 
+/* Partial (in-flight) text — same dimmed treatment the old per-word
+ * partials had, but applied to one contiguous span. */
+.editorial-text--partial {
+  color: var(--muted);
+}
+
+/* Just-committed flash — applied via CSS Highlight API in TranscriptSection
+ * to the character range of words that crossed from partial → committed
+ * on this render. Highlight is removed after ~320ms so the text falls
+ * back to default (white) color, giving a subtle grey→white reveal. */
+::highlight(just-committed) {
+  color: var(--muted);
+}
+
 /* Segments rows — single-line timestamps in their own column */
 .segs-list {
   display: flex;

@@ -1032,10 +1032,18 @@ body {
   border-top: 1px solid var(--rule);
   cursor: pointer;
   transition: color 0.15s;
-  /* Each segment row is independent for layout/paint/style purposes.
-   * Lets the browser skip re-layout of off-screen rows when content
-   * grows or scroll moves — meaningful after thousands of rows. */
+  /* Each segment row is independent for layout/paint/style purposes —
+   * lets visible rows paint independently of each other. */
   contain: layout paint style;
+  /* Native virtualization: browser skips layout AND paint of off-screen
+   * rows automatically, using contain-intrinsic-size as a placeholder
+   * height so scroll position stays accurate. After thousands of
+   * rendered rows the savings are massive — only the ~10-20 rows
+   * actually on screen pay layout cost. `auto` lets the browser
+   * remember the measured height after first layout, so the initial
+   * 90px estimate only matters for never-rendered rows. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 90px;
 }
 .segs-row:first-child {
   border-top: none;

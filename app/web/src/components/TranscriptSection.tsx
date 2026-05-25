@@ -419,12 +419,36 @@ function PlainText({
   const containerRef = useRef<HTMLDivElement | null>(null)
   const textSpanRef = useRef<HTMLSpanElement | null>(null)
 
-  // Build the full joined text + per-word char offsets in one pass.
-  // Committed words first, then partial. The partial start offset is
-  // the boundary the highlight Range anchors to. Recomputed only when
-  // committed or partialWords actually change identity (React batches
-  // partial updates well — typically ~4 Hz during streaming).
-  const { text, offsets, partialStartChar } = useMemo(() => {
+  // Content-fingerprint cache for the heavy text+offsets build.
+  // `body.words` and `partialWords` come in as FRESH array references
+  // on every parent render — Sidebar rebuilds the verbose body on
+  // every WS message even when the underlying word list hasn't
+  // grown. A naive `useMemo([committed, partialWords])` would
+  // re-compute (and re-string-identify) on every WS message, which
+  // is what triggered the flash: the highlight useEffect saw a new
+  // `text` reference and tore down + recreated the CSS Highlight.
+  //
+  // The fingerprint here is `committed.length` (committed is
+  // append-only — a length match means identical content) plus a
+  // cheap O(partial) join of partial words (partials are small — at
+  // most a few dozen tokens). When the fingerprint matches the last
+  // render, we return the cached text/offsets — same string
+  // identity, so the highlight effect's `text` dep doesn't trip and
+  // the Highlight is left alone.
+  const partialJoin = partialWords.map((w) => w.word).join(' ')
+  const cacheRef = useRef<{
+    committedLen: number
+    partialJoin: string
+    text: string
+    offsets: number[]
+    partialStartChar: number
+  } | null>(null)
+  let cache = cacheRef.current
+  if (
+    !cache ||
+    cache.committedLen !== committed.length ||
+    cache.partialJoin !== partialJoin
+  ) {
     const total = committed.length + partialWords.length
     const offsets: number[] = new Array(total)
     const parts: string[] = new Array(total)
@@ -440,49 +464,71 @@ function PlainText({
       parts[committed.length + i] = partialWords[i].word
       pos += partialWords[i].word.length + 1
     }
-    return { text: parts.join(' '), offsets, partialStartChar: partialStart }
-  }, [committed, partialWords])
+    cache = {
+      committedLen: committed.length,
+      partialJoin,
+      text: parts.join(' '),
+      offsets,
+      partialStartChar: partialStart,
+    }
+    cacheRef.current = cache
+  }
+  const { text, offsets, partialStartChar } = cache
 
   // Position the 'partial' CSS Highlight over the partial char range.
-  // Replaced (not mutated) every time the boundary shifts so the
-  // highlight never holds a stale Range. When `partialWords.length`
-  // hits 0, the highlight is cleared instead — no partial tail to
-  // colour. The Highlight API is supported in Chromium 105+ /
-  // WebKit 17.2+; on older engines the partial text just renders in
-  // the default colour (graceful degradation; no JS error).
+  // Stable Highlight + Range refs: the Highlight object is created
+  // exactly once (idempotent — first render that has the API and a
+  // valid text node), and the Range is mutated in place via
+  // setStart/setEnd. This is the critical difference from the
+  // previous implementation which did `cssH.set('partial', new
+  // Highlight(range))` on every effect run — that recreate visibly
+  // flashed the partial region on every WS message because the
+  // browser tore down + repainted the entire highlighted area.
+  //
+  // Highlight API is in Chromium 105+ / WebKit 17.2+; on older
+  // engines the partial text just renders in default colour (no JS
+  // error — graceful degradation).
+  const highlightRef = useRef<unknown>(null)
+  const rangeRef = useRef<Range | null>(null)
   useEffect(() => {
+    type HighlightLike = { size?: number }
     type CSSWithHighlights = typeof CSS & {
-      highlights?: {
-        get: (name: string) => unknown
-        set: (name: string, h: unknown) => void
-        delete: (name: string) => void
-      }
+      highlights?: { set: (name: string, h: unknown) => void }
     }
     type WithHighlight = Window & {
-      Highlight?: new (...ranges: Range[]) => unknown
+      Highlight?: new (...ranges: Range[]) => HighlightLike
     }
     const cssH = (CSS as CSSWithHighlights).highlights
     const HighlightCtor = (window as unknown as WithHighlight).Highlight
     if (!cssH || !HighlightCtor) return
     const span = textSpanRef.current
     const textNode = span?.firstChild
-    if (!textNode || textNode.nodeType !== Node.TEXT_NODE) {
-      cssH.delete('partial')
-      return
+    if (!textNode || textNode.nodeType !== Node.TEXT_NODE) return
+
+    let r = rangeRef.current
+    if (!r) {
+      r = document.createRange()
+      rangeRef.current = r
     }
-    if (partialWords.length === 0) {
-      cssH.delete('partial')
-      return
-    }
-    const range = document.createRange()
+    // When partialWords is empty, collapse the Range to a 0-length
+    // span at position 0. Browser renders no highlighted area, but
+    // the Highlight + Range stay alive so the next non-empty partial
+    // doesn't pay the recreate cost. Try/catch protects against
+    // setStart/setEnd throwing if the text node was replaced
+    // mid-paint (rare; bail and let the next render retry).
+    const start = partialWords.length === 0 ? 0 : partialStartChar
+    const end = partialWords.length === 0 ? 0 : text.length
     try {
-      range.setStart(textNode, partialStartChar)
-      range.setEnd(textNode, text.length)
+      r.setStart(textNode, start)
+      r.setEnd(textNode, end)
     } catch {
-      cssH.delete('partial')
       return
     }
-    cssH.set('partial', new HighlightCtor(range))
+    if (!highlightRef.current) {
+      const h = new HighlightCtor(r)
+      highlightRef.current = h
+      cssH.set('partial', h)
+    }
   }, [text, partialStartChar, partialWords.length])
 
   // Click handler: caret → char offset → word index → seek. Binary

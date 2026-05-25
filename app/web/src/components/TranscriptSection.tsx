@@ -428,6 +428,7 @@ const LazyChunk = memo(
   function LazyChunk({
     segId,
     text,
+    segStart,
     startIdx,
     endIdx,
     words,
@@ -436,6 +437,7 @@ const LazyChunk = memo(
   }: {
     segId: number
     text: string
+    segStart: number
     startIdx: number
     endIdx: number
     words: Word[]
@@ -457,7 +459,23 @@ const LazyChunk = memo(
       // Off-screen: single text node, inline. ~1 DOM node + 1 text
       // node total. Browser layouts the text string as one wrappable
       // run, which is much cheaper than per-word spans.
-      return <span ref={wrapperRef}>{text + ' '}</span>
+      // Clicks fall through to segment-start seek — coarser than the
+      // mounted per-word seek but covers the "scroll back, click old
+      // text to replay that sentence" case. seek() is now safe-clamped
+      // to audio.seekable so unreachable targets (live URL streams)
+      // silently no-op rather than stalling audio.
+      return (
+        <span
+          ref={wrapperRef}
+          onClick={() => {
+            seek(segStart)
+            play()
+          }}
+          style={{ cursor: 'pointer' }}
+        >
+          {text + ' '}
+        </span>
+      )
     }
     // On-screen: full Word spans for cursor + click-to-seek.
     // Reveal animation only fires for words that arrived recently —
@@ -491,6 +509,7 @@ const LazyChunk = memo(
     prev.startIdx === next.startIdx &&
     prev.endIdx === next.endIdx &&
     prev.text === next.text &&
+    prev.segStart === next.segStart &&
     prev.live === next.live,
 )
 
@@ -521,6 +540,7 @@ const CommittedWordList = memo(function CommittedWordList({
     const out: Array<{
       segId: number
       text: string
+      segStart: number
       startIdx: number
       endIdx: number
     }> = []
@@ -534,6 +554,7 @@ const CommittedWordList = memo(function CommittedWordList({
       out.push({
         segId: seg.id,
         text: (seg.text || '').trim(),
+        segStart: seg.start,
         startIdx,
         endIdx: wIdx,
       })
@@ -579,6 +600,7 @@ const CommittedWordList = memo(function CommittedWordList({
           key={p.segId}
           segId={p.segId}
           text={p.text}
+          segStart={p.segStart}
           startIdx={p.startIdx}
           endIdx={p.endIdx}
           words={words}

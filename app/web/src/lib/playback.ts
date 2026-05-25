@@ -192,7 +192,33 @@ export function setAudioUrl(url: string) {
 
 export function seek(t: number) {
   const el = ensureEl()
-  el.currentTime = Math.max(0, t)
+  const target = Math.max(0, t)
+  // For URL+WS live streams, the audio element's `seekable` range is
+  // tiny (HLS playlist window or icecast buffer). Clicking on a word
+  // from hours ago would be way outside that range — the browser
+  // tries to fulfill the seek, stalls indefinitely waiting for
+  // unreachable data, and the audio element enters a broken state
+  // that can take minutes to recover from (if at all). Silently
+  // refuse seeks to positions we know are unreachable. For files
+  // and recorded audio, seekable spans the full duration so this
+  // never trips.
+  //
+  // Defensive on empty seekable (just after src change, before any
+  // data has loaded) — allow the seek and let the browser handle
+  // it normally. Otherwise newly-loaded sources couldn't be seeked.
+  const sk = el.seekable
+  if (sk.length === 0) {
+    el.currentTime = target
+    return
+  }
+  for (let i = 0; i < sk.length; i++) {
+    if (target >= sk.start(i) && target <= sk.end(i)) {
+      el.currentTime = target
+      return
+    }
+  }
+  // Out of all seekable ranges — no-op. The audio continues from
+  // wherever it currently is.
 }
 
 export function play() {

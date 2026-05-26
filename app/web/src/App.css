@@ -153,25 +153,9 @@ body {
 }
 .wf-fade-in { animation: wfFadeIn 380ms cubic-bezier(0.22, 0.61, 0.36, 1); }
 
-/* Word + segment reveal during a live stream. Each newly-mounted node
- * with the .word-reveal / .seg-reveal class fades up once. The animation
- * runs natively in the compositor — no per-frame React re-render. */
-@keyframes wordReveal {
-  from {
-    opacity: 0;
-    filter: blur(2.2px);
-    transform: translateY(3px);
-  }
-  to {
-    opacity: 1;
-    filter: none;
-    transform: none;
-  }
-}
-.word-reveal {
-  animation: wordReveal 380ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
-  will-change: opacity, filter, transform;
-}
+/* Segment reveal during a live stream. Newly-arrived segments get the
+ * .seg-reveal class which fades up once. The animation runs natively
+ * in the compositor — no per-frame React re-render. */
 @keyframes segReveal {
   from {
     opacity: 0;
@@ -201,18 +185,10 @@ body {
  * When the model commits the sentence, the --partial class is removed
  * and the color glides back to committed white.
  *
- * Playback position is NOT signalled by recoloring individual words —
- * a single moving underline beneath the text tracks it (see
- * .text-playhead and the underline element rendered by PlainText).
- * That's deliberate: per-word recoloring jittered because real
- * per-token timestamps from the engine overlap or have small gaps. */
-.editorial-word {
-  color: var(--fg);
-  transition: color 240ms ease-out;
-}
-.editorial-word--partial {
-  color: var(--muted);
-}
+ * Playback position is tracked by the underline span (see
+ * .text-playhead and the element rendered by CursorOverlay). No
+ * per-word recolouring — that jittered because real per-token
+ * timestamps from the engine overlap or have small gaps. */
 .segs-row {
   transition: opacity 240ms ease-out, color 240ms ease-out;
 }
@@ -1009,16 +985,6 @@ body {
   letter-spacing: 0.005em;
   color: var(--fg);
 }
-/* Per-word base layout — colors set above by .editorial-word and
- * .editorial-word--partial. Position relative kept so future per-word
- * affordances (focus rings etc) can anchor. No per-word underline:
- * playback position is tracked by the .text-playhead element. */
-.editorial-word {
-  position: relative;
-  cursor: pointer;
-  display: inline-block;
-}
-
 /* Partial (in-flight) text — coloured via the CSS Highlight API in
  * TranscriptSection. The committed text + the partial tail live in one
  * text node so commits don't restructure the DOM; the highlight Range

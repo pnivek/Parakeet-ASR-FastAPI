@@ -7,12 +7,13 @@ import { formatTime } from '../lib/format'
 interface Props {
   result: TranscriptionResponse | null
   filename: string
-  /** True while partials are still arriving (live mic / progressive WS). Drives
-   * the smoothstep fade-in reveal. For a finalized result we just colour
-   * words by playback position — no fade. */
+  /** True while partials are still arriving (live mic / progressive WS).
+   * Gates the segment-arrival fade animation + the auto-scroll-to-bottom
+   * behavior. False once the result is finalized. */
   live: boolean
-  /** Map of segment.id → performance.now() at first observation. Drives the
-   * fade-in of newly arrived segments during live streaming. */
+  /** Map of segment.id → performance.now() at first observation. Drives
+   * the .seg-reveal fade-in on newly-arrived segments in the segments
+   * view. */
   segmentArrivals: Map<number, number>
   /** Engine's in-flight sentence buffer — uncommitted tokens streamed
    * by the server between actual .!? commits. Rendered as dimmed text
@@ -182,7 +183,6 @@ export const TranscriptSection = memo(function TranscriptSection({
             segmentArrivals={segmentArrivals}
             partialSegment={partialSegment ?? null}
             partialWords={partialWords ?? []}
-            scrollRoot={bodyEl}
           />
         )}
         <div ref={sentinelRef} aria-hidden style={{ height: 1 }} />
@@ -214,7 +214,6 @@ function VerboseBody({
   segmentArrivals,
   partialSegment,
   partialWords,
-  scrollRoot,
 }: {
   body: VerboseJsonResponse
   view: View
@@ -223,20 +222,12 @@ function VerboseBody({
   segmentArrivals: Map<number, number>
   partialSegment: WhisperSegment | null
   partialWords: Word[]
-  scrollRoot: HTMLElement | null
 }) {
   // Text view is now pure-text-node + Range-API; it self-subscribes
   // to useCurrentTime inside CursorOverlay. The other views (segments,
   // words) wrap their own subscribers below.
   if (view === 'text')
-    return (
-      <PlainText
-        body={body}
-        partialSegment={partialSegment}
-        partialWords={partialWords}
-        scrollRoot={scrollRoot}
-      />
-    )
+    return <PlainText body={body} partialWords={partialWords} />
   if (view === 'segments')
     return (
       <SegmentsView
@@ -290,9 +281,9 @@ function WordsView({
   partialWords: Word[]
 }) {
   const t = useCurrentTime()
-  // Interval-containment across committed + partial — same rule as
-  // ActiveWordTracker. WordsGrid renders partial cells immediately
-  // after committed at index committed.length + partialIdx.
+  // Interval-containment across committed + partial. WordsGrid renders
+  // partial cells immediately after committed at index
+  // committed.length + partialIdx.
   const activeIdx = useMemo(() => {
     const committed = body.words ?? []
     if (committed.length === 0 && partialWords.length === 0) return -1
@@ -344,22 +335,15 @@ function WordsView({
 
 // ── Text view: pure text node + cursor overlay ────────────────────
 //
-// The whole committed transcript is rendered as a SINGLE text node
-// inside one <span>; the partial in-flight sentence is a second
-// <span>. No per-word DOM, no per-chunk DOM, no IntersectionObserver.
-// DOM size is O(1) regardless of session length — five elements total.
+// Committed + partial words are joined and rendered as a SINGLE text
+// node inside one <span>. The partial tail is coloured grey via a
+// CSS Highlight Range; on commit the Range shrinks in place. DOM is
+// O(1) regardless of session length — five elements total.
 //
-// Cursor + click work via the Range API on the text nodes:
+// Cursor + click work via the Range API on the text node:
 //   - Cursor: word index → character offset → Range → getBoundingClientRect.
 //   - Click: caretRangeFromPoint(x, y) → character offset → binary
-//     search wordCharOffsets → word → seek.
-//
-// Browser handles inline-text layout once for the whole transcript
-// (extremely well-optimized); scroll is pure compositor work; React
-// only reconciles when new committed words actually land. The Chunk
-// /IO/Word machinery this replaced was generating dozens of React
-// re-renders per frame during auto-scroll which caused the bouncy
-// auto-scroll + Follow-button jank.
+//     search the offsets array → word → seek.
 
 /** Cross-engine wrapper around caretRangeFromPoint / caretPositionFromPoint
  * (Chromium/Safari vs Firefox respectively). Returns the text node + the
@@ -401,20 +385,11 @@ function caretFromPoint(
  * content/height jitter to bounce the auto-scroll. */
 function PlainText({
   body,
-  partialSegment,
   partialWords,
-  scrollRoot,
 }: {
   body: VerboseJsonResponse
-  partialSegment: WhisperSegment | null
   partialWords: Word[]
-  /** Kept for prop signature compat with VerboseBody — not used in
-   * pure text mode (no IntersectionObserver per chunk). */
-  scrollRoot: HTMLElement | null
 }) {
-  void scrollRoot
-  void partialSegment
-
   const committed = body.words ?? []
   const containerRef = useRef<HTMLDivElement | null>(null)
   const textSpanRef = useRef<HTMLSpanElement | null>(null)
@@ -595,10 +570,9 @@ function PlainText({
   )
 }
 
-/** Plays the role of the old `ActiveWordTracker`. Subscribes to
- * `useCurrentTime()`, computes the active word index, and imperatively
- * positions an absolutely-positioned underline span via the Range API
- * over the single text node. */
+/** Subscribes to `useCurrentTime()`, computes the active word index,
+ * and imperatively positions an absolutely-positioned underline span
+ * via the Range API over the single text node. */
 function CursorOverlay({
   committed,
   partialWords,
@@ -617,9 +591,9 @@ function CursorOverlay({
   const lastIdxRef = useRef<number>(-1)
   const lastTRef = useRef<number>(0)
 
-  // Interval-containment across committed + partial — same selection
-  // rule as the previous ActiveWordTracker. Indices are "global":
-  // 0..committed.length-1 = committed, committed.length..= partial.
+  // Interval-containment across committed + partial. Indices are
+  // "global": 0..committed.length-1 = committed, committed.length..=
+  // partial.
   const activeIdx = useMemo(() => {
     if (committed.length === 0 && partialWords.length === 0) return -1
     let found = -1

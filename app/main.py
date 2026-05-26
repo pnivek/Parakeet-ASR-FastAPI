@@ -13,7 +13,7 @@ import threading
 import functools
 import concurrent.futures
 from enum import Enum
-from typing import Awaitable, Callable, Optional, Tuple, List
+from typing import Awaitable, Callable, Dict, Optional, Tuple, List
 import subprocess
 import uvicorn
 

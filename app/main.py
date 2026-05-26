@@ -1195,7 +1195,16 @@ async def handle_streaming_pcm(
         maxsize=client_config["batch_size"] * 2 # Allow some buffering
     )
     producer_done_event = asyncio.Event() # Signals producer has finished all its tasks
-    
+    # Flips True when the client disconnects (or we otherwise want to bail).
+    # Set by the producer's disconnect handlers (feed_ffmpeg_stdin catches
+    # WebSocketDisconnect / RuntimeError on close); consumed by the consumer
+    # to break out of its drain loop and skip the engine.flush() trailing
+    # work, and by the engine itself via the cancel_check callback to bail
+    # between forward passes. Without this, when the client closed mid-
+    # upload the consumer kept processing all already-queued chunks (a
+    # multi-second tail of GPU work the user never sees).
+    cancel_event = asyncio.Event()
+
     accumulated_asr_processing_time_s: float = 0.0
     total_duration_processed_seconds_for_asr: float = 0.0 # Based on PCM from ffmpeg
 
@@ -1260,11 +1269,12 @@ async def handle_streaming_pcm(
             try:
                 while True:
                     if websocket.application_state != WebSocketState.CONNECTED:
-                        logger.info(f"({session_id}) Feed ffmpeg: WebSocket no longer connected. Closing ffmpeg stdin.")
+                        logger.info(f"({session_id}) Feed ffmpeg: WebSocket no longer connected. Cancelling pipeline.")
+                        cancel_event.set()
                         if process.stdin and not process.stdin.is_closing():
                             process.stdin.close()
                         break
-                    
+
                     try:
                         # Timeout for receive to prevent indefinite blocking if client goes silent
                         message = await asyncio.wait_for(websocket.receive(), timeout=30.0)
@@ -1278,6 +1288,10 @@ async def handle_streaming_pcm(
                              logger.info(f"({session_id}) Feed ffmpeg: WebSocket disconnected during receive.")
                         else:
                             logger.error(f"({session_id}) Feed ffmpeg: WebSocket receive error: {e_ws_recv}", exc_info=True)
+                        # Client gone — short-circuit the rest of the pipeline.
+                        # See `cancel_event` declaration in handle_streaming_pcm
+                        # for the propagation chain.
+                        cancel_event.set()
                         if process.stdin and not process.stdin.is_closing():
                             process.stdin.close()
                         break # Exit loop on disconnect or critical error
@@ -1311,11 +1325,13 @@ async def handle_streaming_pcm(
                             logger.warning(f"({session_id}) Feed ffmpeg: ffmpeg stdin closed or unavailable, cannot send data.")
                             break
             except WebSocketDisconnect:
-                logger.info(f"({session_id}) Feed ffmpeg: WebSocket disconnected by client. Closing ffmpeg stdin.")
+                logger.info(f"({session_id}) Feed ffmpeg: WebSocket disconnected by client. Cancelling pipeline.")
+                cancel_event.set()
                 if process.stdin and not process.stdin.is_closing():
                     process.stdin.close()
             except Exception as e_feed:
                 logger.error(f"({session_id}) Feed ffmpeg: Unexpected error: {e_feed}", exc_info=True)
+                cancel_event.set()
                 if process.stdin and not process.stdin.is_closing():
                     process.stdin.close() # Attempt to clean up
             finally:
@@ -1327,6 +1343,16 @@ async def handle_streaming_pcm(
                         # await process.stdin.wait_closed() # Optional: ensure it's fully closed
                     except Exception as e_close_stdin:
                         logger.warning(f"({session_id}) Feed ffmpeg: Error closing ffmpeg stdin in finally: {e_close_stdin}")
+                # On cancel, terminate ffmpeg immediately so it doesn't
+                # spend the next several seconds draining its buffered
+                # input — that drain is exactly what kept the server
+                # "going" after the client clicked Stop on a long file
+                # upload. read_ffmpeg_stdout sees stdout EOF and exits.
+                if cancel_event.is_set() and process.returncode is None:
+                    try:
+                        process.terminate()
+                    except ProcessLookupError:
+                        pass
 
 
         async def read_ffmpeg_stdout_and_queue_chunks():
@@ -1476,6 +1502,9 @@ async def handle_streaming_pcm(
             left_context_secs=STREAMING_LEFT_CONTEXT_S,
             right_context_secs=right_context_secs,
             request_id=f"WS-Stream-{session_id}-eng",
+            # Engine bails between its internal forward passes when this
+            # returns True (set by the producer's disconnect handlers).
+            cancel_check=lambda: cancel_event.is_set(),
         )
         logger.info(
             f"({session_id}) Stream: emission_lag={engine.emission_lag_secs:.2f}s "
@@ -1495,6 +1524,13 @@ async def handle_streaming_pcm(
             while True:
                 item = await chunk_queue.get()
                 if item is None:
+                    chunk_queue.task_done()
+                    break
+                # Bail before doing any GPU work if the client disconnected.
+                # The producer's disconnect handlers set cancel_event; we
+                # check it after every queue read so the bail latency is at
+                # most one engine chunk (typically 2–10s of audio compute).
+                if cancel_event.is_set():
                     chunk_queue.task_done()
                     break
                 tensor, _offset_s = item
@@ -1542,31 +1578,44 @@ async def handle_streaming_pcm(
                         except Exception as e_send:
                             logger.warning(f"({session_id}) Stream: partial send failed: {e_send}")
 
-            # EOF — pad + flush to commit trailing tokens
-            await _run_on_asr_executor(engine.flush)
-            final_partials = engine.pop_final_segments()
-            if final_partials and websocket.application_state == WebSocketState.CONNECTED:
-                try:
-                    _translate_segment_times(final_partials, vad_state)
-                    _accumulate_committed_speech(final_partials, vad_state)
-                    final_words = _segments_to_words(final_partials)
-                    await websocket.send_json({
-                        "type": "segments_batch",
-                        "segments": final_partials,
-                        "words": final_words,
-                        **_streaming_counters(vad_state),
-                    })
-                    sent_segments_pcm.extend(final_partials)
-                except Exception as e_send:
-                    logger.warning(f"({session_id}) Stream: final segment send failed: {e_send}")
+            # EOF — pad + flush to commit trailing tokens. Skipped on
+            # cancel: the client has gone, and flush() is one more
+            # forward pass we'd rather not run.
+            if not cancel_event.is_set():
+                await _run_on_asr_executor(engine.flush)
+                final_partials = engine.pop_final_segments()
+                if final_partials and websocket.application_state == WebSocketState.CONNECTED:
+                    try:
+                        _translate_segment_times(final_partials, vad_state)
+                        _accumulate_committed_speech(final_partials, vad_state)
+                        final_words = _segments_to_words(final_partials)
+                        await websocket.send_json({
+                            "type": "segments_batch",
+                            "segments": final_partials,
+                            "words": final_words,
+                            **_streaming_counters(vad_state),
+                        })
+                        sent_segments_pcm.extend(final_partials)
+                    except Exception as e_send:
+                        logger.warning(f"({session_id}) Stream: final segment send failed: {e_send}")
 
             logger.info(
                 f"({session_id}) Stream: processed {total_engine_chunks} engine chunks "
                 f"in {engine.asr_time_s:.2f}s ASR time, emitted {len(sent_segments_pcm)} segments."
+                f"{' (cancelled)' if cancel_event.is_set() else ''}"
             )
         finally:
             accumulated_asr_processing_time_s += engine.asr_time_s
             engine.reset()
+            # On cancel the producer may still be mid-put on a full
+            # queue. Drain so it can unblock, finish its finally, and
+            # the gather() in the caller can complete.
+            while not chunk_queue.empty():
+                try:
+                    chunk_queue.get_nowait()
+                    chunk_queue.task_done()
+                except (asyncio.QueueEmpty, ValueError):
+                    break
 
     # Main execution block for handle_streaming_pcm
     try:
@@ -1815,6 +1864,11 @@ async def handle_streaming_url(
             left_context_secs=STREAMING_LEFT_CONTEXT_S,
             right_context_secs=right_context_secs,
             request_id=f"WS-URL-{session_id}-eng",
+            # Same cancel propagation as the PCM path — the watcher task
+            # above (watch_ws_disconnect) sets cancel_event on client
+            # disconnect / URL_STREAM_MAX_S hit; engine bails between
+            # forward passes.
+            cancel_check=lambda: cancel_event.is_set(),
         )
         # Partials decoupled from `live_latency` — URL is always live; the
         # preset only controls chunk size. Partials give the user preview
@@ -1825,6 +1879,9 @@ async def handle_streaming_url(
             while True:
                 item = await chunk_queue.get()
                 if item is None:
+                    chunk_queue.task_done()
+                    break
+                if cancel_event.is_set():
                     chunk_queue.task_done()
                     break
                 tensor, _offset_s = item
@@ -1865,25 +1922,35 @@ async def handle_streaming_url(
                         except Exception as e_send:
                             logger.warning(f"({session_id}) URL Stream: partial send failed: {e_send}")
 
-            await _run_on_asr_executor(engine.flush)
-            final_partials = engine.pop_final_segments()
-            if final_partials and websocket.application_state == WebSocketState.CONNECTED:
-                try:
-                    _translate_segment_times(final_partials, vad_state)
-                    _accumulate_committed_speech(final_partials, vad_state)
-                    final_words = _segments_to_words(final_partials)
-                    await websocket.send_json({
-                        "type": "segments_batch",
-                        "segments": final_partials,
-                        "words": final_words,
-                        **_streaming_counters(vad_state),
-                    })
-                    sent_segments_pcm.extend(final_partials)
-                except Exception as e_send:
-                    logger.warning(f"({session_id}) URL Stream: final segment send failed: {e_send}")
+            # Skip the trailing flush + final-segment send on cancel —
+            # see PCM consumer for the same pattern.
+            if not cancel_event.is_set():
+                await _run_on_asr_executor(engine.flush)
+                final_partials = engine.pop_final_segments()
+                if final_partials and websocket.application_state == WebSocketState.CONNECTED:
+                    try:
+                        _translate_segment_times(final_partials, vad_state)
+                        _accumulate_committed_speech(final_partials, vad_state)
+                        final_words = _segments_to_words(final_partials)
+                        await websocket.send_json({
+                            "type": "segments_batch",
+                            "segments": final_partials,
+                            "words": final_words,
+                            **_streaming_counters(vad_state),
+                        })
+                        sent_segments_pcm.extend(final_partials)
+                    except Exception as e_send:
+                        logger.warning(f"({session_id}) URL Stream: final segment send failed: {e_send}")
         finally:
             accumulated_asr_processing_time_s += engine.asr_time_s
             engine.reset()
+            # Drain so producer can unblock from a potentially-full put.
+            while not chunk_queue.empty():
+                try:
+                    chunk_queue.get_nowait()
+                    chunk_queue.task_done()
+                except (asyncio.QueueEmpty, ValueError):
+                    break
 
     try:
         watcher_task = asyncio.create_task(watch_ws_disconnect())

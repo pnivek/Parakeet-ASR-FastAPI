@@ -488,9 +488,18 @@ function PlainText({
   // Highlight API is in Chromium 105+ / WebKit 17.2+; on older
   // engines the partial text just renders in default colour (no JS
   // error — graceful degradation).
+  //
+  // useLayoutEffect (not useEffect) so the Range reposition lands
+  // BEFORE the browser paints the just-mutated text node. With
+  // useEffect the order was: React mutates `<span>` text → browser
+  // paints with stale Highlight position (new partial chars show up
+  // default/white) → effect runs → second paint with correct
+  // Highlight. On fast commits (file+WS) the intermediate frame was
+  // visible as a "grey text disappearing then reappearing as white"
+  // flash. useLayoutEffect collapses both into one paint.
   const highlightRef = useRef<unknown>(null)
   const rangeRef = useRef<Range | null>(null)
-  useEffect(() => {
+  useLayoutEffect(() => {
     type HighlightLike = { size?: number }
     type CSSWithHighlights = typeof CSS & {
       highlights?: { set: (name: string, h: unknown) => void }

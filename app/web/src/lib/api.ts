@@ -261,8 +261,25 @@ export function connectLiveWS(config: WSConfig, callbacks: WSCallbacks): LiveWSH
       console.warn('Failed to parse WS message', e, ev.data)
     }
   }
-  socket.onerror = (e) => callbacks.onError?.(e)
-  socket.onclose = (ev) => callbacks.onClose?.(ev.code, ev.reason)
+  // Tracks whether the consumer called abort(). When true, onclose is a
+  // no-op (or treated as expected) — the WS may close with code 1006 if
+  // the server's cleanup runs past the browser's close-handshake
+  // timeout (~5 s on Chromium). That's not a real error from the
+  // user's perspective; they clicked Stop.
+  let userAborted = false
+  socket.onerror = (e) => {
+    if (userAborted) return
+    callbacks.onError?.(e)
+  }
+  socket.onclose = (ev) => {
+    if (userAborted) {
+      // Normalize the close code to 1000 so the consumer sees a clean
+      // close regardless of whether the server's response landed in time.
+      callbacks.onClose?.(1000, 'client abort')
+      return
+    }
+    callbacks.onClose?.(ev.code, ev.reason)
+  }
 
   return {
     sendBinary(data) {
@@ -288,6 +305,7 @@ export function connectLiveWS(config: WSConfig, callbacks: WSCallbacks): LiveWSH
       }
     },
     abort() {
+      userAborted = true
       try {
         socket.close(1000, 'client abort')
       } catch (e) {
@@ -323,12 +341,19 @@ export function streamFileViaWS(
   async function pumpFile() {
     const CHUNK_SIZE = 64 * 1024
     // Backpressure thresholds. WebSocket.bufferedAmount tells us how many
-    // bytes are queued for send. If we let it climb unboundedly we drown
-    // the server's inbound buffer + delay outbound segments_batch / pings,
-    // which trips uvicorn's keepalive timeout (close 1011). Pause sending
-    // when the buffer crosses HIGH; resume once it drains below LOW.
-    const HIGH = 4 * 1024 * 1024
-    const LOW = 1 * 1024 * 1024
+    // bytes are queued for send. Two competing concerns: (a) too big and
+    // we drown the server's inbound buffer + delay outbound
+    // segments_batch / pings, tripping uvicorn's keepalive (close 1011);
+    // (b) too big and Stop has a multi-second lag because the browser
+    // flushes the buffer before sending the close frame — the server
+    // keeps processing for as long as it takes to drain that audio.
+    //
+    // 256 KB ≈ 16 s of typical MP3 audio: keeps the inbound queue happy
+    // and bounds the stop-latency to ~one engine chunk worth of audio.
+    // CHUNK_SIZE 64 KB means the buffer cycles in 4 frames, plenty for
+    // throughput.
+    const HIGH = 256 * 1024
+    const LOW = 64 * 1024
     const stream = file.stream()
     const reader = stream.getReader()
     try {

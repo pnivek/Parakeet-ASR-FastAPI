@@ -252,10 +252,23 @@ export function connectLiveWS(config: WSConfig, callbacks: WSCallbacks): LiveWSH
     if (finishRequested) socket.send(new ArrayBuffer(0))
     callbacks.onOpen?.()
   }
+  // Stash the server's session_id from the first {type:'session'} message.
+  // Used by abort() to hit the HTTP cancel endpoint out-of-band — that
+  // request reaches the server immediately, independent of the WS's
+  // bufferedAmount and close-handshake round trip. Without it, the
+  // server keeps processing all the buffered audio before noticing the
+  // close.
+  let sessionId: string | null = null
   socket.onmessage = (ev) => {
     if (typeof ev.data !== 'string') return // binary frames not used for control
     try {
       const msg = JSON.parse(ev.data) as WSMessage
+      // Intercept the session handshake; don't propagate it to the
+      // consumer's onMessage (no view cares about it).
+      if (msg && (msg as { type?: string }).type === 'session') {
+        sessionId = (msg as { session_id?: string }).session_id ?? null
+        return
+      }
       callbacks.onMessage(msg)
     } catch (e) {
       console.warn('Failed to parse WS message', e, ev.data)
@@ -306,6 +319,22 @@ export function connectLiveWS(config: WSConfig, callbacks: WSCallbacks): LiveWSH
     },
     abort() {
       userAborted = true
+      // Out-of-band cancel: HTTP POST to the cancel endpoint reaches
+      // the server immediately and flips its cancel_event for this
+      // session. The engine bails on the next chunk boundary without
+      // waiting for the WS's bufferedAmount to drain or the close
+      // handshake to complete. Fire-and-forget — `keepalive: true`
+      // lets the request complete even if the page navigates away.
+      if (sessionId) {
+        try {
+          void fetch(`/v1/audio/streaming/cancel/${encodeURIComponent(sessionId)}`, {
+            method: 'POST',
+            keepalive: true,
+          }).catch(() => {})
+        } catch (e) {
+          console.warn('connectLiveWS: cancel POST failed', e)
+        }
+      }
       try {
         socket.close(1000, 'client abort')
       } catch (e) {

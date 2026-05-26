@@ -19,7 +19,7 @@ import uvicorn
 
 import numpy as np
 
-from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect, Query
 from fastapi.websockets import WebSocketState
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -157,6 +157,19 @@ logger.info(
 
 # --- FastAPI App Setup ---
 app = FastAPI(title="Parakeet ASR Service", version="1.0.0")
+
+# Registry of in-flight streaming cancel events, keyed by session_id.
+# Populated by the WebSocket entry handler before invoking
+# handle_streaming_pcm / handle_streaming_url, removed in its `finally`.
+# The /v1/audio/streaming/cancel/{session_id} HTTP endpoint sets the
+# event for that session — out-of-band signal that the WS-buffered
+# binary frames can't beat. Without this, the client's `socket.close()`
+# waits for `bufferedAmount` to drain before the close frame even
+# reaches the server; the engine keeps processing all the queued audio
+# in the meantime. With this, the cancel arrives in one HTTP round
+# trip independent of WS buffering, and engine bail latency is bounded
+# to one chunk in flight.
+_streaming_cancel_events: Dict[str, asyncio.Event] = {}
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -226,6 +239,30 @@ async def health():
     info = _collect_health_info()
     info["status"] = "ok" if info["model_loaded"] else "loading"
     return info
+
+
+@app.post("/v1/audio/streaming/cancel/{session_id}")
+async def cancel_streaming_session(session_id: str):
+    """Out-of-band cancel for a live streaming WebSocket session.
+
+    Sets the session's cancel_event, which the streaming consumer +
+    engine poll between chunks. Independent of the WS itself — used
+    by the browser client to stop the engine immediately on Stop
+    without waiting for the WS's bufferedAmount + close-handshake
+    round trip. See `_streaming_cancel_events` at top of file.
+
+    Returns 404 if the session isn't currently in-flight (either
+    never existed, already finished, or not a streaming session).
+    The 404 isn't an error from the client's perspective — it just
+    means there's nothing to cancel — but we surface it so misuse
+    surfaces in test runs.
+    """
+    ev = _streaming_cancel_events.get(session_id)
+    if ev is None:
+        raise HTTPException(status_code=404, detail=f"Streaming session {session_id!r} not found")
+    ev.set()
+    logger.info(f"({session_id}) HTTP cancel received; cancel_event set.")
+    return {"cancelled": session_id}
 
 
 @app.get("/readyz")
@@ -1617,6 +1654,10 @@ async def handle_streaming_pcm(
                 except (asyncio.QueueEmpty, ValueError):
                     break
 
+    # Register the cancel event so /v1/audio/streaming/cancel/{session_id}
+    # can flip it out-of-band. Unregistered in the outermost finally below.
+    _streaming_cancel_events[session_id] = cancel_event
+
     # Main execution block for handle_streaming_pcm
     try:
         logger.info(f"({session_id}) Streaming Pipeline (ffmpeg-based): Starting producer and consumer tasks.")
@@ -1666,6 +1707,7 @@ async def handle_streaming_pcm(
                 logger.warning(f"({session_id}) Could not send critical error message to client after pipeline failure: {e_send_err_critical}")
     finally:
         logger.info(f"({session_id}) Streaming Pipeline (ffmpeg-based): Final cleanup.")
+        _streaming_cancel_events.pop(session_id, None)
         # Ensure producer_done_event is set, and a sentinel is in the queue if not already guaranteed by producer's finally.
         if not producer_done_event.is_set():
             producer_done_event.set()
@@ -1952,6 +1994,10 @@ async def handle_streaming_url(
                 except (asyncio.QueueEmpty, ValueError):
                     break
 
+    # Register the cancel event so the HTTP cancel endpoint can flip it
+    # out-of-band (see _streaming_cancel_events at top of file).
+    _streaming_cancel_events[session_id] = cancel_event
+
     try:
         watcher_task = asyncio.create_task(watch_ws_disconnect())
         try:
@@ -1992,6 +2038,7 @@ async def handle_streaming_url(
             except Exception:
                 pass
     finally:
+        _streaming_cancel_events.pop(session_id, None)
         if not producer_done_event.is_set():
             producer_done_event.set()
         try:
@@ -2856,6 +2903,14 @@ async def _ws_handle_unified(
     session_id = base64.urlsafe_b64encode(os.urandom(6)).decode()
     await websocket.accept()
     logger.info(f"({session_id}) {log_prefix}: WebSocket connection accepted.")
+
+    # Send session_id to the client so it can hit the cancel HTTP
+    # endpoint without waiting for WS buffer drain. Safe to send
+    # before any client config — WS is full-duplex once accepted.
+    try:
+        await websocket.send_json({"type": "session", "session_id": session_id})
+    except Exception as e_session_send:
+        logger.warning(f"({session_id}) {log_prefix}: failed to send session id: {e_session_send}")
 
     if not asr_model:
         logger.error(f"({session_id}) {log_prefix}: ASR model not available.")
